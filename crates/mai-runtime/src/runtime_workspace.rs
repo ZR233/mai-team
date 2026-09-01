@@ -84,8 +84,13 @@ impl AgentRuntime {
         self: &Arc<Self>,
         project_id: ProjectId,
     ) -> Result<()> {
-        projects::review::worker::start_project_review_loop_if_ready(Arc::clone(self), project_id)
-            .await
+        let result = projects::review::worker::start_project_review_loop_if_ready(
+            Arc::clone(self),
+            project_id,
+        )
+        .await;
+        self.review_discovery_scheduler.notify();
+        result
     }
 
     pub(super) async fn stop_project_review_loop(self: &Arc<Self>, project_id: ProjectId) {
@@ -94,7 +99,8 @@ impl AgentRuntime {
             project_id,
             PROJECT_REVIEW_RUN_LIST_LIMIT,
         )
-        .await
+        .await;
+        self.review_discovery_scheduler.notify();
     }
 
     #[cfg(test)]

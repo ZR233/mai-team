@@ -1,8 +1,10 @@
 use super::*;
 
 impl AgentRuntime {
-    /// 先停止全部 PL actor，再排空唯一 Thread 持久化写入器。
+    /// 先停止 PR discovery，再停止全部 PL actor并排空唯一 Thread 持久化写入器。
     pub async fn shutdown(&self) -> Result<()> {
+        self.review_discovery_scheduler.shutdown().await?;
+        self.review_ci_watch_scheduler.shutdown().await?;
         let Some(framework) = self.agent_framework.get() else {
             return Ok(());
         };
@@ -142,6 +144,10 @@ impl AgentRuntime {
             ),
             mai_config: Arc::clone(&mai_config),
             agent_framework: OnceCell::new(),
+            review_discovery_scheduler:
+                projects::review::discovery::ProjectReviewDiscoveryScheduler::new(),
+            review_ci_watch_scheduler:
+                projects::review::ci_watch::ProjectReviewCiWatchScheduler::new(),
             cache_root: config.cache_root,
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
@@ -192,10 +198,14 @@ impl AgentRuntime {
             )
             .await;
         });
-        let ci_watch_runtime = Arc::clone(&runtime);
-        tokio::spawn(async move {
-            projects::review::ci_watch::run_project_review_ci_watch_loop(&ci_watch_runtime).await;
-        });
+        runtime
+            .review_ci_watch_scheduler
+            .start(Arc::clone(&runtime))
+            .await;
+        runtime
+            .review_discovery_scheduler
+            .start(Arc::clone(&runtime))
+            .await;
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)
     }
@@ -306,19 +316,34 @@ impl AgentRuntime {
             let summary = record.summary.read().await.clone();
             summaries.insert(summary.id, summary);
         }
+        let role = summary.role.unwrap_or_default();
+        let is_child = parent_id.is_some();
         let identity = pl_core::AgentIdentity {
             id: thread_id.clone(),
             parent_id,
-            role: pl_core::AgentRoleId::new(
-                summary
-                    .role
-                    .map(|role| role.to_string())
-                    .unwrap_or_else(|| "executor".to_string()),
-            )?,
+            role: pl_core::AgentRoleId::new(role.to_string())?,
             depth: framework_depth(product_agent_id, &summaries),
         };
         let mut registration = pl_core::AgentRegistration::new(identity);
         registration.session = initial_thread_context(&summary);
+        if is_child {
+            let profile =
+                agent_host::product_agent_profile(&summary, agent.system_prompt.as_deref())?;
+            let project_root = if summary.project_id.is_some() {
+                projects::workspace::AGENT_WORKSPACE_REPO_PATH
+            } else {
+                "/workspace"
+            };
+            let assignment = agent_host::agent_workspace_assignment(&profile, project_root, None)?;
+            registration
+                .session
+                .session
+                .replace_agent_profile(Some(profile));
+            registration
+                .session
+                .session
+                .replace_workspace_assignment(Some(assignment));
+        }
         let snapshot = handle
             .register(registration)
             .await

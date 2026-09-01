@@ -3,10 +3,13 @@ use std::future::Future;
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_protocol::{ProjectId, ProjectReviewSkipReason};
 use mai_store::ProjectReviewCiWatch;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
 
 use super::eligibility::EvaluatedProjectReviewPr;
-use crate::Result;
+use crate::{Result, RuntimeError};
 
 const CI_WATCH_BATCH_SIZE: usize = 100;
 
@@ -61,13 +64,68 @@ pub(crate) trait ProjectReviewCiWatchOps: Send + Sync {
     ) -> impl Future<Output = Result<bool>> + Send;
 }
 
-pub(crate) async fn run_project_review_ci_watch_loop(ops: &impl ProjectReviewCiWatchOps) {
+pub(crate) struct ProjectReviewCiWatchScheduler {
+    cancellation_token: CancellationToken,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ProjectReviewCiWatchScheduler {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancellation_token: CancellationToken::new(),
+            task: Mutex::new(None),
+        }
+    }
+
+    pub(crate) async fn start<Ops>(&self, ops: Ops)
+    where
+        Ops: ProjectReviewCiWatchOps + Clone + Send + Sync + 'static,
+    {
+        let mut task = self.task.lock().await;
+        if task.is_some() {
+            return;
+        }
+        let cancellation_token = self.cancellation_token.clone();
+        *task = Some(tokio::spawn(async move {
+            run_project_review_ci_watch_loop(ops, cancellation_token).await;
+        }));
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.cancellation_token.cancel();
+        let Some(task) = self.task.lock().await.take() else {
+            return Ok(());
+        };
+        task.await.map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "project review CI watch scheduler stopped unexpectedly: {error}"
+            ))
+        })
+    }
+}
+
+impl Default for ProjectReviewCiWatchScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn run_project_review_ci_watch_loop<Ops>(ops: Ops, cancellation_token: CancellationToken)
+where
+    Ops: ProjectReviewCiWatchOps,
+{
     let interval = Duration::from_secs(super::PROJECT_REVIEW_CI_WATCH_INTERVAL_SECS);
     loop {
-        if let Err(error) = reconcile_due_project_review_ci_watches(ops, Utc::now()).await {
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+        if let Err(error) = reconcile_due_project_review_ci_watches(&ops, Utc::now()).await {
             tracing::warn!("project review CI watch reconciliation failed: {error}");
         }
-        sleep(interval).await;
+        tokio::select! {
+            _ = cancellation_token.cancelled() => break,
+            _ = sleep(interval) => {}
+        }
     }
 }
 
@@ -307,6 +365,17 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_shutdown_cancels_and_joins_the_watch_loop() {
+        let scheduler = ProjectReviewCiWatchScheduler::new();
+        scheduler.start(FakeCiWatchOps::default()).await;
+        tokio::task::yield_now().await;
+
+        scheduler.shutdown().await.expect("shutdown scheduler");
+
+        assert!(scheduler.task.lock().await.is_none());
     }
 
     #[tokio::test]

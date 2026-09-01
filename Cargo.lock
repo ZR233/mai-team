@@ -454,6 +454,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1190,6 +1196,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1633,6 +1649,8 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
  "image-webp",
  "moxcms",
  "num-traits",
@@ -2439,7 +2457,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2478,7 +2496,7 @@ dependencies = [
 [[package]]
 name = "pl-lsp"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "futures",
  "lsp-server",
@@ -2498,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "pl-model"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "async-openai",
  "futures",
@@ -2519,7 +2537,7 @@ dependencies = [
 [[package]]
 name = "pl-output"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "serde",
 ]
@@ -2527,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "pl-patch"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2535,7 +2553,7 @@ dependencies = [
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "serde",
  "serde_json",
@@ -2546,7 +2564,7 @@ dependencies = [
 [[package]]
 name = "pl-skill-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "gray_matter",
  "serde",
@@ -2556,7 +2574,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=cc967ef382f263d2a82fd80e16c866a4aa52b077#cc967ef382f263d2a82fd80e16c866a4aa52b077"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=04131ee5f412aed6b08a623ee189fda793bd2133#04131ee5f412aed6b08a623ee189fda793bd2133"
 dependencies = [
  "pl-protocol",
  "serde",
@@ -4493,6 +4511,12 @@ checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "which"

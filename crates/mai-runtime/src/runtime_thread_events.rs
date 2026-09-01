@@ -51,6 +51,7 @@ impl AgentRuntime {
             .ok_or_else(|| RuntimeError::ThreadNotFound(thread_id.clone()))?;
         let snapshot = self.ensure_framework_agent(product_agent_id).await?;
         ensure_live_canonical_thread(&snapshot)?;
+        let purpose = crate::agent_host::product_thread_purpose(&agent).await;
         let mut inner = self
             .framework_handle()?
             .subscribe_thread(ThreadSubscriptionRequest {
@@ -58,7 +59,9 @@ impl AgentRuntime {
             })
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         inner
-            .replace_bootstrap_thread(crate::agent_host::thread_metadata(&summary, &snapshot))
+            .replace_bootstrap_thread(crate::agent_host::thread_metadata(
+                &summary, &snapshot, purpose,
+            ))
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         Ok(MaiThreadEventSubscription {
             inner,
@@ -77,11 +80,12 @@ impl AgentRuntime {
         let framework_id = pl_core::ThreadId::new(thread_id)?;
         let snapshot = self.ensure_framework_agent(product_agent_id).await?;
         ensure_live_canonical_thread(&snapshot)?;
+        let purpose = crate::agent_host::product_thread_purpose(&agent).await;
         let mut thread = self
             .framework_handle()?
             .thread_snapshot(&framework_id)
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        thread.thread = crate::agent_host::thread_metadata(&summary, &snapshot);
+        thread.thread = crate::agent_host::thread_metadata(&summary, &snapshot, purpose);
         Ok(thread)
     }
 

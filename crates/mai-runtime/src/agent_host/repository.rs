@@ -370,7 +370,7 @@ struct StoredThreadActorDocument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredThreadContextDocument {
-    metadata: serde_json::Value,
+    metadata: pl_core::ThreadContextMetadata,
     session: AgentSessionSnapshot,
     usage: TokenUsage,
     billing_by_turn: BTreeMap<String, TurnBillingRecord>,

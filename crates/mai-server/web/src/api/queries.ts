@@ -9,6 +9,7 @@ import type {
   PullRequestReviewHistoryPage,
   PullRequestReviewPage,
   ProjectDetail,
+  ProjectReviewDiscoverySnapshot,
   ReviewJobDetail,
   ReviewRunDetail,
   ReviewRunsResponse,
@@ -26,6 +27,7 @@ export const queryKeys = {
   projects: ["projects"] as const,
   project: (id: string, agentId?: string | null) => ["projects", id, agentId ?? "maintainer"] as const,
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
+  projectReviewDiscovery: (id: string) => ["projects", id, "review-discovery"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
   projectPullRequestReviews: (id: string) => ["projects", id, "pull-request-reviews"] as const,
   projectPullRequestReviewPage: (id: string, page: number, pageSize: number) => ["projects", id, "pull-request-reviews", page, pageSize] as const,
@@ -89,6 +91,13 @@ export const projectReviewRunsQuery = (id: string) => queryOptions({
   queryKey: queryKeys.projectReviewRuns(id),
   queryFn: () => api<ReviewRunsResponse>(`/projects/${id}/review-runs?offset=0&limit=50`),
   enabled: Boolean(id),
+})
+
+export const projectReviewDiscoveryQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.projectReviewDiscovery(id),
+  queryFn: () => api<ProjectReviewDiscoverySnapshot>(`/projects/${id}/review-discovery`),
+  enabled: Boolean(id),
+  refetchInterval: 60_000,
 })
 
 export const projectReviewRunQuery = (projectId: string, runId?: string | null) => queryOptions({

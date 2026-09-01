@@ -15,11 +15,7 @@ use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
 
-const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 3] = [
-    (".claude/skills", "claude"),
-    (".agents/skills", "agents"),
-    ("skills", "skills"),
-];
+const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 1] = [(".agents/skills", "agents")];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectSkillSourceDir {
@@ -333,29 +329,19 @@ mod tests {
     fn parses_detected_dirs_from_sidecar_stdout() {
         let sources = detected_dirs_from_stdout(
             "/workspace/repo",
-            ".claude/skills\tclaude\t/workspace/repo/.claude/skills\n\
-             skills\tskills\t/workspace/repo/skills\n",
+            ".agents/skills\tagents\t/workspace/repo/.agents/skills\n",
         )
         .expect("parse sources");
 
         assert_eq!(
             sources,
-            vec![
-                ProjectSkillSourceDir {
-                    cache_name: "claude".to_string(),
-                    relative_path: ".claude/skills".to_string(),
-                    container_path: "/workspace/repo/.claude/skills".to_string(),
-                    host_path: None,
-                    host_repository_root: None,
-                },
-                ProjectSkillSourceDir {
-                    cache_name: "skills".to_string(),
-                    relative_path: "skills".to_string(),
-                    container_path: "/workspace/repo/skills".to_string(),
-                    host_path: None,
-                    host_repository_root: None,
-                },
-            ]
+            vec![ProjectSkillSourceDir {
+                cache_name: "agents".to_string(),
+                relative_path: ".agents/skills".to_string(),
+                container_path: "/workspace/repo/.agents/skills".to_string(),
+                host_path: None,
+                host_repository_root: None,
+            }]
         );
     }
 
@@ -397,14 +383,14 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let repository = temp.path().join("repository");
-        let agents_skill = repository.join(".agents/skills/arceos-test-adapter");
-        std::fs::create_dir_all(&agents_skill).expect("canonical skill directory");
-        std::fs::write(agents_skill.join("SKILL.md"), "# Test Adapter\n").expect("canonical skill");
-        let claude_skills = repository.join(".claude/skills");
-        std::fs::create_dir_all(&claude_skills).expect("claude skill directory");
+        let shared_skill = repository.join("skill-library/arceos-test-adapter");
+        std::fs::create_dir_all(&shared_skill).expect("shared skill directory");
+        std::fs::write(shared_skill.join("SKILL.md"), "# Test Adapter\n").expect("canonical skill");
+        let agents_skills = repository.join(".agents/skills");
+        std::fs::create_dir_all(&agents_skills).expect("canonical skill root");
         symlink(
-            "../../.agents/skills/arceos-test-adapter",
-            claude_skills.join("arceos-test-adapter"),
+            "../../skill-library/arceos-test-adapter",
+            agents_skills.join("arceos-test-adapter"),
         )
         .expect("project-internal skill symlink");
 
@@ -412,17 +398,17 @@ mod tests {
         refresh_cache_dir(
             &cache,
             &[ProjectSkillSourceDir {
-                cache_name: "claude".to_string(),
-                relative_path: ".claude/skills".to_string(),
-                container_path: "/workspace/repo/.claude/skills".to_string(),
-                host_path: Some(claude_skills),
+                cache_name: "agents".to_string(),
+                relative_path: ".agents/skills".to_string(),
+                container_path: "/workspace/repo/.agents/skills".to_string(),
+                host_path: Some(agents_skills),
                 host_repository_root: Some(repository),
             }],
         )
         .expect("materialize skill cache");
 
         assert_eq!(
-            std::fs::read_to_string(cache.join("claude/arceos-test-adapter/SKILL.md"))
+            std::fs::read_to_string(cache.join("agents/arceos-test-adapter/SKILL.md"))
                 .expect("materialized skill"),
             "# Test Adapter\n"
         );
@@ -435,21 +421,21 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let repository = temp.path().join("repository");
-        let claude_skills = repository.join(".claude/skills");
-        std::fs::create_dir_all(&claude_skills).expect("claude skill directory");
+        let agents_skills = repository.join(".agents/skills");
+        std::fs::create_dir_all(&agents_skills).expect("canonical skill root");
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside directory");
         std::fs::write(outside.join("SKILL.md"), "# Outside\n").expect("outside skill");
-        symlink("../../../outside", claude_skills.join("outside"))
+        symlink("../../../outside", agents_skills.join("outside"))
             .expect("out-of-repository symlink");
 
         let error = refresh_cache_dir(
             &temp.path().join("cache"),
             &[ProjectSkillSourceDir {
-                cache_name: "claude".to_string(),
-                relative_path: ".claude/skills".to_string(),
-                container_path: "/workspace/repo/.claude/skills".to_string(),
-                host_path: Some(claude_skills),
+                cache_name: "agents".to_string(),
+                relative_path: ".agents/skills".to_string(),
+                container_path: "/workspace/repo/.agents/skills".to_string(),
+                host_path: Some(agents_skills),
                 host_repository_root: Some(repository),
             }],
         )

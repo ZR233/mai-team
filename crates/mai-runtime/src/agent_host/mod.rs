@@ -1,6 +1,7 @@
 mod events;
 mod lifecycle;
 mod policy;
+mod profile_catalog;
 mod repository;
 mod review_manifest;
 mod thread;
@@ -17,9 +18,14 @@ use crate::{AgentRuntime, MaiConfig, RuntimeError};
 pub(crate) use events::{MaiAgentCommitObserver, synchronize_runtime_state};
 pub(crate) use lifecycle::MaiAgentLifecycle;
 pub(crate) use policy::{MaiPolicyContext, compile_execution_policy};
+pub(crate) use profile_catalog::{
+    product_snapshot as product_agent_profile, resolve_route, snapshot as agent_profile,
+    snapshots as agent_profiles, workspace_assignment as agent_workspace_assignment,
+};
 pub(crate) use repository::MaiAgentRepository;
 pub(crate) use thread::{
-    aggregate_usage, canonical_id, last_agent_response, load_runtime, thread_metadata,
+    aggregate_usage, canonical_id, last_agent_response, load_runtime, product_thread_purpose,
+    thread_metadata,
 };
 pub(crate) use turn_factory::{MaiAgentTurnFactory, product_agent};
 

@@ -8,9 +8,10 @@ use serde::Deserialize;
 use mai_protocol::{
     AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId,
     ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
-    ProjectPullRequestStateRefreshSummary, ProjectReviewJobDetail, ProjectReviewQueueResponse,
-    ProjectReviewRunDetail, ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse,
-    SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ProjectPullRequestStateRefreshSummary, ProjectReviewDiscoverySnapshot, ProjectReviewJobDetail,
+    ProjectReviewQueueResponse, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    SendMessageRequest, SendMessageResponse, SkillsListResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
@@ -92,6 +93,13 @@ pub(crate) async fn list_project_review_runs(
             )
             .await?,
     ))
+}
+
+pub(crate) async fn get_project_review_discovery(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+) -> std::result::Result<Json<ProjectReviewDiscoverySnapshot>, ApiError> {
+    Ok(Json(state.runtime.project_review_discovery(id).await?))
 }
 
 pub(crate) async fn get_project_review_run(
@@ -350,6 +358,40 @@ mod tests {
                 jobs: vec![active_job],
             },
             response
+        );
+        let queued_events = state
+            .store
+            .product_events_after(0, 100)
+            .await
+            .expect("load product events")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    mai_protocol::MaiProductEventKind::ProjectReviewQueued { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            0, queued_events,
+            "deduped admission must not publish queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_review_discovery_returns_runtime_snapshot() {
+        let project_id = ProjectId::new_v4();
+        let maintainer_id = AgentId::new_v4();
+        let (state, _dir) = test_app_state(project_id, maintainer_id).await;
+
+        let snapshot = get_project_review_discovery(State(state), Path(project_id))
+            .await
+            .expect("get discovery snapshot")
+            .0;
+
+        assert_eq!(
+            mai_protocol::ProjectReviewDiscoverySnapshot::default(),
+            snapshot
         );
     }
 

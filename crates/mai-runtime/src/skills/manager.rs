@@ -10,6 +10,7 @@ use pl_core::skill::{
 use tokio_util::sync::CancellationToken;
 
 use crate::config::MaiSkillsConfig;
+use crate::skills::review_mode::{MaiReviewModeProvider, REVIEW_MODE_ID};
 use crate::{Result, RuntimeError};
 
 /// mai 产品层声明 Skill 来源，PL 负责发现、校验、冻结、加载与资源读取。
@@ -139,16 +140,23 @@ impl SkillCatalogService {
 
     async fn discover_with_disabled(
         &self,
-        disabled: Vec<String>,
+        mut disabled: Vec<String>,
         cancellation: CancellationToken,
     ) -> Result<Arc<FrozenSkillCatalog>> {
+        // Review Mode 是产品会话不变量，不是用户可禁用的普通 Skill。
+        disabled.retain(|name| !name.eq_ignore_ascii_case(REVIEW_MODE_ID));
         let provider = FileSystemSkillProvider::from_directories(
             "mai-filesystem-skills",
             self.sources.clone(),
         )
         .map_err(RuntimeError::Model)?;
         let registry = SkillRegistry::new();
-        let _registration = registry
+        let _review_mode_registration = registry
+            .register(Arc::new(
+                MaiReviewModeProvider::new().map_err(RuntimeError::Model)?,
+            ))
+            .map_err(RuntimeError::Model)?;
+        let _filesystem_registration = registry
             .register(Arc::new(provider))
             .map_err(RuntimeError::Model)?;
         let config = pl_core::SkillsConfig {
@@ -256,6 +264,50 @@ mod tests {
         assert_eq!(listed.skills.len(), 1);
         assert_eq!(listed.skills[0].description, "project");
         assert!(!listed.skills[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn review_mode_is_preloaded_only_and_cannot_be_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let service = SkillCatalogService::with_roots(root.path(), Vec::new());
+        let request = SkillsConfigRequest {
+            disabled: vec![REVIEW_MODE_ID.to_string()],
+        };
+
+        let catalog = service
+            .discover(
+                &request,
+                &MaiSkillsConfig::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let definition = catalog
+            .load(
+                REVIEW_MODE_ID,
+                pl_core::skill::SkillLoadInvocation::Mode,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(catalog.snapshot().skills.is_empty());
+        assert_eq!(catalog.snapshot().modes.len(), 1);
+        assert_eq!(catalog.snapshot().modes[0].name, REVIEW_MODE_ID);
+        assert_eq!(
+            definition.content,
+            super::super::review_mode::REVIEW_MODE_CONTENT
+        );
+        assert!(
+            catalog
+                .load(
+                    REVIEW_MODE_ID,
+                    pl_core::skill::SkillLoadInvocation::Model,
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
     }
 
     fn write_skill(root: &Path, name: &str, description: &str) {

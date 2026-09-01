@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 
 use mai_protocol::{AgentRole, CreateAgentRequest};
 use pl_core::{AgentLifecycleAdapter, CloseLifecycleRequest, SpawnLifecycleRequest};
+use pl_protocol::{AgentWorkspaceAssignmentSnapshot, AgentWorkspaceMode};
 
 use crate::{AgentRuntime, Result, RuntimeError, agents};
 
@@ -27,6 +28,7 @@ impl MaiAgentLifecycle {
 pub(crate) struct MaiSpawnLease {
     runtime: Weak<AgentRuntime>,
     product_agent_id: mai_protocol::AgentId,
+    assignment: AgentWorkspaceAssignmentSnapshot,
     ownership: SpawnProductOwnership,
     armed: AtomicBool,
 }
@@ -42,19 +44,29 @@ pub(crate) struct MaiCloseLease {
 }
 
 impl MaiSpawnLease {
-    fn borrowed(runtime: &Arc<AgentRuntime>, product_agent_id: mai_protocol::AgentId) -> Self {
+    fn borrowed(
+        runtime: &Arc<AgentRuntime>,
+        product_agent_id: mai_protocol::AgentId,
+        assignment: AgentWorkspaceAssignmentSnapshot,
+    ) -> Self {
         Self {
             runtime: Arc::downgrade(runtime),
             product_agent_id,
+            assignment,
             ownership: SpawnProductOwnership::Borrowed,
             armed: AtomicBool::new(false),
         }
     }
 
-    fn created_here(runtime: &Arc<AgentRuntime>, product_agent_id: mai_protocol::AgentId) -> Self {
+    fn created_here(
+        runtime: &Arc<AgentRuntime>,
+        product_agent_id: mai_protocol::AgentId,
+        assignment: AgentWorkspaceAssignmentSnapshot,
+    ) -> Self {
         Self {
             runtime: Arc::downgrade(runtime),
             product_agent_id,
+            assignment,
             ownership: SpawnProductOwnership::CreatedHere,
             armed: AtomicBool::new(true),
         }
@@ -125,14 +137,33 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
 
     async fn prepare_spawn(&self, request: SpawnLifecycleRequest) -> Result<Self::SpawnLease> {
         let runtime = self.runtime()?;
-        if let Ok((product_agent_id, _)) =
-            super::turn_factory::product_agent(&runtime, &request.child.identity.id).await
-        {
-            return Ok(MaiSpawnLease::borrowed(&runtime, product_agent_id));
+        let profile = request.agent_profile.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidInput("child Agent spawn has no frozen Profile".to_string())
+        })?;
+        if profile.profile_id != request.child.identity.role.as_str() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "frozen Profile `{}` does not match child role `{}`",
+                profile.profile_id, request.child.identity.role
+            )));
         }
         let (parent_id, parent) =
             super::turn_factory::product_agent(&runtime, &request.parent.identity.id).await?;
         let parent_summary = parent.summary.read().await.clone();
+        let workspace_root = if parent_summary.project_id.is_some() {
+            crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
+        } else {
+            "/workspace"
+        };
+        let assignment = workspace_assignment(profile, workspace_root, &request)?;
+        if let Ok((product_agent_id, _)) =
+            super::turn_factory::product_agent(&runtime, &request.child.identity.id).await
+        {
+            return Ok(MaiSpawnLease::borrowed(
+                &runtime,
+                product_agent_id,
+                assignment,
+            ));
+        }
         let parent_container_id = runtime.container_id(parent_id).await?;
         let role = AgentRole::from_str(request.child.identity.role.as_str()).map_err(|error| {
             RuntimeError::InvalidInput(format!(
@@ -158,12 +189,12 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
                 product_agent_id,
                 CreateAgentRequest {
                     name,
-                    provider_id: Some(parent_summary.provider_id.clone()),
-                    model: Some(parent_summary.model.clone()),
-                    reasoning_effort: parent_summary.reasoning_effort.clone(),
+                    provider_id: Some(profile.provider_id.clone()),
+                    model: Some(profile.model.clone()),
+                    reasoning_effort: profile.effort.clone(),
                     docker_image: Some(parent_summary.docker_image.clone()),
                     parent_id: Some(parent_id),
-                    system_prompt: Some(agents::task_role_system_prompt(role).to_string()),
+                    system_prompt: Some(profile.system_instructions.clone()),
                 },
                 agents::ContainerSource::CloneFrom {
                     parent_container_id,
@@ -176,7 +207,45 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
             )
             .await?;
         resource.commit();
-        Ok(MaiSpawnLease::created_here(&runtime, product_agent_id))
+        Ok(MaiSpawnLease::created_here(
+            &runtime,
+            product_agent_id,
+            assignment,
+        ))
+    }
+
+    fn workspace_assignment(
+        &self,
+        lease: &Self::SpawnLease,
+    ) -> Result<Option<AgentWorkspaceAssignmentSnapshot>> {
+        Ok(Some(lease.assignment.clone()))
+    }
+
+    fn initial_context(
+        &self,
+        lease: &Self::SpawnLease,
+    ) -> Result<Vec<pl_core::PinnedContextSection>> {
+        let warning = match lease.assignment.mode {
+            AgentWorkspaceMode::Unrestricted => {
+                "This Profile adds no workspace restriction beyond the product container boundary."
+            }
+            AgentWorkspaceMode::Directory => {
+                "writablePaths is enforced by Mai's built-in file backend; shell, Git, and MCP remain cooperative capabilities and must honor the same receipt."
+            }
+            AgentWorkspaceMode::Worktree => {
+                return Err(RuntimeError::InvalidInput(
+                    "mai does not advertise worktree Agent Profiles".to_string(),
+                ));
+            }
+        };
+        let receipt = serde_json::to_string_pretty(&lease.assignment)
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        Ok(vec![pl_core::context_section(
+            "agent.workspace",
+            1,
+            "Frozen Agent Workspace",
+            format!("{warning}\n\nCanonical workspace receipt:\n{receipt}"),
+        )?])
     }
 
     async fn activate_spawn(&self, lease: &Self::SpawnLease) -> Result<()> {
@@ -240,4 +309,32 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
             "agent resource close cannot be rolled back after destructive cleanup".to_string(),
         ))
     }
+}
+
+fn workspace_assignment(
+    profile: &pl_protocol::AgentProfileSnapshot,
+    project_root: &str,
+    request: &SpawnLifecycleRequest,
+) -> Result<AgentWorkspaceAssignmentSnapshot> {
+    let metadata_mode: AgentWorkspaceMode =
+        serde_json::from_value(request.metadata.get("workspaceMode").cloned().ok_or_else(
+            || RuntimeError::InvalidInput("spawn metadata has no workspace mode".to_string()),
+        )?)
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    if metadata_mode != profile.workspace_mode {
+        return Err(RuntimeError::InvalidInput(format!(
+            "spawn workspace mode `{}` does not match frozen Profile mode `{}`",
+            metadata_mode.label(),
+            profile.workspace_mode.label()
+        )));
+    }
+    let writable_paths: Option<Vec<String>> = serde_json::from_value(
+        request
+            .metadata
+            .get("writablePaths")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    super::agent_workspace_assignment(profile, project_root, writable_paths)
 }

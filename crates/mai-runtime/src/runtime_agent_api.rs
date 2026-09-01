@@ -46,8 +46,9 @@ impl AgentRuntime {
         let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
         let mut summary = agent.summary.read().await.clone();
         summary.token_usage = agent_host::aggregate_usage(&runtime);
+        let purpose = agent_host::product_thread_purpose(&agent).await;
         Ok(AgentDetail {
-            thread: agent_host::thread_metadata(&summary, &snapshot),
+            thread: agent_host::thread_metadata(&summary, &snapshot, purpose),
             summary,
         })
     }
@@ -344,16 +345,25 @@ impl AgentRuntime {
         let parent_runtime_id = agent_host::canonical_id(parent_agent_id)?;
         let child_id = AgentId::new_v4();
         let thread_id = pl_core::ThreadId::new(child_id.to_string())?;
+        let profile = agent_host::agent_profile(&self.mai_config.read().await.models, role)?;
+        let mut session = pl_core::ThreadContextState::empty();
+        session.session.replace_agent_profile(Some(profile.clone()));
         let result = self
             .framework_handle()?
             .spawn(pl_core::AgentSpawnRequest {
                 thread_id,
                 parent_id: parent_runtime_id,
                 role: pl_core::AgentRoleId::new(role.to_string())?,
-                session: pl_core::ThreadContextState::empty(),
+                session,
                 initial_turn_id: None,
                 initial_message: None,
-                metadata: json!({ "name": name.clone(), "taskName": name }),
+                metadata: json!({
+                    "name": name.clone(),
+                    "taskName": name,
+                    "profileId": profile.profile_id,
+                    "workspaceMode": profile.workspace_mode,
+                    "writablePaths": null,
+                }),
             })
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;

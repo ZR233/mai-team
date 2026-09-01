@@ -4,8 +4,9 @@ use std::sync::Arc;
 use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
 use mai_protocol::{
-    AgentId, AgentSummary, ArtifactInfo, PlanHistoryEntry, ProjectId, ProjectSummary, TaskId,
-    TaskPlan, TaskReview, TaskSummary,
+    AgentId, AgentSummary, ArtifactInfo, PlanHistoryEntry, ProjectId,
+    ProjectReviewDiscoverySnapshot, ProjectReviewDiscoveryState, ProjectSummary, TaskId, TaskPlan,
+    TaskReview, TaskSummary,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,7 @@ impl RuntimeState {
 
 pub(crate) struct ProjectRecord {
     pub(crate) summary: RwLock<ProjectSummary>,
+    pub(crate) review_discovery: RwLock<ProjectReviewDiscoverySnapshot>,
     pub(crate) sidecar: RwLock<Option<ContainerHandle>>,
     pub(crate) repo_sync_lock: Mutex<()>,
     pub(crate) review_cycle_lock: Mutex<()>,
@@ -55,8 +57,17 @@ pub(crate) struct ProjectRecord {
 
 impl ProjectRecord {
     pub(crate) fn new(summary: ProjectSummary) -> Self {
+        let discovery_state = if summary.auto_review_enabled {
+            ProjectReviewDiscoveryState::Scanning
+        } else {
+            ProjectReviewDiscoveryState::Disabled
+        };
         Self {
             summary: RwLock::new(summary),
+            review_discovery: RwLock::new(ProjectReviewDiscoverySnapshot {
+                state: discovery_state,
+                ..Default::default()
+            }),
             sidecar: RwLock::new(None),
             repo_sync_lock: Mutex::new(()),
             review_cycle_lock: Mutex::new(()),
@@ -74,7 +85,6 @@ impl ProjectRecord {
 pub(crate) struct ProjectReviewWorker {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) pool_abort_handle: futures::future::AbortHandle,
-    pub(crate) selector_abort_handle: Option<futures::future::AbortHandle>,
     #[cfg(test)]
     pub(crate) relay_selector_abort_handle: Option<futures::future::AbortHandle>,
 }

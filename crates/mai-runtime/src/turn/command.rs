@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 
 use mai_protocol::{AgentId, ToolOutputArtifactInfo};
 use pl_core::{
-    CommandBackend, CommandOutputSizes, CommandOutputTarget, CommandSpawnRequest,
-    command_output_model_path,
+    CommandBackend, CommandCaptureStream, CommandExit, CommandOutputSizes, CommandOutputTarget,
+    CommandReader, CommandSpawnRequest, CommandWriter, ManagedCommand, command_output_model_path,
     tool::output_format::capture::{
         ToolOutputArtifactPathRequest, ToolOutputCapture, ToolOutputCaptureRequest,
         ToolOutputStreamSizes, tool_output_artifact_file_path,
     },
 };
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::{AgentRuntime, Result, RuntimeError};
@@ -26,6 +27,7 @@ pub(crate) struct MaiCommandBackend {
     workspace_root: PathBuf,
     container_id: Arc<Mutex<Option<String>>>,
     captures: Arc<Mutex<HashMap<PathBuf, ToolOutputCapture>>>,
+    output_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MaiCommandBackend {
@@ -40,6 +42,7 @@ impl MaiCommandBackend {
             workspace_root: workspace_root.into(),
             container_id: Arc::new(Mutex::new(None)),
             captures: Arc::new(Mutex::new(HashMap::new())),
+            output_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -53,7 +56,11 @@ impl MaiCommandBackend {
         resolve_workspace_path(&self.workspace_root, path)
     }
 
-    async fn canonical_workspace_path(&self, candidate: &Path) -> Result<PathBuf> {
+    async fn canonical_workspace_path(
+        &self,
+        candidate: &Path,
+        allow_workspace_escape: bool,
+    ) -> Result<PathBuf> {
         let container_id = self.current_container_id().await?;
         let candidate = candidate.to_str().ok_or_else(|| {
             RuntimeError::InvalidInput("exec cwd must be valid UTF-8".to_string())
@@ -61,11 +68,18 @@ impl MaiCommandBackend {
         let root = self.workspace_root.to_str().ok_or_else(|| {
             RuntimeError::InvalidInput("workspace root must be valid UTF-8".to_string())
         })?;
-        let command = format!(
-            "resolved=$(readlink -f -- {candidate}) || exit 2; case \"$resolved\" in {root}|{root}/*) printf '%s' \"$resolved\" ;; *) exit 3 ;; esac",
-            candidate = pl_core::shell_quote_word(candidate),
-            root = pl_core::shell_quote_word(root),
-        );
+        let command = if allow_workspace_escape {
+            format!(
+                "resolved=$(readlink -f -- {candidate}) || exit 2; printf '%s' \"$resolved\"",
+                candidate = pl_core::shell_quote_word(candidate),
+            )
+        } else {
+            format!(
+                "resolved=$(readlink -f -- {candidate}) || exit 2; case \"$resolved\" in {root}|{root}/*) printf '%s' \"$resolved\" ;; *) exit 3 ;; esac",
+                candidate = pl_core::shell_quote_word(candidate),
+                root = pl_core::shell_quote_word(root),
+            )
+        };
         let output = self
             .runtime
             .deps
@@ -137,13 +151,30 @@ impl CommandBackend for MaiCommandBackend {
     async fn resolve_cwd(
         &self,
         cwd: Option<&Path>,
-        _allow_workspace_escape: bool,
-    ) -> Result<PathBuf> {
-        let candidate = cwd.map_or_else(
-            || Ok(self.workspace_root.clone()),
-            |path| self.workspace_path(path),
-        )?;
-        self.canonical_workspace_path(&candidate).await
+        allow_workspace_escape: bool,
+    ) -> Result<String> {
+        let candidate = if allow_workspace_escape {
+            cwd.map_or_else(
+                || self.workspace_root.clone(),
+                |path| {
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        self.workspace_root.join(path)
+                    }
+                },
+            )
+        } else {
+            cwd.map_or_else(
+                || Ok(self.workspace_root.clone()),
+                |path| self.workspace_path(path),
+            )?
+        };
+        self.canonical_workspace_path(&candidate, allow_workspace_escape)
+            .await?
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| RuntimeError::InvalidInput("exec cwd must be valid UTF-8".to_string()))
     }
 
     async fn output_target(
@@ -188,21 +219,96 @@ impl CommandBackend for MaiCommandBackend {
         Ok(target)
     }
 
-    async fn spawn(&self, request: CommandSpawnRequest) -> Result<tokio::process::Child> {
+    async fn spawn(&self, request: CommandSpawnRequest) -> Result<ManagedCommand> {
         let container_id = self.current_container_id().await?;
-        let cwd = request.cwd.to_str().ok_or_else(|| {
-            RuntimeError::InvalidInput("exec cwd must be valid UTF-8".to_string())
-        })?;
-        self.runtime
+        let mut child = self
+            .runtime
             .deps
             .docker
             .spawn_managed_exec(
                 &container_id,
                 &request.process_id,
                 &request.command,
-                Some(cwd),
+                Some(&request.cwd),
             )
-            .map_err(Into::into)
+            .map_err(RuntimeError::from)?;
+        let host_pid = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .map(|value| Box::pin(value) as CommandWriter);
+        let stdout = child
+            .stdout
+            .take()
+            .map(|value| Box::pin(value) as CommandReader);
+        let stderr = child
+            .stderr
+            .take()
+            .map(|value| Box::pin(value) as CommandReader);
+        Ok(ManagedCommand::new(
+            host_pid,
+            stdin,
+            stdout,
+            stderr,
+            async move {
+                child
+                    .wait()
+                    .await
+                    .map(|status| CommandExit {
+                        exit_code: status.code(),
+                    })
+                    .map_err(|error| format!("failed to wait for container command: {error}"))
+            },
+        ))
+    }
+
+    async fn prepare_output(
+        &self,
+        target: &CommandOutputTarget,
+        command: &str,
+        working_directory: &str,
+    ) -> Result<()> {
+        let _guard = self.output_write_lock.lock().await;
+        if let Some(parent) = target.capture_file().parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let header = format!("=== COMMAND ===\n{command}\n\n=== CWD ===\n{working_directory}\n\n");
+        tokio::fs::write(target.capture_file(), header).await?;
+        Ok(())
+    }
+
+    async fn append_output_chunk(
+        &self,
+        target: &CommandOutputTarget,
+        stream: CommandCaptureStream,
+        chunk: &[u8],
+    ) -> Result<()> {
+        let _guard = self.output_write_lock.lock().await;
+        let mut combined = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target.capture_file())
+            .await?;
+        let (label, stream_file) = match stream {
+            CommandCaptureStream::Stdout => ("STDOUT", target.stdout_capture_file()),
+            CommandCaptureStream::Stderr => ("STDERR", target.stderr_capture_file()),
+        };
+        combined
+            .write_all(format!("=== {label} ===\n").as_bytes())
+            .await?;
+        combined.write_all(chunk).await?;
+        if !chunk.ends_with(b"\n") {
+            combined.write_all(b"\n").await?;
+        }
+        if let Some(stream_file) = stream_file {
+            let mut capture = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(stream_file)
+                .await?;
+            capture.write_all(chunk).await?;
+        }
+        Ok(())
     }
 
     async fn publish_output(&self, target: &CommandOutputTarget) -> Result<()> {

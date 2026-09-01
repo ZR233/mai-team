@@ -24,41 +24,7 @@ impl MaiStore {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let connection = open_ci_watch_connection(&path)?;
-            let id = ci_watch_id(watch.project_id, watch.pr);
-            connection.execute(
-                "INSERT INTO project_review_ci_watches (
-                    id, project_id, pr, head_sha, delivery_id, reason,
-                    next_check_at, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(id) DO UPDATE SET
-                    delivery_id = CASE
-                        WHEN project_review_ci_watches.head_sha != excluded.head_sha
-                            THEN excluded.delivery_id
-                        ELSE COALESCE(
-                            project_review_ci_watches.delivery_id,
-                            excluded.delivery_id
-                        )
-                    END,
-                    reason = CASE
-                        WHEN project_review_ci_watches.head_sha != excluded.head_sha
-                            THEN excluded.reason
-                        ELSE project_review_ci_watches.reason
-                    END,
-                    head_sha = excluded.head_sha,
-                    next_check_at = excluded.next_check_at,
-                    updated_at = excluded.updated_at",
-                params![
-                    id,
-                    watch.project_id.to_string(),
-                    u64_to_i64(watch.pr),
-                    watch.head_sha,
-                    watch.delivery_id,
-                    watch.reason,
-                    watch.next_check_at.to_rfc3339(),
-                    watch.created_at.to_rfc3339(),
-                    watch.updated_at.to_rfc3339(),
-                ],
-            )?;
+            upsert_project_review_ci_watch_on_connection(&connection, &watch)?;
             Ok(())
         })
         .await
@@ -245,6 +211,48 @@ impl MaiStore {
             StoreError::InvalidConfig(format!("CI watch lookup task failed: {error}"))
         })?
     }
+}
+
+pub(crate) fn upsert_project_review_ci_watch_on_connection(
+    connection: &Connection,
+    watch: &ProjectReviewCiWatch,
+) -> Result<()> {
+    let id = ci_watch_id(watch.project_id, watch.pr);
+    connection.execute(
+        "INSERT INTO project_review_ci_watches (
+            id, project_id, pr, head_sha, delivery_id, reason,
+            next_check_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+            delivery_id = CASE
+                WHEN project_review_ci_watches.head_sha != excluded.head_sha
+                    THEN excluded.delivery_id
+                ELSE COALESCE(
+                    project_review_ci_watches.delivery_id,
+                    excluded.delivery_id
+                )
+            END,
+            reason = CASE
+                WHEN project_review_ci_watches.head_sha != excluded.head_sha
+                    THEN excluded.reason
+                ELSE project_review_ci_watches.reason
+            END,
+            head_sha = excluded.head_sha,
+            next_check_at = excluded.next_check_at,
+            updated_at = excluded.updated_at",
+        params![
+            id,
+            watch.project_id.to_string(),
+            u64_to_i64(watch.pr),
+            watch.head_sha,
+            watch.delivery_id,
+            watch.reason,
+            watch.next_check_at.to_rfc3339(),
+            watch.created_at.to_rfc3339(),
+            watch.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn ci_watch_from_row(

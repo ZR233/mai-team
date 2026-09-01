@@ -40,10 +40,13 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         let (product_agent_id, agent) =
             product_agent(&runtime, &context.snapshot.identity.id).await?;
         let config = self.config.read().await.clone();
-        let route = config
-            .models
-            .resolve(&context.snapshot.identity.role)
-            .map_err(RuntimeError::Model)?;
+        let frozen_profile = context.session.agent_profile().cloned();
+        let route = super::resolve_route(
+            &config.models,
+            &context.snapshot.identity.role,
+            frozen_profile.as_ref(),
+        )?;
+        let agent_profiles = super::agent_profiles(&config.models)?;
         let web_search = pl_core::plan_web_search(&config.models, &route, &config.web_search)?;
         let exclusive_web_search =
             web_search.visibility == pl_core::ToolVisibilityConstraint::Exclusive;
@@ -63,6 +66,15 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 context.cancellation_token.clone(),
             )
             .await?;
+        let review_context = agent.review_context.read().await.clone();
+        let review_mode = if review_context.is_some() {
+            Some(
+                resolve_review_mode_snapshot(&skill_catalog, context.cancellation_token.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut skills_response =
             skill_catalog_service.project(&skill_catalog, &skills_config, &config.skills);
         if let Some(project_id) = agent.summary.read().await.project_id {
@@ -110,23 +122,32 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         let policy_context = super::MaiPolicyContext {
             can_manage_agents: super::policy::can_manage_agents(&runtime.state, &agent).await,
         };
-        let configured_roles = config.models.routes.keys().cloned().collect::<Vec<_>>();
+        let configured_roles = agent_profiles
+            .iter()
+            .map(|profile| pl_core::AgentRoleId::new(profile.profile_id.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(RuntimeError::Model)?;
         let policy =
             super::compile_execution_policy(&context.snapshot, configured_roles, policy_context);
+        let system_prompt = frozen_profile
+            .as_ref()
+            .map(|profile| profile.system_instructions.as_str())
+            .or(agent.system_prompt.as_deref());
         let generated_instructions =
-            crate::instructions::build_instructions(agent.system_prompt.as_deref(), &mcp_tools);
+            crate::instructions::build_instructions(system_prompt, &mcp_tools);
         let workspace_instructions = runtime
             .project_review_workspace_instructions_for_agent(&agent)
             .await?;
-        let review_manifest = agent
-            .review_context
-            .read()
-            .await
+        let review_manifest = review_context
             .as_deref()
             .map(|context| super::review_manifest::section(context, &skill_load.activations))
             .transpose()?;
         let mut instruction_profile =
             InstructionProfile::new().with_developer_block("mai runtime", generated_instructions);
+        if let Some(mode) = &review_mode {
+            instruction_profile = instruction_profile
+                .with_developer_block(format!("PL Mode {}", mode.mode_id), mode.content.clone());
+        }
         if !config.instructions.base.trim().is_empty() {
             instruction_profile =
                 instruction_profile.with_base_system_prompt(config.instructions.base.clone());
@@ -141,16 +162,19 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             instruction_profile = instruction_profile
                 .with_user_context_block("mai config user", config.instructions.user.clone());
         }
-        let workspace_root = if agent.summary.read().await.project_id.is_some() {
+        let product_has_project = agent.summary.read().await.project_id.is_some();
+        let workspace_root = if product_has_project {
             crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
         } else {
             "/workspace"
         };
+        let agent_workspace = resolve_agent_workspace(
+            context.snapshot.identity.parent_id.is_some(),
+            workspace_root,
+            context.session.workspace_assignment(),
+        )?;
         let mut profile = CoreRuntimeProfile::minimal()
-            .with_agent_workspace(AgentWorkspace::confined(
-                workspace_root,
-                pl_core::WorkspaceMutability::ReadWrite,
-            ))
+            .with_agent_workspace(agent_workspace.clone())
             .with_instruction_profile(instruction_profile)
             .with_context_compaction(context_compaction());
         if let Some(workspace_instructions) = workspace_instructions {
@@ -168,7 +192,11 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                     let refresh_agent = refresh_agent.clone();
                     async move {
                         let tools = if let Some(runtime) = refresh_agent.mcp.read().await.clone() {
-                            runtime.handle().acquire_turn_lease().await?.agent_tools()
+                            runtime
+                                .handle()
+                                .acquire_turn_lease()
+                                .await?
+                                .agent_tools(None)
                         } else {
                             Vec::new()
                         };
@@ -189,9 +217,16 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 framework_agent_id: context.snapshot.identity.id.clone(),
                 framework_runtime: context.runtime.clone(),
                 policy: policy.clone(),
+                workspace: agent_workspace,
+                profiles: agent_profiles,
                 agent_tools,
                 skill_catalog: engine_skill_catalog,
                 exclusive_web_search,
+                collaboration: if review_mode.is_some() {
+                    crate::turn::core_adapter::CollaborationAvailability::Disabled
+                } else {
+                    crate::turn::core_adapter::CollaborationAvailability::Enabled
+                },
             },
         )
         .await?;
@@ -225,6 +260,102 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
     }
 }
 
+async fn resolve_review_mode_snapshot(
+    catalog: &pl_core::skill::FrozenSkillCatalog,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<pl_protocol::ModeInstructionSnapshot> {
+    let metadata = catalog
+        .find_mode(crate::skills::REVIEW_MODE_ID)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "required mai Review Mode is unavailable in the frozen PL catalog".to_string(),
+            )
+        })?;
+    let definition = catalog
+        .load(
+            crate::skills::REVIEW_MODE_ID,
+            pl_core::skill::SkillLoadInvocation::Mode,
+            cancellation,
+        )
+        .await
+        .map_err(RuntimeError::Model)?;
+    let mode = metadata.mode.as_ref().ok_or_else(|| {
+        RuntimeError::InvalidInput("required mai Review Mode has no PL mode metadata".to_string())
+    })?;
+    Ok(pl_protocol::ModeInstructionSnapshot {
+        mode_id: definition.summary.name,
+        display_name: mode.display_name.clone(),
+        source: skill_source_label(definition.summary.source).to_string(),
+        provider_id: definition.summary.provider_id.as_str().to_string(),
+        revision: definition.revision,
+        content_hash: pl_core::canonical_content_hash(definition.content.as_bytes()),
+        content: definition.content,
+    })
+}
+
+fn skill_source_label(source: pl_core::skill::SkillSourceKind) -> &'static str {
+    match source {
+        pl_core::skill::SkillSourceKind::Project => "project",
+        pl_core::skill::SkillSourceKind::User => "user",
+        pl_core::skill::SkillSourceKind::System => "system",
+        pl_core::skill::SkillSourceKind::External => "external",
+    }
+}
+
+fn resolve_agent_workspace(
+    is_child: bool,
+    product_root: &str,
+    assignment: Option<&pl_protocol::AgentWorkspaceAssignmentSnapshot>,
+) -> Result<AgentWorkspace> {
+    if !is_child {
+        return Ok(AgentWorkspace::confined(
+            product_root,
+            pl_core::WorkspaceMutability::ReadWrite,
+        ));
+    }
+    let assignment = assignment.ok_or_else(|| {
+        RuntimeError::InvalidInput("child Agent has no frozen workspace assignment".to_string())
+    })?;
+    if assignment.project_root != product_root {
+        return Err(RuntimeError::InvalidInput(format!(
+            "child Agent project root `{}` does not match product root `{product_root}`",
+            assignment.project_root
+        )));
+    }
+    match assignment.mode {
+        pl_protocol::AgentWorkspaceMode::Unrestricted => {
+            if assignment.root != product_root
+                || assignment.writable_paths.is_some()
+                || assignment.worktree.is_some()
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "unrestricted child Agent has an invalid workspace assignment".to_string(),
+                ));
+            }
+            Ok(AgentWorkspace::local(product_root))
+        }
+        pl_protocol::AgentWorkspaceMode::Directory => {
+            if assignment.root != product_root || assignment.worktree.is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "directory child Agent has an invalid workspace assignment".to_string(),
+                ));
+            }
+            Ok(AgentWorkspace::directory(
+                product_root,
+                assignment.writable_paths.as_ref().map(|paths| {
+                    paths
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>()
+                }),
+            ))
+        }
+        pl_protocol::AgentWorkspaceMode::Worktree => Err(RuntimeError::InvalidInput(
+            "mai does not advertise worktree Agent Profiles".to_string(),
+        )),
+    }
+}
+
 pub(crate) async fn product_agent(
     runtime: &AgentRuntime,
     framework_id: &pl_core::ThreadId,
@@ -237,13 +368,13 @@ pub(crate) async fn product_agent(
     runtime.agent(id).await.map(|agent| (id, agent))
 }
 
-fn skill_mentions(metadata: &serde_json::Value) -> Vec<String> {
+fn skill_mentions(metadata: &pl_core::MailboxMetadata) -> Vec<String> {
     metadata
         .get("skillMentions")
-        .and_then(serde_json::Value::as_array)
+        .and_then(pl_core::MailboxMetadataValue::as_array)
         .into_iter()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
+        .filter_map(pl_core::MailboxMetadataValue::as_str)
         .map(str::to_string)
         .collect()
 }

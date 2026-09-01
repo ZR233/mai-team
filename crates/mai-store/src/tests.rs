@@ -1366,6 +1366,151 @@ async fn review_jobs_dedupe_same_head_and_supersede_old_head() {
 }
 
 #[tokio::test]
+async fn review_discovery_admission_rolls_back_the_whole_batch() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let valid = test_review_job(project_id, 41, "head-41", None);
+    let invalid = test_review_job(project_id, 0, "", None);
+
+    let error = store
+        .admit_project_review_discovery(vec![valid, invalid], Vec::new())
+        .await
+        .expect_err("invalid second candidate must roll back the first insert");
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires a PR number and head SHA")
+    );
+    assert_eq!(
+        None,
+        store
+            .load_active_project_review_job_for_pr(project_id, 41)
+            .await
+            .expect("load rolled back job")
+    );
+}
+
+#[tokio::test]
+async fn review_discovery_admission_batches_jobs_and_ci_watches() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let now = Utc::now();
+    let watch = ProjectReviewCiWatch {
+        project_id,
+        pr: 43,
+        head_sha: "head-43".to_string(),
+        delivery_id: None,
+        reason: "discovery_ci_pending".to_string(),
+        next_check_at: now + chrono::TimeDelta::minutes(1),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let initial = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 42, "head-a", None)],
+            vec![watch.clone()],
+        )
+        .await
+        .expect("admit initial discovery batch");
+    assert_eq!(
+        vec![42],
+        initial.queued.iter().map(|job| job.pr).collect::<Vec<_>>()
+    );
+    assert_eq!(vec![43], initial.watched);
+    assert_eq!(
+        Some(watch),
+        store
+            .load_project_review_ci_watch(project_id, 43)
+            .await
+            .expect("load discovery watch")
+    );
+
+    let repeated = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 42, "head-a", None)],
+            Vec::new(),
+        )
+        .await
+        .expect("dedupe repeated discovery batch");
+    assert_eq!(Vec::<ProjectReviewJobSummary>::new(), repeated.queued);
+    assert_eq!(
+        vec![42],
+        repeated
+            .deduped
+            .iter()
+            .map(|job| job.pr)
+            .collect::<Vec<_>>()
+    );
+
+    let new_head = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 42, "head-b", None)],
+            Vec::new(),
+        )
+        .await
+        .expect("admit new head");
+    assert_eq!(
+        vec!["head-b"],
+        new_head
+            .queued
+            .iter()
+            .map(|job| job.head_sha.as_str())
+            .collect::<Vec<_>>()
+    );
+    let history = store
+        .load_project_pull_request_review_history(project_id, 42, 1, 10)
+        .await
+        .expect("load discovery history");
+    assert_eq!(ProjectReviewJobStatus::Queued, history.items[0].job.status);
+    assert_eq!(
+        ProjectReviewJobStatus::Superseded,
+        history.items[1].job.status
+    );
+}
+
+#[tokio::test]
+async fn review_discovery_suppresses_exhausted_failed_head_only() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut failed = test_review_job(project_id, 44, "failed-head", None);
+    failed.status = ProjectReviewJobStatus::Failed;
+    failed.next_attempt_at = None;
+    failed.finished_at = Some(Utc::now());
+    store
+        .save_project_review_job(failed)
+        .await
+        .expect("save exhausted failed job");
+
+    let same_head = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 44, "failed-head", None)],
+            Vec::new(),
+        )
+        .await
+        .expect("suppress failed head");
+    assert_eq!(vec![44], same_head.suppressed);
+    assert_eq!(Vec::<ProjectReviewJobSummary>::new(), same_head.queued);
+
+    let new_head = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 44, "new-head", None)],
+            Vec::new(),
+        )
+        .await
+        .expect("allow new head");
+    assert_eq!(
+        vec!["new-head"],
+        new_head
+            .queued
+            .iter()
+            .map(|job| job.head_sha.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn review_job_environment_warning_round_trips_independently_of_failure() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();

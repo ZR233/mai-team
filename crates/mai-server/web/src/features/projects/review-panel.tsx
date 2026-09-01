@@ -5,7 +5,7 @@ import { toast } from "sonner"
 
 import { api } from "@/api/client"
 import type { ProjectDetail, PullRequestStateRefreshSummary, PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
-import { projectPullRequestReviewsQuery, queryKeys } from "@/api/queries"
+import { projectPullRequestReviewsQuery, projectReviewDiscoveryQuery, queryKeys } from "@/api/queries"
 import { PagePagination } from "@/components/page-pagination"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
 import { Badge } from "@/components/ui/badge"
@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input"
 
 import { ReviewJobDetails } from "./review-job-details"
 import { ReviewJobList } from "./review-job-list"
+import { ReviewDiscoveryCard } from "./review-discovery-card"
 
 const REVIEW_PAGE_SIZE = 20
 
@@ -38,6 +39,7 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
     ...projectPullRequestReviewsQuery(project.id, page, REVIEW_PAGE_SIZE),
     placeholderData: keepPreviousData,
   })
+  const discovery = useQuery(projectReviewDiscoveryQuery(project.id))
   const [selectedReview, setSelectedReview] = useState<PullRequestReviewSummary | null>(null)
   const [runDialogOpen, setRunDialogOpen] = useState(false)
   const [pr, setPr] = useState("")
@@ -105,6 +107,7 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
           </DialogContent>
         </Dialog>
       </div>
+      <ReviewDiscoveryCard snapshot={discovery.data} loading={discovery.isLoading} error={discovery.error} onRetry={() => void discovery.refetch()} />
       <div className="flex flex-wrap gap-2" aria-label="Review job summary"><Badge variant="secondary">{summary.active} active</Badge><Badge variant="outline">{summary.succeeded} succeeded</Badge><Badge variant="outline">{summary.skipped} skipped</Badge><Badge variant={summary.failed ? "destructive" : "outline"}>{summary.failed} failed</Badge></div>
       {reviews.isLoading && <LoadingState rows={5} />}
       {reviews.error && <ErrorState error={reviews.error} retry={() => void reviews.refetch()} />}

@@ -133,6 +133,9 @@ fn event_name(event: &MaiProductEventEnvelope) -> &'static str {
             "github_webhook_received"
         }
         mai_protocol::MaiProductEventKind::ProjectReviewQueued { .. } => "project_review_queued",
+        mai_protocol::MaiProductEventKind::ProjectReviewDiscoveryUpdated { .. } => {
+            "project_review_discovery_updated"
+        }
         mai_protocol::MaiProductEventKind::McpServerStatusChanged { .. } => {
             "mcp_server_status_changed"
         }
@@ -205,6 +208,14 @@ mod tests {
             installation_id: None,
         });
         assert_eq!(event_name(&event), "github_webhook_received");
+    }
+
+    #[test]
+    fn project_review_discovery_updated_event_name() {
+        let event = make_event(MaiProductEventKind::ProjectReviewDiscoveryUpdated {
+            project_id: ProjectId::new_v4(),
+        });
+        assert_eq!(event_name(&event), "project_review_discovery_updated");
     }
 
     #[test]

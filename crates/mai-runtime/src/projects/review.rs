@@ -13,6 +13,7 @@ pub(crate) mod ci_watch;
 pub(crate) mod cleanup;
 pub(crate) mod context;
 pub(crate) mod cycle;
+pub(crate) mod discovery;
 pub(crate) mod eligibility;
 pub(crate) mod job;
 pub(crate) mod job_attempt;
@@ -35,7 +36,7 @@ pub(crate) mod worker;
 
 #[cfg(test)]
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
-const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
+pub(crate) const PROJECT_REVIEW_DISCOVERY_INTERVAL_SECS: u64 = 600;
 pub(crate) const PROJECT_REVIEW_CI_WATCH_INTERVAL_SECS: u64 = 60;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;

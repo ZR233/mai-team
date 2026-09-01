@@ -6,6 +6,12 @@ use pl_core::{AgentSnapshot, AgentState, ThreadId};
 
 use crate::{Result, RuntimeError};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductThreadPurpose {
+    Standard,
+    Review,
+}
+
 /// 产品 AgentId 即 PL ThreadId，边界只做非空校验。
 pub(crate) fn canonical_id(agent_id: mai_protocol::AgentId) -> Result<pl_core::ThreadId> {
     pl_core::ThreadId::new(agent_id.to_string()).map_err(RuntimeError::Model)
@@ -61,7 +67,11 @@ pub(crate) fn last_agent_response(runtime: &StoredThreadRuntime) -> Option<Strin
 }
 
 /// 将产品 Agent metadata 绑定到 PL Thread snapshot。
-pub(crate) fn thread_metadata(summary: &AgentSummary, snapshot: &AgentSnapshot) -> Thread {
+pub(crate) fn thread_metadata(
+    summary: &AgentSummary,
+    snapshot: &AgentSnapshot,
+    purpose: ProductThreadPurpose,
+) -> Thread {
     let id = summary.id.to_string();
     let parent = summary.parent_id.map(|parent| parent.to_string());
     Thread {
@@ -72,10 +82,16 @@ pub(crate) fn thread_metadata(summary: &AgentSummary, snapshot: &AgentSnapshot) 
             .or_else(|| summary.task_id.map(|task| task.to_string()))
             .unwrap_or_default(),
         title: summary.name.clone(),
-        mode: if summary.task_id.is_some() || summary.project_id.is_some() {
-            ThreadMode::Task
-        } else {
-            ThreadMode::Simple
+        mode: match purpose {
+            ProductThreadPurpose::Review => ThreadMode::new(crate::skills::REVIEW_MODE_ID)
+                .expect("mai Review Mode is a valid PL ModeId"),
+            ProductThreadPurpose::Standard => {
+                if summary.task_id.is_some() || summary.project_id.is_some() {
+                    ThreadMode::task()
+                } else {
+                    ThreadMode::simple()
+                }
+            }
         },
         root_thread_id: parent.clone().unwrap_or_else(|| id.clone()),
         parent_thread_id: parent,
@@ -98,5 +114,15 @@ pub(crate) fn thread_metadata(summary: &AgentSummary, snapshot: &AgentSnapshot) 
         created_at: summary.created_at.timestamp(),
         updated_at: snapshot.updated_at,
         archived: matches!(snapshot.state, AgentState::Closed(_)),
+    }
+}
+
+pub(crate) async fn product_thread_purpose(
+    agent: &crate::state::AgentRecord,
+) -> ProductThreadPurpose {
+    if agent.review_context.read().await.is_some() {
+        ProductThreadPurpose::Review
+    } else {
+        ProductThreadPurpose::Standard
     }
 }

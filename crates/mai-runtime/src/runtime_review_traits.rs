@@ -411,12 +411,75 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
 }
 
 impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> {
-    fn enqueue_project_reviews(
+    fn admit_project_review_discovery(
         &self,
         project_id: ProjectId,
-        signals: Vec<ProjectReviewSignalInput>,
-    ) -> impl std::future::Future<Output = Result<ProjectReviewQueueSummary>> + Send {
-        AgentRuntime::enqueue_project_review_signals(self, project_id, signals, false)
+        input: projects::review::selector::ProjectReviewDiscoveryAdmissionInput,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::selector::ProjectReviewDiscoveryAdmissionResult>,
+    > + Send {
+        AgentRuntime::admit_project_review_discovery(self, project_id, input)
+    }
+}
+
+impl projects::review::discovery::ProjectReviewDiscoveryOps for Arc<AgentRuntime> {
+    async fn project_review_discovery_project_ids(&self) -> Vec<ProjectId> {
+        let projects = self.state.projects.read().await;
+        projects.keys().copied().collect()
+    }
+
+    async fn project_review_discovery_enabled(&self, project_id: ProjectId) -> Result<bool> {
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        let summary = project.summary.read().await.clone();
+        if !summary.auto_review_enabled
+            || summary.status != ProjectStatus::Ready
+            || summary.clone_status != ProjectCloneStatus::Ready
+        {
+            return Ok(false);
+        }
+        let Some(account_id) = summary.git_account_id else {
+            return Ok(false);
+        };
+        let provider = self.deps.git_accounts.summary(&account_id).await?.provider;
+        Ok(matches!(
+            provider,
+            GitProvider::Github | GitProvider::GithubAppRelay
+        ))
+    }
+
+    fn run_project_review_discovery(
+        &self,
+        project_id: ProjectId,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::selector::ProjectReviewSelectorRunResult>,
+    > + Send {
+        projects::review::selector::run_project_review_selector(
+            self,
+            project_id,
+            cancellation_token,
+        )
+    }
+
+    async fn project_review_discovery_snapshot(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<ProjectReviewDiscoverySnapshot> {
+        let project = self.project(project_id).await?;
+        Ok(project.review_discovery.read().await.clone())
+    }
+
+    async fn update_project_review_discovery_snapshot(
+        &self,
+        project_id: ProjectId,
+        snapshot: ProjectReviewDiscoverySnapshot,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        *project.review_discovery.write().await = snapshot;
+        self.events
+            .publish(MaiProductEventKind::ProjectReviewDiscoveryUpdated { project_id })
+            .await;
+        Ok(())
     }
 }
 
@@ -532,12 +595,15 @@ mod tests {
                 prefix_changed_reason: None,
                 updated_at: 2,
             },
+            turn_completion_tokens: 0,
+            turn_decode_millis: 0,
             todo: None,
             active_skills: Vec::new(),
             active_mcp_servers: Vec::new(),
             active_lsp_servers: Vec::new(),
             progress: None,
             mcp_health: None,
+            workflow: None,
             updated_at: 2,
         });
         let turn = Turn {
@@ -1189,30 +1255,6 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::ensure_project_repository_ready(self.as_ref(), project_id)
-    }
-
-    async fn project_git_provider(&self, project_id: ProjectId) -> Result<Option<GitProvider>> {
-        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
-        let Some(account_id) = project.summary.read().await.git_account_id.clone() else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.deps.git_accounts.summary(&account_id).await?.provider,
-        ))
-    }
-
-    fn run_project_review_selector(
-        &self,
-        project_id: ProjectId,
-        cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<
-        Output = Result<projects::review::selector::ProjectReviewSelectorRunResult>,
-    > + Send {
-        projects::review::selector::run_project_review_selector(
-            self,
-            project_id,
-            cancellation_token,
-        )
     }
 
     #[cfg(test)]

@@ -83,6 +83,9 @@ export function applyProductEvent(queryClient: QueryClient, event: ProductEventE
         case "project_review_queued":
           queryClient.invalidateQueries({ queryKey: ["projects", String(event.project_id)], exact: false })
           break
+        case "project_review_discovery_updated":
+          queryClient.invalidateQueries({ queryKey: queryKeys.projectReviewDiscovery(String(event.project_id)) })
+          break
         case "mcp_server_status_changed":
           queryClient.invalidateQueries({ queryKey: queryKeys.mcpServers })
           break
@@ -98,6 +101,6 @@ export function applyProductEvent(queryClient: QueryClient, event: ProductEventE
 export const PRODUCT_EVENT_NAMES = [
   "agent_created", "agent_updated", "agent_deleted", "task_created", "task_updated",
   "task_deleted", "project_created", "project_updated", "project_deleted",
-  "github_webhook_received", "project_review_queued", "operation_failed", "plan_updated",
+  "github_webhook_received", "project_review_queued", "project_review_discovery_updated", "operation_failed", "plan_updated",
   "artifact_created", "mcp_server_status_changed",
 ] as const

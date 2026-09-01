@@ -3,6 +3,8 @@ use serde::Serialize;
 use crate::projects::review::context::ProjectReviewContext;
 use crate::{Result, RuntimeError};
 
+const REVIEW_MANIFEST_SECTION_ID: &str = "mai.review-manifest";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewManifest<'a> {
@@ -65,13 +67,8 @@ pub(super) fn section(
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| {
         RuntimeError::InvalidInput(format!("failed to serialize review manifest: {error}"))
     })?;
-    pl_core::context_section(
-        pl_core::REVIEW_MANIFEST_SECTION_ID,
-        1,
-        "Review Manifest",
-        content,
-    )
-    .map_err(RuntimeError::Model)
+    pl_core::context_section(REVIEW_MANIFEST_SECTION_ID, 1, "Review Manifest", content)
+        .map_err(RuntimeError::Model)
 }
 
 #[cfg(test)]
@@ -118,7 +115,7 @@ mod tests {
 
         let section = section(&context, &[]).expect("manifest");
 
-        assert_eq!(section.id.as_str(), pl_core::REVIEW_MANIFEST_SECTION_ID);
+        assert_eq!(section.id.as_str(), REVIEW_MANIFEST_SECTION_ID);
         assert!(section.content.contains("/project/repo"));
         assert!(section.content.contains("/workspace/repo"));
         assert!(section.content.contains("1631"));

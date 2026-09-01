@@ -18,7 +18,7 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
 
 ## 持久化入队与幂等
 
-周期 selector 和 `pull_request` webhook 必须先执行确定性的 eligibility 判断，再把
+独立 discovery scheduler 和 `pull_request` webhook 必须先执行确定性的 eligibility 判断，再把
 合格 PR 直接写入持久化 Job 队列。`check_run`、`check_suite`、`workflow_run`
 的 `completed` 事件是持久化唤醒信号：只要项目仍启用自动审查，就直接写入或
 命中现有 Job，最终 eligibility 留到 Job 被 claim 后、创建 Reviewer 前执行。生产
@@ -33,6 +33,8 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
   `Ignored`。
 - 手动重新审查遇到同一 PR 的活跃 Job 时直接返回该 Job，不访问 GitHub、也不创建重复 generation。
 - 历史 Job 已终止时，手动重新审查可以创建新 Job。
+- discovery 不为同一 head 已耗尽尝试并进入 `Failed` 的 Job 自动创建无限 generation；
+  新 head、Webhook 新事件和手动重新审查不受此抑制规则影响。
 - `pull_request` webhook 单 PR eligibility 读取失败时不写内存队列，由 relay
   的失败确认机制重投；当前事件仅因 CI 尚未完成而不满足 eligibility 时，按
   `project + PR` 持久化 CI watch。相同 PR 的后续 delivery 更新同一 watch，新
@@ -42,14 +44,16 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
 `check_run`、`check_suite`、`workflow_run` 的 `completed` 会唤醒对应 PR。`push`
 不创建 Review Job，仍只同步默认分支与项目缓存。
 
-server 启动后每分钟只复核到期的 CI watch，不缩短 30 分钟全量 selector 周期。
+server 启动后每分钟复核到期的 CI watch；独立 discovery 每 10 分钟执行一次全量兜底扫描。
 CI 仍运行时 CAS 延期；变为合格时走同一个 PR 单活入队事务并删除 watch；PR 已
 关闭、变为 draft 或当前 head 已审查时删除 watch。GitHub 读取失败保留 watch
 等待重试。这样 completed webhook 偶发丢失或 server 重启都不会丢失待审查意图。
 
-## Selector 契约
+## Discovery 契约
 
-selector 是确定性的 Rust 代码，只读取 GitHub 并写入合格 Job，不创建 Agent、不调用模型、不提交 review。
+discovery 是 Runtime 独立拥有的调度能力，不依附项目 worker 或 Review Job 执行生命周期。
+selector 是其中确定性的 Rust 读取阶段：只读取 GitHub 并形成批量准入输入，不创建 Agent、
+不调用模型、不提交 review，也不在 GitHub 网络读取期间持有 SQLite 写事务。
 
 周期扫描使用：
 
@@ -57,7 +61,9 @@ selector 是确定性的 Rust 代码，只读取 GitHub 并写入合格 Job，�
 state=open&sort=created&direction=asc&per_page=20&page=N
 ```
 
-每页按 PR number 升序评估，最多并发检查四个候选。单 PR webhook 路径复用相同规则：
+必须完整读取所有 open PR 页面。每页按 PR number 升序评估，最多并发检查四个候选。
+单候选读取失败记录为 partial error，其余候选继续；项目身份或 PR 分页读取失败则整轮失败，
+不得写入任何 Job 或 watch。单 PR webhook 路径复用相同规则：
 
 1. draft 跳过。
 2. `queued`、`requested`、`waiting`、`pending`、`in_progress` 等未完成 CI 状态会阻塞；CI conclusion 不参与阻塞判断。
@@ -66,7 +72,16 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 5. 无法读取提交时间时，以 review `commit_id` 是否等于当前 head 兜底。
 6. PR 作者、其他人的 review 状态和 `mergeable_state` 不参与过滤。
 
-周期 selector 成功后等待 30 分钟；读取失败按 1 秒起步、最高 600 秒的指数退避重试。selector 的 UI 状态不得覆盖活跃 Job 投影。
+全部 GitHub 读取结束后，合格候选和 CI pending 候选在一个短 `BEGIN IMMEDIATE` 事务中
+分别批量写入 Job 和持久化 CI watch。任一写入失败整批回滚；同 head 去重、新 head
+supersede、CI watch 原子 upsert 和 PR 单活约束均复用同一 Store 不变量。只有真正新建的
+Job 发布 `project_review_queued`，deduped、watched 和 suppressed 只进入 discovery 计数。
+
+scheduler 在服务启动时立即扫描，此后以每轮开始时间为基准按固定 10 分钟周期运行；扫描超过
+一个周期时跳过已经错过的 tick，从完成时重新安排下一轮，避免补跑风暴。项目并发上限为 2，
+同项目绝不重叠。开启自动 Review、项目资源转为 Ready 或相关配置变化会唤醒 scheduler；
+读取失败按 1 秒起步、最高 600 秒的指数退避重试。scheduler 关机时取消并排空当前扫描。
+discovery 快照与 `ProjectSummary.review_status` 正交，不能覆盖活跃 Job 投影。
 
 ## Claim、租约与启动恢复
 
@@ -163,3 +178,11 @@ schema 32 继续保留旧 Job/Run、intent、receipt、状态、用量和时间�
 `framework-archives/pl-v2-<timestamp>/`。对应 Run 返回 `history_status = pl_v2_archived`、归档 ID
 和时间；Web 显示明确的离线归档说明，不发起旧 Thread 请求，不使用加载失败或损坏文案。旧终态
 不自动重放；迁移前受控取消的目标在新服务健康后按最新 head 重新入队。
+
+`GET /projects/{id}/review-discovery` 返回 Runtime 内存快照，状态为 `disabled`、`idle`、
+`scanning`、`partial` 或 `backoff`，并包含上次开始/完成、下次计划时间、scanned、eligible、
+queued、deduped、watched、suppressed、errors 和最近错误。快照不写产品数据库；重启后先进入
+`scanning` 并立即生成新结果。
+
+每次快照变化发布 `project_review_discovery_updated` SSE。Web Review 页面用该事件精确失效
+discovery query，同时保留 60 秒低频刷新作为断线兜底；状态卡与 Job 状态、Run 状态分开展示。

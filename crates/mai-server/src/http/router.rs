@@ -230,6 +230,10 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             post(handlers::projects::send_project_message),
         )
         .route(
+            "/projects/{id}/review-discovery",
+            get(handlers::projects::get_project_review_discovery),
+        )
+        .route(
             "/projects/{id}/review-runs",
             get(handlers::projects::list_project_review_runs),
         )

@@ -27,6 +27,8 @@ test.beforeEach(async ({ page }) => {
 test("PR 聚合列表分页并在详情切换执行和未执行历史", async ({ page }) => {
   await page.goto("/projects/project-1?view=review")
 
+  await expect(page.getByLabel("PR discovery status")).toContainText("Idle")
+  await expect(page.getByLabel("PR discovery status")).toContainText("CI watched2")
   await expect(pullRequestEntry(page, 42)).toBeVisible()
   await expect(page.getByLabel("Review job summary")).toContainText("1 succeeded")
   await pullRequestEntry(page, 42).click()
@@ -83,6 +85,20 @@ async function installReviewFixture(page: Page) {
     const path = url.pathname
     if (path === "/projects") return json(route, [projectSummary])
     if (path === "/projects/project-1") return json(route, projectDetail())
+    if (path === "/projects/project-1/review-discovery") return json(route, {
+      state: "idle",
+      last_started_at: "2026-08-11T10:00:00Z",
+      last_completed_at: "2026-08-11T10:00:05Z",
+      next_scan_at: "2026-08-11T10:10:00Z",
+      scanned: 21,
+      eligible: 1,
+      queued: 0,
+      deduped: 1,
+      watched: 2,
+      suppressed: 1,
+      errors: 0,
+      last_error: null,
+    })
     if (path === "/projects/project-1/pull-request-reviews") {
       const pageNumber = Number(url.searchParams.get("page") || "1")
       return json(route, reviewPage(pageNumber))

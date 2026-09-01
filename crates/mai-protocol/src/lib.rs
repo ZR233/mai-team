@@ -186,6 +186,46 @@ pub enum ProjectReviewSkipReason {
 }
 
 #[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString, Default,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewDiscoveryState {
+    #[default]
+    Disabled,
+    Idle,
+    Scanning,
+    Partial,
+    Backoff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectReviewDiscoveryCounts {
+    pub scanned: u64,
+    pub eligible: u64,
+    pub queued: u64,
+    pub deduped: u64,
+    pub watched: u64,
+    pub suppressed: u64,
+    pub errors: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectReviewDiscoverySnapshot {
+    pub state: ProjectReviewDiscoveryState,
+    #[serde(default)]
+    pub last_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub next_scan_at: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub counts: ProjectReviewDiscoveryCounts,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
@@ -1428,6 +1468,9 @@ pub enum MaiProductEventKind {
         pr: u64,
         reason: String,
     },
+    ProjectReviewDiscoveryUpdated {
+        project_id: ProjectId,
+    },
     OperationFailed {
         scope: String,
         agent_id: Option<AgentId>,
@@ -2126,6 +2169,40 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn review_discovery_snapshot_uses_flat_tagged_api_shape() {
+        let states = [
+            (ProjectReviewDiscoveryState::Disabled, "disabled"),
+            (ProjectReviewDiscoveryState::Idle, "idle"),
+            (ProjectReviewDiscoveryState::Scanning, "scanning"),
+            (ProjectReviewDiscoveryState::Partial, "partial"),
+            (ProjectReviewDiscoveryState::Backoff, "backoff"),
+        ];
+
+        for (state, expected) in states {
+            let value = serde_json::to_value(ProjectReviewDiscoverySnapshot {
+                state,
+                counts: ProjectReviewDiscoveryCounts {
+                    scanned: 9,
+                    eligible: 3,
+                    queued: 1,
+                    deduped: 1,
+                    watched: 2,
+                    suppressed: 1,
+                    errors: 1,
+                },
+                last_error: Some("PR #8 unavailable".to_string()),
+                ..Default::default()
+            })
+            .expect("serialize discovery snapshot");
+
+            assert_eq!(expected, value["state"]);
+            assert_eq!(9, value["scanned"]);
+            assert_eq!(2, value["watched"]);
+            assert!(value.get("counts").is_none());
+        }
+    }
 
     #[test]
     fn create_agent_request_accepts_missing_docker_image() {

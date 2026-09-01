@@ -170,6 +170,14 @@ impl AgentRuntime {
         .await
     }
 
+    pub async fn project_review_discovery(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<ProjectReviewDiscoverySnapshot> {
+        let project = self.project(project_id).await?;
+        Ok(project.review_discovery.read().await.clone())
+    }
+
     pub async fn get_project_review_run(
         &self,
         project_id: ProjectId,
@@ -555,6 +563,7 @@ impl AgentRuntime {
             .await?)
     }
 
+    #[cfg(test)]
     pub(super) async fn enqueue_project_review_signals(
         self: &Arc<Self>,
         project_id: ProjectId,
@@ -568,6 +577,99 @@ impl AgentRuntime {
             start_worker,
         )
         .await
+    }
+
+    pub(super) async fn admit_project_review_discovery(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        input: projects::review::selector::ProjectReviewDiscoveryAdmissionInput,
+    ) -> Result<projects::review::selector::ProjectReviewDiscoveryAdmissionResult> {
+        let project = self.project(project_id).await?;
+        if !project.summary.read().await.auto_review_enabled {
+            return Ok(Default::default());
+        }
+        let mut candidates = Vec::with_capacity(input.eligible.len());
+        let mut signals = Vec::with_capacity(input.eligible.len());
+        for selection in input.eligible {
+            let head_sha = match selection.head_sha.as_deref().map(str::trim) {
+                Some(head_sha) if !head_sha.is_empty() => head_sha.to_string(),
+                Some(_) | None => {
+                    projects::review::target::resolve_project_review_target(
+                        self,
+                        project_id,
+                        projects::review::target::ProjectReviewRequest {
+                            pr: selection.pr,
+                            head_sha_hint: None,
+                        },
+                    )
+                    .await?
+                    .head_sha
+                }
+            };
+            signals.push(ProjectReviewSignalInput {
+                pr: selection.pr,
+                head_sha: Some(head_sha.clone()),
+                delivery_id: None,
+                reason: "discovery".to_string(),
+            });
+            candidates.push(projects::review::job::new_project_review_job(
+                projects::review::job::NewProjectReviewJob {
+                    project_id,
+                    pr: selection.pr,
+                    head_sha,
+                    source: ProjectReviewJobSource::Automatic,
+                    delivery_id: None,
+                    reason: "discovery".to_string(),
+                },
+            ));
+        }
+        let discovered_at = now();
+        let watches = input
+            .pending_ci
+            .into_iter()
+            .filter_map(|selection| {
+                selection
+                    .head_sha
+                    .map(|head_sha| mai_store::ProjectReviewCiWatch {
+                        project_id,
+                        pr: selection.pr,
+                        head_sha,
+                        delivery_id: None,
+                        reason: "discovery_ci_pending".to_string(),
+                        next_check_at: discovered_at
+                            + chrono::TimeDelta::seconds(
+                                projects::review::PROJECT_REVIEW_CI_WATCH_INTERVAL_SECS as i64,
+                            ),
+                        created_at: discovered_at,
+                        updated_at: discovered_at,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let admission = self
+            .deps
+            .store
+            .admit_project_review_discovery(candidates, watches)
+            .await?;
+        let queue = ProjectReviewQueueSummary {
+            queued: admission.queued.iter().map(|job| job.pr).collect(),
+            deduped: admission.deduped.iter().map(|job| job.pr).collect(),
+            ignored: Vec::new(),
+            jobs: admission
+                .queued
+                .iter()
+                .chain(admission.deduped.iter())
+                .cloned()
+                .collect(),
+        };
+        self.finish_project_review_queue(project, signals, &queue, true)
+            .await?;
+        Ok(
+            projects::review::selector::ProjectReviewDiscoveryAdmissionResult {
+                queue,
+                watched: admission.watched,
+                suppressed: admission.suppressed,
+            },
+        )
     }
 
     pub(crate) async fn enqueue_project_review_replacement(
@@ -729,9 +831,10 @@ impl AgentRuntime {
             return Ok(());
         }
         let project_id = project.summary.read().await.id;
-        for signal in signals.iter().filter(|signal| {
-            summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
-        }) {
+        for signal in signals
+            .iter()
+            .filter(|signal| summary.queued.contains(&signal.pr))
+        {
             self.events
                 .publish(MaiProductEventKind::ProjectReviewQueued {
                     project_id,

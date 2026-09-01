@@ -39,3 +39,4 @@ walkdir.workspace = true
 libc = "0.2"
 pretty_assertions.workspace = true
 rusqlite.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

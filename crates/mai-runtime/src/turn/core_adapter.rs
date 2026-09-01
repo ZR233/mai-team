@@ -12,6 +12,12 @@ use crate::{AgentRuntime, Result};
 /// mai-team 产品动作工具的原生工具组标识。
 pub(crate) const PRODUCT_TOOL_GROUP: &str = "mai-product";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollaborationAvailability {
+    Enabled,
+    Disabled,
+}
+
 pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) agent: Arc<AgentRecord>,
@@ -19,9 +25,12 @@ pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) framework_agent_id: FrameworkThreadId,
     pub(crate) framework_runtime: AgentRuntimeHandle,
     pub(crate) policy: AgentExecutionPolicy,
+    pub(crate) workspace: pl_core::AgentWorkspace,
+    pub(crate) profiles: Vec<pl_protocol::AgentProfileSnapshot>,
     pub(crate) agent_tools: AgentToolSet,
     pub(crate) skill_catalog: Option<Arc<pl_core::skill::FrozenSkillCatalog>>,
     pub(crate) exclusive_web_search: bool,
+    pub(crate) collaboration: CollaborationAvailability,
 }
 
 /// 为 PL Agent Runtime 构造 mai turn engine。
@@ -51,22 +60,19 @@ pub(crate) async fn build_mai_turn_engine(
     }
 
     let summary = ctx.agent.summary.read().await.clone();
-    let workspace_root = if summary.project_id.is_some() {
-        crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
-    } else {
-        "/workspace"
-    };
+    let workspace_root = ctx.workspace.root().to_string_lossy().into_owned();
     let workspace_backend = Arc::new(super::container::MaiContainerBackend::new(
         ctx.runtime.clone(),
         ctx.agent_id,
     ));
-    let workspace_file_backend = Arc::new(pl_core::ContainerWorkspaceFileBackend::new(
+    let workspace_file_backend = Arc::new(super::workspace_file::MaiWorkspaceFileBackend::new(
         workspace_backend,
+        &ctx.workspace,
     ));
     let command_backend = Arc::new(super::command::MaiCommandBackend::new(
         ctx.runtime.clone(),
         ctx.agent_id,
-        workspace_root,
+        &workspace_root,
     ));
     let git_runtime =
         crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent).await?;
@@ -82,10 +88,12 @@ pub(crate) async fn build_mai_turn_engine(
                 git_runtime.backend,
                 git_runtime.credential_provider,
             )
-            .install(&mut engine, workspace_root, None)
+            .install_agent_workspace(&mut engine, ctx.workspace.clone(), None)
             .await?;
     } else {
-        installer.install(&mut engine, workspace_root, None).await?;
+        installer
+            .install_agent_workspace(&mut engine, ctx.workspace.clone(), None)
+            .await?;
     }
 
     let product_tools = super::product_tools::MaiProductTools::new(
@@ -103,17 +111,27 @@ pub(crate) async fn build_mai_turn_engine(
         engine.agent_tools().uninstall(&ToolGroupId::new("skills"));
     }
 
-    let collaboration = pl_core::AgentCollaborationTools::new(
-        ctx.framework_runtime,
-        ctx.framework_agent_id,
-        pl_core::AgentCollaborationToolConfig {
-            policy: ctx.policy.collaboration,
-            session_runtime: engine.tool_session_runtime(),
-            workspace_root: workspace_root.into(),
-        },
-    );
-    engine
-        .agent_tools()
-        .install(ToolGroupId::new("collaboration"), collaboration.tools())?;
+    match ctx.collaboration {
+        CollaborationAvailability::Enabled => {
+            let collaboration = pl_core::AgentCollaborationTools::new(
+                ctx.framework_runtime,
+                ctx.framework_agent_id,
+                pl_core::AgentCollaborationToolConfig {
+                    policy: ctx.policy.collaboration,
+                    session_runtime: engine.tool_session_runtime(),
+                    workspace_root: ctx.workspace.project_root().to_path_buf(),
+                    profiles: ctx.profiles,
+                },
+            );
+            engine
+                .agent_tools()
+                .install(ToolGroupId::new("collaboration"), collaboration.tools())?;
+        }
+        CollaborationAvailability::Disabled => {
+            engine
+                .agent_tools()
+                .uninstall(&ToolGroupId::new("collaboration"));
+        }
+    }
     Ok(engine)
 }

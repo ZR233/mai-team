@@ -18,6 +18,35 @@ afterEach(() => {
 })
 
 describe("pull request review pagination", () => {
+  it("shows discovery counts, schedule, and the latest partial error", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith("/review-discovery")) return jsonResponse({
+        state: "partial",
+        last_started_at: "2026-08-11T10:00:00Z",
+        last_completed_at: "2026-08-11T10:00:05Z",
+        next_scan_at: "2026-08-11T10:10:00Z",
+        scanned: 24,
+        eligible: 3,
+        queued: 1,
+        deduped: 2,
+        watched: 4,
+        suppressed: 1,
+        errors: 1,
+        last_error: "PR #19: GitHub unavailable",
+      })
+      if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0, newly_closed: 0 })
+      return jsonResponse({ ...reviewPage([], 1), total_items: 0, total_pages: 0 })
+    }))
+
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findByText("Partial")).toBeVisible()
+    expect(screen.getByLabelText("PR discovery status")).toHaveTextContent("24")
+    expect(screen.getByLabelText("PR discovery status")).toHaveTextContent("CI watched4")
+    expect(screen.getByText("PR #19: GitHub unavailable")).toBeVisible()
+  })
+
   it("requests the selected page and replaces the aggregate rows", async () => {
     const requested: string[] = []
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

@@ -88,6 +88,18 @@ mai 只负责构造产品 Typed Tool、声明 `ToolEffect` 并按角色安装允
 product tools 都遵循相同工具组生命周期；exclusive Web Search 通过卸载不允许的组获得唯一
 计划，而不是在 schema 列表上二次过滤。
 
+协作工具只接收本 Turn 已启用的 PL `AgentProfileSnapshot`。mai 从四个产品模型 route 生成
+`planner | explorer | executor | reviewer` Profile；spawn 时 PL 将完整 Profile 冻结进 child
+session，产品 lifecycle 在创建容器前直接取得同一快照。后续 Turn 的 provider、model、effort
+和 system instructions 都从该快照解析，不能回读当前角色 route、继承父 Agent 或从任意 metadata
+重建。配置更新只影响之后创建的 child。
+
+PL 同时把产品 lifecycle 返回的 `AgentWorkspaceAssignmentSnapshot` 冻结进 session。Turn Factory
+必须直接消费该 receipt；mai 容器文件 backend 用容器内 POSIX 路径实施 root 和
+`writablePaths`，而不是把宿主路径策略套到虚拟路径。Review 的 `/project/repo` 只作为额外只读
+根；任何写入仍只能落在 receipt 的 `/workspace` 根内。mai 当前不发布 worktree Profile，因此
+收到 worktree receipt 必须失败，不能静默退化成 directory。
+
 ## Skill 所有权
 
 PL 公开 `SkillRegistry`、目录 provider、`FrozenSkillCatalog`、`skills_list` 和 `skill_view`：
@@ -96,13 +108,33 @@ PL 公开 `SkillRegistry`、目录 provider、`FrozenSkillCatalog`、`skills_lis
   resource 路径安全和 Turn Skill 指令；
 - mai 只声明 project/repository/user/system 目录及顺序，保存产品禁用名称，并把同一 frozen
   catalog 的 System/Project 目录投影进 Agent 容器；
-- project Skill 的 sidecar 探测、精确 Review base SHA 快照、项目锁和缓存仍由 mai 持有；
+- project Skill 只从 canonical `.agents/skills` 扫描；不读取 `.claude/skills` 或顶层 `skills`
+  兼容目录。sidecar 探测、精确 Review base SHA 快照、项目锁和缓存仍由 mai 持有；
 - 每个 Turn 只构建一个 catalog，显式 `skillMentions` 和文本调用都通过 PL 加载；模型看到的
   Skill 工具也来自这个 catalog；
 - system Skill 是否启用服从 PL `SkillsConfig.system.enabled`，mai 不另写解析器或回退规则。
 
 配置 API 只接受 `{ "disabled": [name...] }`。schema 31 的旧 `config[].enabled` 仅在离线
 31→32 迁移中读取一次；schema 32 服务不会解析旧形状。
+
+### Review 固定 Mode
+
+真实 GitHub Review 不是用户可选的普通对话形态。mai 通过产品拥有的 `SkillProvider` 把
+`mode.review` 注册进同一个 PL `SkillRegistry`，并只在 Agent 已绑定 `ProjectReviewContext` 时按
+`SkillLoadInvocation::Mode` 从当前冻结 catalog 加载它。该 Mode 不进入普通 Skill 列表，既不可
+由模型调用，也不可由用户选择或禁用；Thread 的 `mode` 投影同样由 Review Context 唯一决定，
+不存在 mode 切换 API、备用模式或字符串回退。
+
+Review Mode 在每个 Turn 开始前冻结 `provider_id`、revision、content hash 和正文，再作为开发者
+约束进入指令装配。其具体 Rust 接口和字段可以随 PL 演进，但产品宿主必须始终能够注册自有 Mode
+来源、从同一个冻结 catalog 按 Mode 通道加载正文，并保留可核验的来源与 revision。缺失这组能力
+会迫使产品复制 PL 的 Skill 发现和冻结逻辑，使一次 Review 的 UI mode、模型指令与工具计划可能
+来自不同 generation，因此这是公共宿主语义，不是 mai 的兼容适配需求。
+
+Review 会话不注册 PL collaboration 工具组，连空工具或运行时过滤层也不保留；`spawn_agent`、
+`send_message`、`wait` 等子代理能力从唯一 ToolPlan 中物理缺席。普通项目和任务会话仍按冻结
+Profile 使用 PL collaboration。Review Mode 的指令也明确禁止委派，但安全边界以“不安装工具组”
+为准，不能只依赖提示词。
 
 ## MCP 与动态工具
 

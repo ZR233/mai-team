@@ -40,6 +40,7 @@ pub(crate) enum ReviewEligibilityDecision {
     Ineligible(ProjectReviewSkipReason),
 }
 
+#[cfg(test)]
 pub(crate) fn select_review_prs(
     reviewer_user_id: u64,
     mut candidates: Vec<PullRequestCandidate>,

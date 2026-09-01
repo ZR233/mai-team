@@ -115,6 +115,7 @@ pub(crate) async fn native_git_tool_runtime(
         worktree: std::path::PathBuf::from(projects::workspace::AGENT_WORKSPACE_REPO_PATH),
         git_binary: std::path::PathBuf::from("git"),
         policy: GitPolicy::new(project_summary.branch),
+        native_credentials: false,
         default_push_branch: Some(format!("mai-agent/{}", summary.id)),
         remote_url: Some(remote_url),
         workspace_info,
@@ -154,6 +155,7 @@ fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
         worktree: clone,
         git_binary: std::path::PathBuf::from(git_binary),
         policy: GitPolicy::new(context.project.branch.clone()),
+        native_credentials: false,
         default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
         remote_url: Some(github_clone_url(
             &context.project.owner,

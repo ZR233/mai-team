@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::cleanup_tasks::ensure_project_review_cleanup_tasks;
 use crate::records::ProjectReviewJobRecord;
+use crate::review_ci_watches::upsert_project_review_ci_watch_on_connection;
 use crate::*;
 
 mod aggregation;
@@ -27,6 +28,14 @@ pub enum ProjectReviewJobEnqueueDisposition {
 pub struct ProjectReviewJobEnqueueResult {
     pub disposition: ProjectReviewJobEnqueueDisposition,
     pub job: ProjectReviewJobSummary,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectReviewDiscoveryAdmission {
+    pub queued: Vec<ProjectReviewJobSummary>,
+    pub deduped: Vec<ProjectReviewJobSummary>,
+    pub suppressed: Vec<u64>,
+    pub watched: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +64,53 @@ pub enum ProjectReviewCiPendingSkipResult {
 }
 
 impl MaiStore {
+    pub async fn admit_project_review_discovery(
+        &self,
+        candidates: Vec<ProjectReviewJobSummary>,
+        watches: Vec<ProjectReviewCiWatch>,
+    ) -> Result<ProjectReviewDiscoveryAdmission> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut admission = ProjectReviewDiscoveryAdmission::default();
+            for candidate in candidates {
+                validate_discovery_candidate(&candidate)?;
+                let has_active =
+                    load_active_job(&transaction, candidate.project_id, candidate.pr)?.is_some();
+                if !has_active && latest_same_head_job_failed(&transaction, &candidate)? {
+                    admission.suppressed.push(candidate.pr);
+                    continue;
+                }
+                let result = enqueue_in_transaction(
+                    &transaction,
+                    candidate,
+                    ProjectReviewSignalFreshness::Current,
+                )?;
+                match result.disposition {
+                    ProjectReviewJobEnqueueDisposition::Queued => {
+                        admission.queued.push(result.job);
+                    }
+                    ProjectReviewJobEnqueueDisposition::Deduped => {
+                        admission.deduped.push(result.job);
+                    }
+                }
+            }
+            for watch in watches {
+                validate_discovery_watch(&watch)?;
+                admission.watched.push(watch.pr);
+                upsert_project_review_ci_watch_on_connection(&transaction, &watch)?;
+            }
+            transaction.commit()?;
+            Ok(admission)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review discovery admission task failed: {error}"))
+        })?
+    }
+
     pub async fn prune_project_review_jobs_before_batch(
         &self,
         cutoff: DateTime<Utc>,
@@ -658,6 +714,44 @@ impl MaiStore {
             StoreError::InvalidConfig(format!("review reconciliation task failed: {error}"))
         })?
     }
+}
+
+fn validate_discovery_candidate(candidate: &ProjectReviewJobSummary) -> Result<()> {
+    if candidate.pr == 0 || candidate.head_sha.trim().is_empty() {
+        return Err(StoreError::InvalidConfig(
+            "review discovery candidate requires a PR number and head SHA".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_discovery_watch(watch: &ProjectReviewCiWatch) -> Result<()> {
+    if watch.pr == 0 || watch.head_sha.trim().is_empty() {
+        return Err(StoreError::InvalidConfig(
+            "review discovery CI watch requires a PR number and head SHA".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn latest_same_head_job_failed(
+    connection: &Connection,
+    candidate: &ProjectReviewJobSummary,
+) -> Result<bool> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM project_review_jobs
+             WHERE project_id = ?1 AND pr = ?2 AND head_sha = ?3
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![
+                candidate.project_id.to_string(),
+                u64_to_i64(candidate.pr),
+                candidate.head_sha,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(status.as_deref() == Some("failed"))
 }
 
 fn enqueue_on_path(

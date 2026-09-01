@@ -293,7 +293,6 @@ pub(crate) async fn resume_project_reviewer(
     reviewer_id: AgentId,
     request: ProjectReviewRequest,
 ) -> Result<PreparedProjectReviewer> {
-    ops.ensure_project_reviewer_thread(reviewer_id).await?;
     let target = resolve_project_review_target(ops, project_id, request.clone()).await?;
     if request
         .head_sha_hint
@@ -315,6 +314,7 @@ pub(crate) async fn resume_project_reviewer(
                 "reviewer is attached to a different review job".to_string(),
             ));
         }
+        ops.ensure_project_reviewer_thread(reviewer_id).await?;
         return Ok(PreparedProjectReviewer {
             agent: ops.agent_summary(reviewer_id).await?,
             target: context.target.clone(),
@@ -329,6 +329,7 @@ pub(crate) async fn resume_project_reviewer(
         .await?;
     ops.attach_project_review_context(reviewer_id, Arc::clone(&context))
         .await?;
+    ops.ensure_project_reviewer_thread(reviewer_id).await?;
     ops.ensure_project_reviewer_container(
         reviewer_id,
         target.clone(),
@@ -826,9 +827,9 @@ mod tests {
         assert_eq!(
             *ops.operations.lock().await,
             vec![
-                "ensure_thread",
                 "create_context",
                 "attach_context",
+                "ensure_thread",
                 "ensure_container",
             ]
         );

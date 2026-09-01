@@ -215,6 +215,8 @@ pub struct AgentRuntime {
     events: RuntimeEvents,
     mai_config: Arc<RwLock<MaiConfig>>,
     agent_framework: OnceCell<pl_core::AgentRuntime<agent_host::MaiAgentHost>>,
+    review_discovery_scheduler: projects::review::discovery::ProjectReviewDiscoveryScheduler,
+    review_ci_watch_scheduler: projects::review::ci_watch::ProjectReviewCiWatchScheduler,
     cache_root: PathBuf,
     artifact_files_root: PathBuf,
     sidecar_image: String,
@@ -232,11 +234,10 @@ struct ResolvedAgentModel {
 
 fn initial_thread_context(summary: &AgentSummary) -> pl_core::ThreadContextState {
     let mut context = pl_core::ThreadContextState::empty();
-    context.metadata = serde_json::json!({
-        "title": summary.name,
-        "createdAt": summary.created_at,
-        "updatedAt": summary.updated_at,
-    });
+    context.metadata = pl_core::ThreadContextMetadata {
+        project_id: summary.project_id.map(|project_id| project_id.to_string()),
+        title: Some(summary.name.clone()),
+    };
     context
 }
 

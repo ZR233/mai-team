@@ -187,6 +187,23 @@ export interface PullRequestReviewStatusSummary {
   failed: number
 }
 
+export type ProjectReviewDiscoveryState = "disabled" | "idle" | "scanning" | "partial" | "backoff"
+
+export interface ProjectReviewDiscoverySnapshot {
+  state: ProjectReviewDiscoveryState
+  last_started_at?: string | null
+  last_completed_at?: string | null
+  next_scan_at?: string | null
+  scanned: number
+  eligible: number
+  queued: number
+  deduped: number
+  watched: number
+  suppressed: number
+  errors: number
+  last_error?: string | null
+}
+
 export interface PullRequestReviewSummary {
   pr: number
   latest_job: ReviewJobSummary

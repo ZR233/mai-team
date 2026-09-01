@@ -47,6 +47,19 @@ describe("product event cache projection", () => {
     expect(client.getQueryState(second)?.isInvalidated).toBe(false)
   })
 
+  it("invalidates only the discovery snapshot for a discovery update", () => {
+    const client = new QueryClient()
+    const discovery = queryKeys.projectReviewDiscovery("project-1")
+    const reviewJobs = queryKeys.projectPullRequestReviews("project-1")
+    client.setQueryData(discovery, { state: "scanning" })
+    client.setQueryData(reviewJobs, { reviews: [] })
+
+    applyProductEvent(client, event("project_review_discovery_updated", { project_id: "project-1" }))
+
+    expect(client.getQueryState(discovery)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(reviewJobs)?.isInvalidated).toBe(false)
+  })
+
   it("ignores future product events without invalidating unrelated caches", () => {
     const client = new QueryClient()
     client.setQueryData(queryKeys.providers, { providers: [] })

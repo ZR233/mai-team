@@ -16,7 +16,7 @@ Review Job/Run、reviewer Agent、租约 owner/expiry、PR number 和 head SHA�
 { "auto_review_enabled": false }
 ```
 
-该产品 API 会停止 selector/worker，取消活跃 Job/Run 和 Agent Turn，删除临时 Reviewer，并清空
+该产品 API 会禁用独立 discovery、停止 Review worker，取消活跃 Job/Run 和 Agent Turn，删除临时 Reviewer，并清空
 Review 租约。保存每个被取消目标的 project、PR 和原 head；恢复时必须重新读取 GitHub 最新 head，
 不能直接复用旧 SHA。
 

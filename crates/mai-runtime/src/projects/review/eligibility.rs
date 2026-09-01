@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::selection::{
     CheckSignal, PullRequestCandidate, PullRequestReview, ReviewEligibilityDecision,
-    ReviewSelection, review_eligibility, select_review_prs,
+    review_eligibility,
 };
 use crate::github::github_path_segment;
 use crate::{Result, RuntimeError};
@@ -53,50 +53,6 @@ pub(crate) trait ProjectReviewEligibilityOps: Send + Sync {
         project_id: ProjectId,
         path: String,
     ) -> impl Future<Output = Result<Value>> + Send;
-}
-
-#[cfg(test)]
-pub(crate) async fn select_project_review_candidates(
-    ops: &impl ProjectReviewEligibilityOps,
-    project_id: ProjectId,
-) -> Result<Vec<SelectedProjectReviewPr>> {
-    let summary = ops.project_summary(project_id).await?;
-    let identity = ops.project_review_identity(project_id).await?;
-    let owner = github_path_segment(&summary.owner);
-    let repo = github_path_segment(&summary.repo);
-    let mut page = 1_u64;
-    let mut selected = Vec::new();
-    loop {
-        let pull_requests = list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
-        tracing::debug!(
-            project_id = %project_id,
-            page,
-            count = pull_requests.len(),
-            "project review selector fetched open PR page"
-        );
-        if pull_requests.is_empty() {
-            return Ok(selected);
-        }
-        let mut pull_requests = pull_requests;
-        pull_requests.sort_by_key(|pull_request| pull_request.number);
-        for pull_request in pull_requests.iter() {
-            selected.extend(
-                select_project_review_pull_request(
-                    ops,
-                    project_id,
-                    &owner,
-                    &repo,
-                    identity.user_id,
-                    pull_request,
-                )
-                .await?,
-            );
-        }
-        if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
-            return Ok(selected);
-        }
-        page += 1;
-    }
 }
 
 #[cfg(test)]
@@ -198,7 +154,7 @@ pub(super) async fn pull_request_candidate(
         None => None,
     };
     let checks = match head_sha.as_deref() {
-        Some(head_sha) => check_signals(ops, project_id, owner, repo, head_sha).await,
+        Some(head_sha) => check_signals(ops, project_id, owner, repo, head_sha).await?,
         None => CandidateChecks::default(),
     };
     Ok(PullRequestCandidate {
@@ -214,19 +170,29 @@ pub(super) async fn pull_request_candidate(
     })
 }
 
-pub(super) async fn select_project_review_pull_request(
+pub(super) async fn evaluate_project_review_pull_request(
     ops: &impl ProjectReviewEligibilityOps,
     project_id: ProjectId,
     owner: &str,
     repo: &str,
     reviewer_user_id: u64,
     pull_request: &GithubPullRequest,
-) -> Result<Vec<SelectedProjectReviewPr>> {
+) -> Result<EvaluatedProjectReviewPr> {
     let candidate = pull_request_candidate(ops, project_id, owner, repo, pull_request).await?;
-    Ok(select_review_prs(reviewer_user_id, vec![candidate])
-        .into_iter()
-        .map(selected_project_review_pr)
-        .collect())
+    let pr = candidate.number;
+    let head_sha = candidate.head_sha.clone();
+    Ok(match review_eligibility(reviewer_user_id, candidate) {
+        ReviewEligibilityDecision::Eligible(selection) => EvaluatedProjectReviewPr {
+            pr: selection.pr,
+            head_sha: selection.head_sha,
+            skip_reason: None,
+        },
+        ReviewEligibilityDecision::Ineligible(reason) => EvaluatedProjectReviewPr {
+            pr,
+            head_sha,
+            skip_reason: Some(reason),
+        },
+    })
 }
 
 async fn pull_request_detail(
@@ -282,13 +248,7 @@ async fn commit_time(
         "/repos/{owner}/{repo}/commits/{}",
         github_path_segment(head_sha)
     );
-    let value = match ops.github_api_get_json(project_id, path).await {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::debug!(project_id = %project_id, "project review eligibility could not read commit time: {err}");
-            return Ok(None);
-        }
-    };
+    let value = ops.github_api_get_json(project_id, path).await?;
     let commit: GithubCommit = decode_github_json(value, "get commit")?;
     Ok(commit
         .commit
@@ -302,31 +262,24 @@ async fn check_signals(
     owner: &str,
     repo: &str,
     head_sha: &str,
-) -> CandidateChecks {
+) -> Result<CandidateChecks> {
     let checks_path = format!(
         "/repos/{owner}/{repo}/commits/{}/check-runs?per_page=100",
         github_path_segment(head_sha)
     );
-    let check_runs = match ops.github_api_get_json(project_id, checks_path).await {
-        Ok(value) => decode_github_json::<GithubCheckRunResponse>(value, "list check runs")
-            .map(|response| response.check_runs)
-            .unwrap_or_default(),
-        Err(err) => {
-            tracing::debug!(project_id = %project_id, "project review eligibility could not list check runs: {err}");
-            Vec::new()
-        }
-    };
+    let check_runs = decode_github_json::<GithubCheckRunResponse>(
+        ops.github_api_get_json(project_id, checks_path).await?,
+        "list check runs",
+    )?
+    .check_runs;
     let status_path = format!(
         "/repos/{owner}/{repo}/commits/{}/status",
         github_path_segment(head_sha)
     );
-    let combined_status = match ops.github_api_get_json(project_id, status_path).await {
-        Ok(value) => decode_github_json::<GithubCombinedStatus>(value, "get combined status").ok(),
-        Err(err) => {
-            tracing::debug!(project_id = %project_id, "project review eligibility could not read combined status: {err}");
-            None
-        }
-    };
+    let combined_status = decode_github_json::<GithubCombinedStatus>(
+        ops.github_api_get_json(project_id, status_path).await?,
+        "get combined status",
+    )?;
     let mut signals = check_runs
         .into_iter()
         .map(|run| CheckSignal {
@@ -334,23 +287,14 @@ async fn check_signals(
             conclusion: run.conclusion,
         })
         .collect::<Vec<_>>();
-    if let Some(status) = combined_status.as_ref() {
-        signals.extend(status.statuses.iter().map(|status| CheckSignal {
-            status: status.state.clone(),
-            conclusion: None,
-        }));
-    }
-    CandidateChecks {
+    signals.extend(combined_status.statuses.iter().map(|status| CheckSignal {
+        status: status.state.clone(),
+        conclusion: None,
+    }));
+    Ok(CandidateChecks {
         signals,
-        combined_status_state: combined_status.and_then(|status| status.state),
-    }
-}
-
-pub(super) fn selected_project_review_pr(selection: ReviewSelection) -> SelectedProjectReviewPr {
-    SelectedProjectReviewPr {
-        pr: selection.pr,
-        head_sha: selection.head_sha,
-    }
+        combined_status_state: combined_status.state,
+    })
 }
 
 fn decode_github_json<T: for<'de> Deserialize<'de>>(value: Value, action: &str) -> Result<T> {
@@ -581,6 +525,60 @@ mod tests {
             .expect("select pr");
 
         assert_eq!(None, selected);
+    }
+
+    #[tokio::test]
+    async fn invalid_commit_response_is_a_candidate_error() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeEligibilityOps::new(vec![
+            (
+                "/repos/owner/repo/pulls/8".to_string(),
+                pr_detail(8, false, "head-8"),
+            ),
+            (
+                "/repos/owner/repo/pulls/8/reviews?per_page=100&page=1".to_string(),
+                json!([]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D8".to_string(),
+                json!("invalid"),
+            ),
+        ]);
+
+        let error = select_project_review_pr(&ops, project_id, 8, None)
+            .await
+            .expect_err("unknown commit state must not admit review");
+
+        assert!(error.to_string().contains("get commit"));
+    }
+
+    #[tokio::test]
+    async fn invalid_ci_response_is_a_candidate_error() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeEligibilityOps::new(vec![
+            (
+                "/repos/owner/repo/pulls/9".to_string(),
+                pr_detail(9, false, "head-9"),
+            ),
+            (
+                "/repos/owner/repo/pulls/9/reviews?per_page=100&page=1".to_string(),
+                json!([]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D9".to_string(),
+                commit("2026-01-01T00:00:00Z"),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D9/check-runs?per_page=100".to_string(),
+                json!({"check_runs": "unknown"}),
+            ),
+        ]);
+
+        let error = select_project_review_pr(&ops, project_id, 9, None)
+            .await
+            .expect_err("unknown CI state must not admit review");
+
+        assert!(error.to_string().contains("list check runs"));
     }
 
     #[tokio::test]

@@ -213,6 +213,7 @@ fn event_agent_id(event: &MaiProductEventEnvelope) -> Option<AgentId> {
         | MaiProductEventKind::ProjectDeleted { .. }
         | MaiProductEventKind::GithubWebhookReceived { .. }
         | MaiProductEventKind::ProjectReviewQueued { .. }
+        | MaiProductEventKind::ProjectReviewDiscoveryUpdated { .. }
         | MaiProductEventKind::PlanUpdated { .. } => None,
         MaiProductEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
     }
