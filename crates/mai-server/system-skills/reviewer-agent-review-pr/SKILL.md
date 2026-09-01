@@ -18,6 +18,12 @@ The default branch remains available in the PR workspace as `refs/remotes/origin
 
 Every `exec` call must use `/workspace/repo` as its `cwd`. To inspect the read-only base snapshot, use `read_file`, `list_files`, or `search_files`, or reference an absolute `/project/repo/...` path from a command whose `cwd` remains `/workspace/repo`. Never use `/project/repo` itself as an `exec` working directory.
 
+## Load Matching Project Skills
+
+Project Skills are review constraints, not optional background reading. After initializing the findings ledger and before inspecting implementation code, call `skills_list` once. For every catalog entry whose description clearly matches the changed files or the review semantics, call `skill_view` and follow the complete loaded instructions. Do not inspect `.agents/skills` files directly as a substitute: a Skill counts as loaded only after a successful `skill_view` activation appears in the Thread.
+
+If the Review manifest contains Rust or Cargo changes and `rust-code-quality` is available, loading `rust-code-quality` is mandatory. Follow its adjacent-skill routing and load applicable API, concurrency, unsafe, feature-development, test-quality, or domain Skills before judging that surface. Do not continue into broad code inspection until this selection step is complete.
+
 ## Keep a Persistent Findings Ledger
 
 Before investigating the PR, call `write_session_note` once with `expectedRevision: 0`. Initialize the note with immutable metadata only: a title, the target PR number, and the head SHA. Do not add progress checkboxes, mutable status fields, or placeholder finding sections; task progress belongs in `update_todo_list`, not in the ledger. The note belongs to this reviewer session, stays out of `/workspace/repo`, survives context compaction, and is deleted with the reviewer agent. After initialization, never replace or clear it with `write_session_note` and never fall back to a temporary file.

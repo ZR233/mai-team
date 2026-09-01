@@ -212,6 +212,10 @@ mod tests {
         let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
         let contents = fs::read_to_string(skill_path).expect("skill contents");
         assert!(contents.contains("name: reviewer-agent-review-pr"));
+        assert!(contents.contains("call `skills_list` once"));
+        assert!(contents.contains("call `skill_view`"));
+        assert!(contents.contains("loading `rust-code-quality` is mandatory"));
+        assert!(contents.contains("only after a successful `skill_view` activation"));
         assert!(contents.contains("`write_session_note` once with `expectedRevision: 0`"));
         assert!(contents.contains("Initialize the note with immutable metadata only"));
         assert!(contents.contains("Do not add progress checkboxes"));

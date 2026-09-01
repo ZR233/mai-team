@@ -28,7 +28,7 @@ export function TimelineEntriesView({ items, activeTurn, progress }: { items: Th
   const entries = useMemo(() => buildTimelineEntries(items), [items])
   const activity = activeTurn?.state.kind === "running" ? <ThreadActivityRow phase={activeTurn.state.data.phase} progress={progress} /> : null
   if (entries.length === 0 && !activity) return <p className="py-12 text-center text-sm text-muted-foreground">No Thread activity yet.</p>
-  return <div role="feed" aria-label="Conversation timeline" className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-3 py-5">{entries.map((entry) => <TimelineEntryView key={entry.key} entry={entry} />)}{activity}</div>
+  return <div role="feed" aria-label="Conversation timeline" className="mx-auto flex w-full min-w-0 max-w-4xl flex-col gap-3 py-5">{entries.map((entry) => <TimelineEntryView key={entry.key} entry={entry} />)}{activity}</div>
 }
 
 function TimelineEntryView({ entry }: { entry: TimelineEntry }) {
@@ -72,7 +72,7 @@ function ThreadItemCard({ item }: { item: ThreadItem }) {
 }
 
 function CommentaryText({ text, status }: { text: string; status: string }) {
-  return <TimelineActivityRail role="group" aria-label="Commentary"><article className="flex min-w-0 gap-2 px-1.5 py-1.5"><Bot className="mt-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><div className="flex min-w-0 flex-1 flex-col gap-1"><div className="flex items-center gap-2"><span className="text-xs font-medium text-muted-foreground">Commentary</span>{status !== "completed" && <Badge variant="secondary">{status}</Badge>}</div><Markdown variant="auxiliary">{text}</Markdown></div></article></TimelineActivityRail>
+  return <TimelineMessage icon={Bot} label="Mai Team" ariaLabel="Mai Team update" status={status} variant="response"><Markdown variant="response">{text}</Markdown></TimelineMessage>
 }
 
 function SkillActivationRow({ activation }: { activation: SkillActivation }) {

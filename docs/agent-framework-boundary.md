@@ -131,6 +131,13 @@ Review Mode 在每个 Turn 开始前冻结 `provider_id`、revision、content ha
 会迫使产品复制 PL 的 Skill 发现和冻结逻辑，使一次 Review 的 UI mode、模型指令与工具计划可能
 来自不同 generation，因此这是公共宿主语义，不是 mai 的兼容适配需求。
 
+Review Mode 把项目 Skill 选择定义为正式执行阶段：初始化 findings ledger 后、读取实现代码前，
+Reviewer 必须先通过同一冻结 catalog 调用 `skills_list`，再对与 changed files 或审查语义匹配的
+项目 Skill 调用 `skill_view`。目录已物化、catalog 已发现或工具已安装都不代表已加载；只有 PL
+产生的 `SkillActivation`、durable Skill Item 与 `runtime.activeSkills` 才是激活事实。Rust/Cargo
+变更在项目提供 `rust-code-quality` 时必须先加载该基线，再由其正文路由 API、并发、unsafe、功能、
+测试和领域 Skill。mai 不解析 Skill 正文、不复制 activation 状态，也不按工具输出猜测是否触发。
+
 Review 会话不注册 PL collaboration 工具组，连空工具或运行时过滤层也不保留；`spawn_agent`、
 `send_message`、`wait` 等子代理能力从唯一 ToolPlan 中物理缺席。普通项目和任务会话仍按冻结
 Profile 使用 PL collaboration。Review Mode 的指令也明确禁止委派，但安全边界以“不安装工具组”

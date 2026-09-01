@@ -112,6 +112,20 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
     expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
   })
 
+  it("代理过程输出与最终回复都保持主正文层级", () => {
+    render(<ThreadTimeline snapshot={snapshot([
+      item({ kind: "text", data: { channel: "commentary", text: "正在检查生命周期。", lifecycle: completed() } }),
+      item({ kind: "text", data: { channel: "final", text: "检查完成，没有发现阻塞问题。", lifecycle: completed() } }),
+    ])} />)
+
+    const update = screen.getByRole("article", { name: "Mai Team update" })
+    const response = screen.getByRole("article", { name: "Mai Team response" })
+    expect(update).toHaveAttribute("data-priority", "primary")
+    expect(response).toHaveAttribute("data-priority", "primary")
+    expect(within(update).getByText("正在检查生命周期。")).toBeVisible()
+    expect(within(response).getByText("检查完成，没有发现阻塞问题。")).toBeVisible()
+  })
+
   it("仅在 canonical Turn running 状态显示尾部活动行", () => {
     const active = snapshot([])
     active.activeTurn = {

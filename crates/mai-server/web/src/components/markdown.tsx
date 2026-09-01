@@ -7,7 +7,7 @@ const markdownVariants = cva("prose min-w-0 max-w-none break-words", {
   variants: {
     variant: {
       default: "text-sm leading-6",
-      response: "text-[15px] leading-7 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:text-base [&_h3]:font-semibold",
+      response: "text-[15px] leading-7 text-foreground [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:text-lg [&_h3]:font-semibold",
       auxiliary: "text-sm leading-6 text-muted-foreground",
     },
   },
