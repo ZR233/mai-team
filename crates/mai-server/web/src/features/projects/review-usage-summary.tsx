@@ -2,7 +2,6 @@ import { Gauge } from "lucide-react"
 
 import type { TokenUsage } from "@/api/product-types"
 import { Badge } from "@/components/ui/badge"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 
 import { cacheHitRate } from "./review-job-model"
@@ -10,21 +9,27 @@ import { cacheHitRate } from "./review-job-model"
 export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null; active: boolean }) {
   const hitRate = cacheHitRate(usage)
   if (!usage) {
-    return <Card size="sm">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2"><Gauge className="size-4 text-muted-foreground" aria-hidden />Token usage</CardTitle>
-        <CardDescription>{active ? "Usage will appear after the active attempt finishes." : "No token usage was recorded for this review."}</CardDescription>
-      </CardHeader>
-    </Card>
+    return (
+      <section aria-label="Token usage" className="flex items-start gap-2 border-y py-3">
+        <Gauge className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <div className="flex flex-col gap-0.5">
+          <h3 className="text-sm font-medium">Token usage</h3>
+          <p className="text-xs text-muted-foreground">{active ? "Usage will appear after the active attempt finishes." : "No token usage was recorded for this review."}</p>
+        </div>
+      </section>
+    )
   }
 
   const hitRateLabel = formatCacheHitRate(hitRate)
-  return <Card size="sm">
-    <CardHeader>
-      <CardTitle className="flex items-center gap-2"><Gauge className="size-4 text-muted-foreground" aria-hidden />Token usage</CardTitle>
-      <CardDescription>{active ? "Usage from completed attempts; the active attempt appears after it finishes." : "Combined usage across this logical review and its retries."}</CardDescription>
-    </CardHeader>
-    <CardContent className="flex flex-col gap-4">
+  return <section aria-label="Token usage" className="flex flex-col gap-3 border-y py-3">
+    <div className="flex items-start gap-2">
+      <Gauge className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
+      <div className="flex flex-col gap-0.5">
+        <h3 className="text-sm font-medium">Token usage</h3>
+        <p className="text-xs text-muted-foreground">{active ? "Usage from completed attempts; the active attempt appears after it finishes." : "Combined usage across this logical review and its retries."}</p>
+      </div>
+    </div>
+    <div className="flex flex-col gap-3 pl-6">
       <dl className="grid grid-cols-2 gap-3">
         <UsageMetric label="Total tokens" value={formatCompactTokens(usage.totalTokens)} title={formatExactTokens(usage.totalTokens)} />
         <UsageMetric label="Cache hit" value={hitRateLabel} />
@@ -48,8 +53,8 @@ export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null
         <UsageDetail label="Output" value={usage.completionTokens} />
         <UsageDetail label="Reasoning" value={usage.reasoningTokens} />
       </dl>
-    </CardContent>
-  </Card>
+    </div>
+  </section>
 }
 
 export function ReviewAttemptUsage({ usage }: { usage?: TokenUsage }) {
@@ -64,7 +69,7 @@ export function ReviewAttemptUsage({ usage }: { usage?: TokenUsage }) {
 function UsageMetric({ label, value, title }: { label: string; value: string; title?: string }) {
   return <div className="min-w-0">
     <dt className="text-xs text-muted-foreground">{label}</dt>
-    <dd className="mt-1 truncate text-xl font-semibold tabular-nums" title={title}>{value}</dd>
+    <dd className="mt-0.5 truncate text-base font-semibold tabular-nums" title={title}>{value}</dd>
   </div>
 }
 

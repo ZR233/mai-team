@@ -6,13 +6,15 @@
  * 复用同一分组行为。
  */
 
-import { Bot, ListChecks, LoaderCircle, User } from "lucide-react"
+import { Bot, ListChecks, LoaderCircle, Sparkles, User } from "lucide-react"
+import { useMemo } from "react"
 
 import { Markdown } from "@/components/markdown"
 import { Badge } from "@/components/ui/badge"
-import type { ThreadItem, ThreadSnapshot, Turn } from "@/events/thread-events.generated"
+import type { SkillActivation, ThreadItem, ThreadSnapshot, Turn } from "@/events/thread-events.generated"
 
 import { ReasoningEntry } from "./reasoning-entry"
+import { TimelineActivityRail } from "./timeline-activity"
 import { buildTimelineEntries, type TimelineEntry } from "./timeline-entries"
 import { ToolActivityRow, ToolActivityGroupView } from "./tool-activity-view"
 import { buildToolActivity } from "./tool-activity"
@@ -23,10 +25,10 @@ export function ThreadTimeline({ snapshot }: { snapshot: ThreadSnapshot | null }
 }
 
 export function TimelineEntriesView({ items, activeTurn, progress }: { items: ThreadItem[]; activeTurn?: Turn; progress?: string }) {
-  const entries = buildTimelineEntries(items)
+  const entries = useMemo(() => buildTimelineEntries(items), [items])
   const activity = activeTurn?.state.kind === "running" ? <ThreadActivityRow phase={activeTurn.state.data.phase} progress={progress} /> : null
   if (entries.length === 0 && !activity) return <p className="py-12 text-center text-sm text-muted-foreground">No Thread activity yet.</p>
-  return <div className="space-y-3 py-5">{entries.map((entry) => <TimelineEntryView key={entry.key} entry={entry} />)}{activity}</div>
+  return <div role="feed" aria-label="Conversation timeline" className="mx-auto flex w-full min-w-0 max-w-3xl flex-col gap-3 py-5">{entries.map((entry) => <TimelineEntryView key={entry.key} entry={entry} />)}{activity}</div>
 }
 
 function TimelineEntryView({ entry }: { entry: TimelineEntry }) {
@@ -47,21 +49,22 @@ function ThreadItemCard({ item }: { item: ThreadItem }) {
   switch (state.kind) {
     case "text":
       if (state.data.channel === "user") {
-        return <TimelineCard icon={User} label="User" status={state.data.lifecycle.kind}><Markdown>{state.data.text}</Markdown></TimelineCard>
+        return <TimelineMessage icon={User} label="You" ariaLabel="You message" status={state.data.lifecycle.kind} variant="user"><Markdown>{state.data.text}</Markdown></TimelineMessage>
       }
       return state.data.channel === "final"
-        ? <TimelineCard icon={Bot} label="Final" status={state.data.lifecycle.kind}><Markdown>{state.data.text}</Markdown></TimelineCard>
+        ? <TimelineMessage icon={Bot} label="Mai Team" ariaLabel="Mai Team response" status={state.data.lifecycle.kind} variant="response"><Markdown variant="response">{state.data.text}</Markdown></TimelineMessage>
         : <CommentaryText text={state.data.text} status={state.data.lifecycle.kind} />
     case "thinking":
       return null
     case "plan":
-      return <article className="flex gap-3 rounded-md border-l-2 bg-muted/20 px-3 py-2.5"><ListChecks className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-1"><span className="text-xs font-medium text-muted-foreground">Plan</span><Markdown>{state.data.content}</Markdown></div></article>
+      return <TimelineActivityRail role="group" aria-label="Plan"><article className="flex min-w-0 gap-2 px-1.5 py-1.5"><ListChecks className="mt-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><div className="flex min-w-0 flex-1 flex-col gap-1"><span className="text-xs font-medium text-muted-foreground">Plan</span><Markdown variant="auxiliary">{state.data.content}</Markdown></div></article></TimelineActivityRail>
     case "tool":
       return <ToolActivityRow activity={buildToolActivity({ ...item, state })} />
+    case "skill":
+      return <SkillActivationRow activation={state.data.activation} />
     case "agent":
     case "turn":
     case "inference":
-    case "skill":
     case "file":
     case "contextCompaction":
       return null
@@ -69,14 +72,25 @@ function ThreadItemCard({ item }: { item: ThreadItem }) {
 }
 
 function CommentaryText({ text, status }: { text: string; status: string }) {
-  return <article className="flex gap-3 px-1 py-1.5"><Bot className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-1"><div className="flex items-center gap-2"><span className="text-xs font-medium text-muted-foreground">Commentary</span>{status !== "completed" && <Badge variant="secondary">{status}</Badge>}</div><Markdown>{text}</Markdown></div></article>
+  return <TimelineActivityRail role="group" aria-label="Commentary"><article className="flex min-w-0 gap-2 px-1.5 py-1.5"><Bot className="mt-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><div className="flex min-w-0 flex-1 flex-col gap-1"><div className="flex items-center gap-2"><span className="text-xs font-medium text-muted-foreground">Commentary</span>{status !== "completed" && <Badge variant="secondary">{status}</Badge>}</div><Markdown variant="auxiliary">{text}</Markdown></div></article></TimelineActivityRail>
+}
+
+function SkillActivationRow({ activation }: { activation: SkillActivation }) {
+  return <TimelineActivityRail><article aria-label={`Skill loaded: ${activation.name}`} className="flex min-h-9 min-w-0 items-center gap-2 px-1.5"><Sparkles className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><div className="flex min-w-0 flex-1 flex-wrap items-center gap-2"><span className="text-xs font-medium text-muted-foreground">Skill loaded</span><Badge variant="outline">{activation.name}</Badge><span className="min-w-0 truncate text-xs text-muted-foreground">· {skillActivationCauseLabel(activation.cause)} · {activation.source}</span></div></article></TimelineActivityRail>
+}
+
+function skillActivationCauseLabel(cause: SkillActivation["cause"]): string {
+  switch (cause.kind) {
+    case "tool": return "Triggered by tool"
+    case "userGesture": return "Selected by user"
+  }
 }
 
 type ActivePhase = Extract<Turn["state"], { kind: "running" }>["data"]["phase"]
 
 function ThreadActivityRow({ phase, progress }: { phase: ActivePhase; progress?: string }) {
   const label = activityLabel(phase)
-  return <div className="flex min-h-9 items-center gap-2 rounded-md px-1.5 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" /><span className="font-medium">{label}</span>{progress && <span className="truncate">· {progress}</span>}</div>
+  return <TimelineActivityRail><div className="flex min-h-9 min-w-0 items-center gap-2 px-1.5 text-sm text-muted-foreground"><LoaderCircle className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden="true" /><span className="shrink-0 font-medium">{label}</span>{progress && <span className="truncate">· {progress}</span>}</div></TimelineActivityRail>
 }
 
 function activityLabel(phase: ActivePhase): string {
@@ -90,6 +104,21 @@ function activityLabel(phase: ActivePhase): string {
   }
 }
 
-function TimelineCard({ icon: Icon, label, status, children }: { icon: typeof Bot; label: string; status: string; children: React.ReactNode }) {
-  return <article className="flex gap-3 rounded-lg border bg-card p-3"><Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-2"><div className="flex items-center gap-2"><span className="text-xs font-medium">{label}</span><Badge variant="secondary">{status}</Badge></div>{children}</div></article>
+function TimelineMessage({ icon: Icon, label, ariaLabel, status, variant, children }: { icon: typeof Bot; label: string; ariaLabel: string; status: string; variant: "user" | "response"; children: React.ReactNode }) {
+  const user = variant === "user"
+  return (
+    <article
+      aria-label={ariaLabel}
+      data-timeline-entry="message"
+      data-priority={user ? "normal" : "primary"}
+      className={user ? "min-w-0 rounded-xl bg-muted/55 px-4 py-3" : "min-w-0 px-1 py-3 sm:py-4"}
+    >
+      <header className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+        <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="font-medium text-foreground">{label}</span>
+        {status !== "completed" && <Badge variant="secondary">{status}</Badge>}
+      </header>
+      {children}
+    </article>
+  )
 }

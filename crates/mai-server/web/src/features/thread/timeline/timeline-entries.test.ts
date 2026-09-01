@@ -43,7 +43,7 @@ describe("buildTimelineEntries PL v2 投影", () => {
     expect(thoughts.map((entry) => entry.kind)).toEqual(["reasoningGroup", "reasoningGroup"])
   })
 
-  it("隐藏空思考与内部协议条目且不打断工具分组", () => {
+  it("技能加载可见并打断工具分组，其余空内容和内部条目保持隐藏", () => {
     const first = toolCall()
     const entries = buildTimelineEntries([
       first,
@@ -53,7 +53,11 @@ describe("buildTimelineEntries PL v2 投影", () => {
       toolCall(),
     ])
 
-    expect(entries).toEqual([expect.objectContaining({ kind: "toolGroup", key: `tool-group:${first.id}` })])
+    expect(entries).toEqual([
+      expect.objectContaining({ kind: "tool", key: first.id }),
+      expect.objectContaining({ kind: "item", item: expect.objectContaining({ state: expect.objectContaining({ kind: "skill" }) }) }),
+      expect.objectContaining({ kind: "tool" }),
+    ])
   })
 
   it("运行中的工具分组标记为 active，失败输出计数", () => {

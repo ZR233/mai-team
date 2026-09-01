@@ -11,6 +11,7 @@ import { useEffect, useState } from "react"
 import { Markdown } from "@/components/markdown"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { cn } from "@/lib/utils"
+import { TimelineActivityRail, timelineActivityTriggerClass } from "./timeline-activity"
 import type { ReasoningActivityGroup } from "./timeline-entries"
 
 export function ReasoningEntry({ group }: { group: ReasoningActivityGroup }) {
@@ -32,24 +33,28 @@ export function ReasoningEntry({ group }: { group: ReasoningActivityGroup }) {
     .join("\n\n")
 
   return (
-    <Collapsible open={open} onOpenChange={setOpen}>
-      <CollapsibleTrigger
-        className="group flex min-h-9 w-full items-center gap-2 rounded-md px-1.5 text-left text-sm text-muted-foreground outline-none transition-colors hover:bg-muted/45 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-        aria-label={`${open ? "Collapse" : "Expand"} reasoning`}
-      >
-        <Brain className="size-4 shrink-0" aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-        {group.active && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/70 motion-reduce:animate-none" aria-hidden="true" />}
-        <ChevronDown
-          className={cn("size-3.5 shrink-0 transition-transform motion-reduce:transition-none", open && "rotate-180")}
-          aria-hidden="true"
-        />
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="border-l-2 py-1 pr-2 pl-3 text-muted-foreground">
-          <Markdown>{text}</Markdown>
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
+    <TimelineActivityRail>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger
+          className={timelineActivityTriggerClass}
+          aria-label={`${open ? "Collapse" : "Expand"} reasoning`}
+        >
+          <Brain className="size-3.5 shrink-0" data-icon="inline-start" aria-hidden="true" />
+          <span className="shrink-0 font-medium text-foreground/80">Reasoning</span>
+          <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+          {group.active && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/70 motion-reduce:animate-none" aria-hidden="true" />}
+          <ChevronDown
+            className={cn("size-3.5 shrink-0 transition-transform motion-reduce:transition-none", open && "rotate-180")}
+            data-icon="inline-end"
+            aria-hidden="true"
+          />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="px-1.5 pt-1 pb-2">
+            <Markdown variant="auxiliary">{text}</Markdown>
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </TimelineActivityRail>
   )
 }

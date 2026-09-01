@@ -4,7 +4,6 @@ import { useEffect, useState } from "react"
 
 import type { PullRequestReviewHistoryItem, PullRequestReviewHistoryPage, PullRequestReviewSummary, ReviewJobDetail, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
 import { projectPullRequestReviewHistoryQuery, projectReviewJobQuery, projectReviewRunQuery } from "@/api/queries"
-import { Markdown } from "@/components/markdown"
 import { PagePagination } from "@/components/page-pagination"
 import { ErrorState, LoadingState } from "@/components/page-state"
 import { StatusBadge } from "@/components/status"
@@ -106,7 +105,7 @@ function ReviewDetailsContent({ projectId, history, historyPage, selectedItem, s
   if (history.isLoading) return <LoadingState rows={5} />
   if (history.error) return <ErrorState error={history.error} retry={() => void history.refetch()} />
   if (!history.data?.items.length) return <p className="rounded-lg border p-4 text-sm text-muted-foreground">No retained review history.</p>
-  return <div className="flex flex-col gap-5 pb-4">
+  return <div className="flex flex-col gap-4 pb-4">
     <Field>
       <FieldLabel htmlFor="review-history">Review history</FieldLabel>
       <Select value={selectedJobId ?? ""} onValueChange={onSelectJob}>
@@ -139,7 +138,7 @@ function ReviewRecordContent({ projectId, item, detail, detailLoading, detailErr
   const attemptsMissing = Boolean(attempted && detail && (detail.attempts?.length ?? 0) === 0)
   const reviewStartedAt = detail?.attempts?.[0]?.started_at
   const usage = projectReviewUsage(detail?.attempts ?? [])
-  return <div className="flex flex-col gap-5">
+  return <div className="flex flex-col gap-4">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge status={job.status} /><ReviewOutcome job={job} /><EnvironmentWarningBadge job={job} />{job.status === "retry_waiting" && <Badge variant="outline">Retry scheduled</Badge>}</div>
     <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${job.attempt_count}/${job.max_attempts}`} /><Metric label="Created" value={formatReviewDate(job.created_at)} /><Metric label="Duration" value={reviewStartedAt ? formatReviewDuration(reviewStartedAt, job.finished_at) : "—"} /><Metric label="Next attempt" value={job.next_attempt_at ? formatReviewDate(job.next_attempt_at) : "—"} /></dl>
     {attempted && !attemptsMissing && <ReviewUsageSummary usage={usage.total} active={reviewJobIsActive(job)} />}
@@ -148,7 +147,7 @@ function ReviewRecordContent({ projectId, item, detail, detailLoading, detailErr
     {job.failure && <Alert variant="destructive"><CircleAlert /><AlertTitle>{job.status === "retry_waiting" ? "Attempt failed; retry pending" : "Review failed"}</AlertTitle><AlertDescription><span className="block">{job.failure.message}</span><span className="mt-1 block text-xs opacity-80">{job.failure.category}{job.failure.code ? ` · ${job.failure.code}` : ""}{job.failure.http_status ? ` · HTTP ${job.failure.http_status}` : ""}</span></AlertDescription></Alert>}
     {job.environment_warning && <Alert className="border-amber-500/50 bg-amber-500/5 text-amber-950 dark:text-amber-100"><CircleAlert /><AlertTitle>Latest image refresh failed</AlertTitle><AlertDescription><span className="block">{job.environment_warning.message}</span><span className="mt-1 block text-xs opacity-80">{job.environment_warning.image} · cached {shortSha(job.environment_warning.cached_image_id)} · {formatReviewDate(job.environment_warning.observed_at)}</span></AlertDescription></Alert>}
     {job.submission_intent && !job.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><h3 className="text-sm font-medium">GitHub submission pending</h3><p className="mt-1 text-xs text-muted-foreground">The server is reconciling one {job.submission_intent.event.replaceAll("_", " ")} review at head {shortSha(job.submission_intent.head_sha)} with {job.submission_intent.comment_count} inline comments.</p></section>}
-    {job.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">GitHub receipt</h3><p className="text-xs text-muted-foreground">Review #{job.submission_receipt.github_review_id} · {formatReviewDate(job.submission_receipt.submitted_at)}</p></div>{job.submission_receipt.html_url && <Button asChild variant="outline" size="sm"><a href={job.submission_receipt.html_url} target="_blank" rel="noreferrer"><ExternalLink /> Open</a></Button>}</div></section>}
+    {job.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">GitHub receipt</h3><p className="text-xs text-muted-foreground">Review #{job.submission_receipt.github_review_id} · {formatReviewDate(job.submission_receipt.submitted_at)}</p></div>{job.submission_receipt.html_url && <Button asChild variant="outline" size="sm"><a href={job.submission_receipt.html_url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Open</a></Button>}</div></section>}
     {attempted && (detailLoading ? <LoadingState rows={4} /> : detailError ? <ErrorState error={detailError} retry={retryDetail} /> : detail && !attemptsMissing ? <Attempts projectId={projectId} attempts={detail.attempts} usageByAttemptId={usage.attempts} /> : null)}
     <Collapsible open={metadataOpen} onOpenChange={setMetadataOpen} className="rounded-lg border"><CollapsibleTrigger asChild><Button variant="ghost" className="w-full justify-between rounded-lg px-3" aria-label={`${metadataOpen ? "Hide" : "Show"} technical details`}>Technical details<ChevronDown className={cn("size-4 transition-transform motion-reduce:transition-none", metadataOpen && "rotate-180")} /></Button></CollapsibleTrigger><CollapsibleContent className="border-t"><dl className="divide-y"><DetailRow label="Job" value={job.id} mono /><DetailRow label="Head SHA" value={job.head_sha} mono /><DetailRow label="Reviewer" value={job.reviewer_agent_id || "—"} mono /><DetailRow label="Source" value={job.source} /></dl></CollapsibleContent></Collapsible>
   </div>
@@ -157,7 +156,39 @@ function ReviewRecordContent({ projectId, item, detail, detailLoading, detailErr
 function Attempts({ projectId, attempts, usageByAttemptId }: { projectId: string; attempts: ReviewRunSummary[]; usageByAttemptId: Record<string, NonNullable<ReviewRunSummary["token_usage"]>> }) {
   const [selected, setSelected] = useState<ReviewRunSummary | null>(() => latestReviewAttempt(attempts))
   const selectedAttempt = attempts.find((attempt) => attempt.id === selected?.id) ?? latestReviewAttempt(attempts)
-  return <section className="flex flex-col gap-2.5"><div><h3 className="text-sm font-medium">Attempts</h3><p className="text-xs text-muted-foreground">Each row is one Agent turn; retry-waiting is part of the same logical review.</p></div>{attempts.length === 0 ? <p className="rounded-lg border p-3 text-sm text-muted-foreground">No attempt has started yet.</p> : <div className="flex flex-col gap-2">{attempts.map((attempt) => <button key={attempt.id} type="button" className={cn("flex min-h-11 w-full items-center justify-between gap-3 rounded-lg border p-3 text-left", selectedAttempt?.id === attempt.id && "border-primary/50 bg-muted/40")} onClick={() => setSelected(attempt)}><span className="min-w-0 flex-1"><span className="block text-sm font-medium">Attempt {attempt.attempt_index || 1}</span><span className="block text-xs text-muted-foreground">{formatReviewDate(attempt.started_at)} · {formatReviewDuration(attempt.started_at, attempt.finished_at)}</span><ReviewAttemptUsage usage={usageByAttemptId[attempt.id]} />{attempt.error && <span className="mt-1 block truncate text-xs text-destructive">{attempt.error}</span>}</span><StatusBadge status={attempt.status} /></button>)}</div>}{selectedAttempt?.summary && <section className="rounded-lg border bg-muted/35 p-3"><h4 className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt summary</h4><Markdown>{selectedAttempt.summary}</Markdown></section>}<ReviewAttemptActivity projectId={projectId} attempt={selectedAttempt} /></section>
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <h3 className="text-sm font-medium">Attempts</h3>
+        <p className="text-xs text-muted-foreground">Each attempt is one Agent turn; retry waiting remains part of the same review.</p>
+      </div>
+      {attempts.length === 0
+        ? <p className="rounded-lg border p-3 text-sm text-muted-foreground">No attempt has started yet.</p>
+        : <div className="flex flex-wrap gap-2" role="group" aria-label="Review attempts">
+            {attempts.map((attempt) => (
+              <button
+                key={attempt.id}
+                type="button"
+                aria-pressed={selectedAttempt?.id === attempt.id}
+                className={cn(
+                  "flex min-h-9 min-w-0 items-center gap-2 rounded-lg border px-3 py-2 text-left transition-colors hover:bg-muted/45",
+                  selectedAttempt?.id === attempt.id && "border-foreground/20 bg-muted/60",
+                )}
+                onClick={() => setSelected(attempt)}
+              >
+                <span className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-xs font-medium">Attempt {attempt.attempt_index || 1}</span>
+                  <span className="text-[11px] tabular-nums text-muted-foreground">{formatReviewDuration(attempt.started_at, attempt.finished_at)}</span>
+                  <ReviewAttemptUsage usage={usageByAttemptId[attempt.id]} />
+                  {attempt.error && <span className="max-w-48 truncate text-xs text-destructive">{attempt.error}</span>}
+                </span>
+                <StatusBadge status={attempt.status} />
+              </button>
+            ))}
+          </div>}
+      <ReviewAttemptActivity projectId={projectId} attempt={selectedAttempt} />
+    </section>
+  )
 }
 
 function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; attempt: ReviewRunSummary | null }) {
@@ -166,7 +197,7 @@ function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; atte
   if (detail.isLoading) return <LoadingState rows={3} />
   if (detail.error) return <ErrorState error={detail.error} retry={() => void detail.refetch()} />
   const activity = detail.data ? buildReviewActivity(detail.data as ReviewRunDetail) : null
-  return <div className="space-y-2"><h4 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt activity</h4>{activity && <ReviewActivityList activity={activity} />}</div>
+  return <section aria-label="Attempt activity" className="flex flex-col gap-1 border-t pt-4"><h4 className="text-sm font-medium">Attempt activity</h4>{activity && <ReviewActivityList activity={activity} />}</section>
 }
 
 function ReviewDetailActions({ pr, repository, reviewable, onRereview, pending }: { pr?: number; repository: string; reviewable: boolean; onRereview(pr: number): void; pending: boolean }) {

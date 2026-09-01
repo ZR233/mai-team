@@ -38,6 +38,9 @@ test("PR 聚合列表分页并在详情切换执行和未执行历史", async ({
   await page.getByRole("option", { name: /succeeded/i }).click()
   await expect(page.getByText("Attempt 1")).toBeVisible()
   await expect(page.getByText("Review completed").first()).toBeVisible()
+  await expect(page.getByRole("feed", { name: "Conversation timeline" })).toBeVisible()
+  const response = page.getByRole("article", { name: "Mai Team response" })
+  await expect(response).toContainText("Review response from shared Timeline")
 
   await page.keyboard.press("Escape")
   await expect(page.getByRole("dialog")).toHaveCount(0)
@@ -134,7 +137,7 @@ async function installReviewFixture(page: Page) {
       ...reviewJob("executed-job", 42, "succeeded", 1),
       attempts: [reviewRun],
     })
-    if (path === "/projects/project-1/review-runs/run-1") return json(route, { ...reviewRun, history: null })
+    if (path === "/projects/project-1/review-runs/run-1") return json(route, { ...reviewRun, history: reviewHistory })
     return route.continue()
   })
 }
@@ -194,6 +197,23 @@ const reviewRun = {
   finished_at: "2026-08-11T10:01:00Z",
   summary: "Review completed",
   history_status: "available",
+}
+
+const reviewHistory = {
+  turn: {
+    id: "turn-1",
+    threadId: "thread-1",
+    revision: 1,
+    state: { kind: "completed", data: { startedAt: 1, completedAt: 8, completion: "normal" } },
+    updatedAt: 8,
+  },
+  contextDisposition: "active",
+  items: [
+    { id: "review-user", threadId: "thread-1", turnId: "turn-1", ordinal: 0, revision: 1, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: "Review pull request #42.", lifecycle: { kind: "completed", data: { completedAt: 1 } } } } },
+    { id: "review-reasoning", threadId: "thread-1", turnId: "turn-1", ordinal: 1, revision: 1, createdAt: 2, updatedAt: 4, state: { kind: "thinking", data: { summary: ["Checking correctness and tests"], content: ["Inspecting the affected runtime paths."], lifecycle: { kind: "completed", data: { completedAt: 4 } } } } },
+    { id: "review-skill", threadId: "thread-1", turnId: "turn-1", ordinal: 2, revision: 1, createdAt: 5, updatedAt: 5, state: { kind: "skill", data: { activation: { name: "project-review", source: "project", providerId: "fixture", resourceBase: { kind: "directory", path: "/skills/project-review" }, turnId: "turn-1", cause: { kind: "tool", toolCallId: "skill-view" }, activatedAt: 5 } } } },
+    { id: "review-final", threadId: "thread-1", turnId: "turn-1", ordinal: 3, revision: 1, createdAt: 6, updatedAt: 8, state: { kind: "text", data: { channel: "final", text: "## Review response from shared Timeline\n\nThe change is correct overall; add one focused regression before merge.", lifecycle: { kind: "completed", data: { completedAt: 8 } } } } },
+  ],
 }
 
 const projectSummary = {

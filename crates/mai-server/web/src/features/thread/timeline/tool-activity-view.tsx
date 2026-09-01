@@ -5,7 +5,7 @@
  * 组件只消费投影层产出的 ToolActivity / ToolActivityGroup 模型。
  */
 
-import { CheckCircle2, ChevronDown, CircleDot, Download, FileOutput, FileSearch, FileText, GitPullRequest, NotebookPen, OctagonAlert, SquareTerminal, Wrench } from "lucide-react"
+import { ChevronDown, CircleDot, Download, FileOutput, FileSearch, FileText, GitPullRequest, NotebookPen, OctagonAlert, SquareTerminal, Wrench } from "lucide-react"
 import { useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
@@ -15,6 +15,7 @@ import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
 
 import { isFailedOutcome, type ToolActivity, type ToolOutcome } from "./tool-activity"
+import { TimelineActivityRail, timelineActivityTriggerClass } from "./timeline-activity"
 import { formatToolJson } from "./tool-json"
 import type { ToolActivityGroup } from "./timeline-entries"
 import { ToolSectionView } from "./tool-section-view"
@@ -25,22 +26,16 @@ export function ToolActivityRow({ activity, variant = "standalone" }: { activity
   const [open, setOpen] = useState(false)
   const failed = isFailedOutcome(activity.outcome)
 
-  return (
+  const content = (
     <Collapsible open={open} onOpenChange={setOpen} className="w-full min-w-0 max-w-full overflow-hidden">
       <CollapsibleTrigger
-        className="group flex min-h-11 w-full max-w-full items-center gap-2.5 overflow-hidden rounded-md px-1.5 text-left outline-none transition-colors hover:bg-muted/45 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+        className={timelineActivityTriggerClass}
         aria-label={`${open ? "Collapse" : "Expand"} ${activity.title}`}
       >
-        <span className={cn(
-          "grid size-8 shrink-0 place-items-center rounded-md border bg-background text-muted-foreground",
-          failed && "border-destructive/30 text-destructive",
-        )}>
-          <ToolIcon name={activity.title} className="size-3.5" aria-hidden="true" />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-medium">{activity.title}</span>
-          {activity.summary && <span className="block truncate text-xs text-muted-foreground">{activity.summary}</span>}
-        </span>
+        <ToolIcon name={activity.title} className={cn("size-3.5 shrink-0", failed && "text-destructive")} aria-hidden="true" />
+        <span className="shrink-0 font-medium text-foreground/80">{activity.title}</span>
+        {activity.summary && <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{activity.summary}</span>}
+        {!activity.summary && <span className="min-w-0 flex-1" />}
         {variant === "standalone" && <OutcomeBadge outcome={activity.outcome} />}
         <OutcomeIcon outcome={activity.outcome} />
         {variant === "standalone" && (
@@ -51,7 +46,7 @@ export function ToolActivityRow({ activity, variant = "standalone" }: { activity
         )}
       </CollapsibleTrigger>
       <CollapsibleContent className="max-w-full overflow-hidden">
-        <div className={cn("space-y-3 border-t py-3", variant === "grouped" && "bg-muted/20 px-3")}>
+        <div className={cn("flex flex-col gap-3 rounded-lg bg-muted/25 p-3", variant === "grouped" && "rounded-none bg-muted/20")}>
           {activity.sections.map((section, index) => <ToolSectionView key={index} section={section} />)}
           {activity.artifacts.length > 0 && <ArtifactList artifacts={activity.artifacts} />}
           {(activity.rawArguments || activity.rawResult) && <RawToolData rawArguments={activity.rawArguments} rawResult={activity.rawResult} />}
@@ -59,39 +54,37 @@ export function ToolActivityRow({ activity, variant = "standalone" }: { activity
       </CollapsibleContent>
     </Collapsible>
   )
+
+  return variant === "standalone" ? <TimelineActivityRail>{content}</TimelineActivityRail> : content
 }
 
 export function ToolActivityGroupView({ group }: { group: ToolActivityGroup }) {
   const [open, setOpen] = useState(false)
 
   return (
-    <Collapsible open={open} onOpenChange={setOpen} className="w-full min-w-0 max-w-full overflow-hidden" data-tool-activity-group>
-      <CollapsibleTrigger
-        className="group flex min-h-11 w-full max-w-full items-center gap-2.5 overflow-hidden rounded-md px-1.5 text-left outline-none transition-colors hover:bg-muted/45 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-        aria-label={`${open ? "Collapse" : "Expand"} ${group.countLabel}`}
-      >
-        <span className={cn(
-          "grid size-8 shrink-0 place-items-center rounded-md border bg-background text-muted-foreground",
-          group.failedCount > 0 && "border-destructive/30 text-destructive",
-        )}>
-          <Wrench className="size-3.5" aria-hidden="true" />
-        </span>
-        <span className="min-w-0 flex-1 truncate text-sm font-semibold">{group.countLabel}</span>
-        {group.durationLabel && <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{group.durationLabel}</span>}
-        {group.failedCount > 0
-          ? <OctagonAlert className="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-          : group.active
-            ? <CircleDot className="size-3.5 shrink-0 animate-pulse text-muted-foreground motion-reduce:animate-none" aria-hidden="true" />
-            : null}
-        <ChevronDown
-          className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none", open && "rotate-180")}
-          aria-hidden="true"
-        />
-      </CollapsibleTrigger>
-      <CollapsibleContent className="max-w-full overflow-hidden">
-        <div className="relative ml-3 max-w-[calc(100%-0.75rem)] pl-3 sm:ml-5 sm:max-w-[calc(100%-1.25rem)] sm:pl-5">
-          <Separator orientation="vertical" className="absolute top-0 left-0 h-full" />
-          <div className="flex min-w-0 max-w-full flex-col overflow-hidden">
+    <TimelineActivityRail>
+      <Collapsible open={open} onOpenChange={setOpen} className="w-full min-w-0 max-w-full overflow-hidden" data-tool-activity-group>
+        <CollapsibleTrigger
+          className={timelineActivityTriggerClass}
+          aria-label={`${open ? "Collapse" : "Expand"} ${group.countLabel}`}
+        >
+          <Wrench className={cn("size-3.5 shrink-0", group.failedCount > 0 && "text-destructive")} data-icon="inline-start" aria-hidden="true" />
+          <span className="shrink-0 font-medium text-foreground/80">Tools</span>
+          <span className="min-w-0 flex-1 truncate text-xs">{group.countLabel}</span>
+          {group.durationLabel && <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{group.durationLabel}</span>}
+          {group.failedCount > 0
+            ? <OctagonAlert className="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+            : group.active
+              ? <CircleDot className="size-3.5 shrink-0 animate-pulse text-muted-foreground motion-reduce:animate-none" aria-hidden="true" />
+              : null}
+          <ChevronDown
+            className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none", open && "rotate-180")}
+            data-icon="inline-end"
+            aria-hidden="true"
+          />
+        </CollapsibleTrigger>
+        <CollapsibleContent className="max-w-full overflow-hidden">
+          <div className="ml-4 flex min-w-0 max-w-[calc(100%-1rem)] flex-col overflow-hidden border-l pl-3">
             {group.activities.map((activity, index) => (
               <div key={activity.id} className="min-w-0 max-w-full overflow-hidden">
                 {index > 0 && <Separator />}
@@ -99,9 +92,9 @@ export function ToolActivityGroupView({ group }: { group: ToolActivityGroup }) {
               </div>
             ))}
           </div>
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
+        </CollapsibleContent>
+      </Collapsible>
+    </TimelineActivityRail>
   )
 }
 
@@ -114,15 +107,15 @@ function OutcomeBadge({ outcome }: { outcome: ToolOutcome }) {
 function OutcomeIcon({ outcome }: { outcome: ToolOutcome }) {
   if (isFailedOutcome(outcome)) return <OctagonAlert className="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
   if (outcome === "active") return <CircleDot className="size-3.5 shrink-0 animate-pulse text-muted-foreground motion-reduce:animate-none" aria-hidden="true" />
-  if (outcome === "completed") return <CheckCircle2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+  if (outcome === "completed") return null
   return null
 }
 
 function ArtifactList({ artifacts }: { artifacts: { id?: string; label: string }[] }) {
   return (
-    <section className="space-y-1.5">
+    <section className="flex flex-col gap-1.5">
       <h5 className="text-xs font-medium text-muted-foreground">Artifacts</h5>
-      <ul className="space-y-1">
+      <ul className="flex flex-col gap-1">
         {artifacts.map((artifact, index) => (
           <li key={index}>
             {artifact.id
@@ -149,7 +142,7 @@ function RawToolData({ rawArguments, rawResult }: { rawArguments: string | null;
         Original data
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <div className="space-y-2 border-t p-2">
+        <div className="flex flex-col gap-2 border-t p-2">
           {rawArguments && <RawDataBlock label="Arguments" value={rawArguments} />}
           {rawResult && <RawDataBlock label="Result" value={rawResult} />}
         </div>
@@ -160,7 +153,7 @@ function RawToolData({ rawArguments, rawResult }: { rawArguments: string | null;
 
 function RawDataBlock({ label, value }: { label: string; value: string }) {
   return (
-    <div className="space-y-1">
+    <div className="flex flex-col gap-1">
       <p className="text-xs text-muted-foreground">{label}</p>
       <ScrollArea className="max-h-48 rounded-md border">
         <pre className="bg-foreground p-2.5 font-mono text-xs break-all whitespace-pre-wrap text-background">{formatToolJson(value)}</pre>

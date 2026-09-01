@@ -61,10 +61,33 @@ test("Thread 切换使用隔离 store，消息发送到目标 Thread", async ({ 
 })
 
 test("Thread timeline 在全部视口可用", async ({ page }) => {
+  const consoleProblems: string[] = []
+  page.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning") consoleProblems.push(message.text())
+  })
   await page.goto("/chat/env-a")
   await expect(page.getByText("Alpha message")).toBeVisible()
+  await expect(page.getByRole("article", { name: "Skill loaded: project-review" })).toBeVisible()
+  await expect(page.getByRole("feed", { name: "Conversation timeline" })).toBeVisible()
+  await expect(page.getByRole("article", { name: "Mai Team response" })).toContainText("Alpha message")
   await expect(page.locator("strong").filter({ hasText: "future-model" })).toBeVisible()
+
+  const skills = page.getByRole("button", { name: "2 skills loaded" })
+  await expect(skills).toBeVisible()
+  if ((page.viewportSize()?.width ?? 0) >= 1024) {
+    await skills.hover()
+    await expect(page.getByRole("tooltip")).toContainText("project-review, rust-code-quality")
+  }
+  await skills.click()
+  await expect(page.getByRole("menuitemcheckbox", { name: "project-review" })).toHaveAttribute("aria-checked", "true")
+  await expect(page.getByRole("menuitemcheckbox", { name: "rust-code-quality" })).toHaveAttribute("aria-checked", "true")
+  await expect(page.getByRole("tooltip")).toHaveCount(0)
+  await page.keyboard.press("Escape")
+  await expect(page.getByRole("menuitemcheckbox", { name: "project-review" })).toHaveCount(0)
+  await page.getByRole("article", { name: "Mai Team response" }).click()
+  await expect(page.getByRole("tooltip")).toHaveCount(0)
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  expect(consoleProblems).toEqual([])
 })
 
 async function installApiFixture(page: Page) {
@@ -153,9 +176,16 @@ function snapshotUpdate(threadId: string, text: string) {
       schemaVersion: 7,
       revision: 1,
       thread: thread(threadId, threadId),
-      items: [{ id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "final", text, lifecycle: { kind: "completed", data: { completedAt: 1 } } } } }],
+      items: [
+        { id: `${threadId}:user`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: "Review the Rust service for correctness and maintainability.", lifecycle: { kind: "completed", data: { completedAt: 1 } } } } },
+        { id: `${threadId}:reasoning`, threadId, turnId: `${threadId}:turn`, ordinal: 1, revision: 0, createdAt: 2, updatedAt: 8, state: { kind: "thinking", data: { summary: ["Inspecting project structure and dependencies"], content: ["I will focus on ownership boundaries and error paths."], lifecycle: { kind: "completed", data: { completedAt: 8 } } } } },
+        { id: `${threadId}:tool`, threadId, turnId: `${threadId}:turn`, ordinal: 2, revision: 0, createdAt: 9, updatedAt: 12, state: { kind: "tool", data: { invocation: { toolCallId: `${threadId}:read`, name: "read_file", arguments: JSON.stringify({ path: "src/runtime.rs" }) }, state: { kind: "succeeded", data: { completedAt: 12, output: { result: "runtime source", exitCode: 0 } } } } } },
+        { id: `${threadId}:skill`, threadId, turnId: `${threadId}:turn`, ordinal: 3, revision: 0, createdAt: 13, updatedAt: 13, state: { kind: "skill", data: { activation: { name: "project-review", source: "project", providerId: "fixture", resourceBase: { kind: "directory", path: "/skills/project-review" }, turnId: `${threadId}:turn`, cause: { kind: "tool", toolCallId: `${threadId}:skill-view` }, activatedAt: 13 } } } },
+        { id: `${threadId}:commentary`, threadId, turnId: `${threadId}:turn`, ordinal: 4, revision: 0, createdAt: 14, updatedAt: 14, state: { kind: "text", data: { channel: "commentary", text: "Checked the runtime boundary and focused the review on actionable findings.", lifecycle: { kind: "completed", data: { completedAt: 14 } } } } },
+        { id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 5, revision: 0, createdAt: 15, updatedAt: 15, state: { kind: "text", data: { channel: "final", text: `## Rust service review\n\n${text}\n\nThe implementation is sound overall.\n\n- **Correctness:** ownership is explicit.\n- **Testing:** add a regression for the failure path.`, lifecycle: { kind: "completed", data: { completedAt: 15 } } } } },
+      ],
       interactions: [],
-      runtime: { threadId, usage: usageSnapshot(), activeSkills: [], activeMcpServers: [], activeLspServers: [], updatedAt: 1 },
+      runtime: { threadId, usage: usageSnapshot(), activeSkills: ["project-review", "rust-code-quality"], activeMcpServers: [], activeLspServers: [], updatedAt: 2 },
     },
   }
 }

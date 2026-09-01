@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { describe, expect, it } from "vitest"
 
@@ -89,10 +89,13 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
 
     render(<TimelineEntriesView items={[productionItem]} />)
 
-    expect(screen.getByText("原生 PL v2 Review 结果")).toBeVisible()
+    const timeline = screen.getByRole("feed", { name: "Conversation timeline" })
+    const response = within(timeline).getByRole("article", { name: "Mai Team response" })
+    expect(response).toHaveAttribute("data-priority", "primary")
+    expect(within(response).getByText("原生 PL v2 Review 结果")).toBeVisible()
   })
 
-  it("渲染文字与计划，并隐藏协议内部条目", () => {
+  it("渲染文字、计划与技能加载，并隐藏其余协议内部条目", () => {
     render(<ThreadTimeline snapshot={snapshot([
       item({ kind: "text", data: { channel: "user", text: "please review", lifecycle: completed() } }),
       item({ kind: "text", data: { channel: "commentary", text: "正在检查生命周期。", lifecycle: completed() } }),
@@ -105,6 +108,7 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
     expect(screen.getByText("please review")).toBeVisible()
     expect(screen.getByText("正在检查生命周期。")).toBeVisible()
     expect(screen.getByText("核对清理边界")).toBeVisible()
+    expect(screen.getByRole("article", { name: "Skill loaded: review" })).toHaveTextContent("Triggered by tool · system")
     expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
   })
 

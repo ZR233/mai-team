@@ -2,7 +2,7 @@
  * 时间轴投影：ThreadItem[] → TimelineEntry[]。
  *
  * 核心规则（Codex 风格）：同一 turn 内连续的工具调用合并为一个
- * toolGroup 条目；任何非工具条目（文字、思考、计划、文件、压缩通知）
+ * toolGroup 条目；任何可见的非工具条目（文字、思考、计划、技能激活）
  * 或 turn 边界都会打断分组。连续段长度为 1 时退化为单个 tool 条目。
  *
  * key 从条目 id 派生且流式更新期间稳定，保证分组折叠状态不被 React 重置。
@@ -107,7 +107,6 @@ function isVisibleItem(item: ThreadItem): boolean {
     case "agent":
     case "turn":
     case "inference":
-    case "skill":
     case "file":
     case "contextCompaction":
       return false
@@ -115,6 +114,7 @@ function isVisibleItem(item: ThreadItem): boolean {
       return [...(item.state.data.summary ?? []), ...(item.state.data.content ?? [])].some((part) => part.trim().length > 0)
     case "text":
     case "plan":
+    case "skill":
     case "tool":
       return true
   }

@@ -23,20 +23,20 @@ export function ToolSectionView({ section }: { section: ToolSection }) {
       return <FactList title={section.title} items={section.items} />
     case "list":
       return (
-        <section className="space-y-1.5">
+        <section className="flex flex-col gap-1.5">
           <h5 className="text-xs font-medium text-muted-foreground">{section.title}</h5>
-          <ul className="space-y-1 rounded-md border bg-muted/30 p-2.5 font-mono text-xs break-all">
+          <ul className="flex flex-col gap-1 rounded-md border bg-muted/30 p-2.5 font-mono text-xs break-all">
             {section.items.map((item, index) => <li key={index}>{item}</li>)}
           </ul>
         </section>
       )
     case "matches":
       return (
-        <section className="space-y-1.5">
+        <section className="flex flex-col gap-1.5">
           <h5 className="text-xs font-medium text-muted-foreground">{section.title}</h5>
           <div className="divide-y rounded-md border">
             {section.items.map((match, index) => (
-              <div key={index} className="space-y-0.5 p-2">
+              <div key={index} className="flex flex-col gap-0.5 p-2">
                 <code className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <FileSearch className="size-3 shrink-0" aria-hidden="true" />
                   {matchLocation(match)}
@@ -48,7 +48,7 @@ export function ToolSectionView({ section }: { section: ToolSection }) {
         </section>
       )
     case "markdown":
-      return <ExpandableContent title={section.title} text={section.text} render={(value) => <Markdown>{value}</Markdown>} />
+      return <ExpandableContent title={section.title} text={section.text} render={(value) => <Markdown variant="auxiliary">{value}</Markdown>} />
     case "code":
       return <ExpandableContent title={section.title} text={section.text} render={(value) => <pre className="font-mono text-xs whitespace-pre-wrap">{value}</pre>} />
     case "text":
@@ -62,7 +62,7 @@ function matchLocation(match: { path?: string; line?: number; column?: number })
 
 function FactList({ title, items }: { title: string; items: { label: string; value: string }[] }) {
   return (
-    <section className="space-y-1.5">
+    <section className="flex flex-col gap-1.5">
       <h5 className="text-xs font-medium text-muted-foreground">{title}</h5>
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 rounded-md border bg-muted/45 p-2.5 text-xs">
         {items.map((item, index) => (
@@ -82,7 +82,7 @@ function ExpandableContent({ title, text, render }: { title: string; text: strin
   const value = expanded ? text : preview
 
   return (
-    <section className="space-y-1.5">
+    <section className="flex flex-col gap-1.5">
       <h5 className="text-xs font-medium text-muted-foreground">{title}</h5>
       <ScrollArea className={cn("rounded-md border", expanded ? "max-h-[32rem]" : "max-h-64")}>
         <div className="p-2.5">{render(value)}</div>
