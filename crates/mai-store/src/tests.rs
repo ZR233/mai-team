@@ -1369,13 +1369,25 @@ async fn review_jobs_dedupe_same_head_and_supersede_old_head() {
 async fn review_discovery_admission_rolls_back_the_whole_batch() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
+    let mut failed = test_review_job(project_id, 40, "head-40", None);
+    failed.status = ProjectReviewJobStatus::Failed;
+    failed.attempt_count = 1;
+    failed.first_retryable_failure_at = Some(Utc::now() - chrono::TimeDelta::hours(1));
+    failed.next_attempt_at = None;
+    failed.finished_at = Some(Utc::now());
+    let failed_id = failed.id;
+    store
+        .save_project_review_job(failed)
+        .await
+        .expect("save recoverable failed job");
+    let retry = test_review_job(project_id, 40, "head-40", None);
     let valid = test_review_job(project_id, 41, "head-41", None);
     let invalid = test_review_job(project_id, 0, "", None);
 
     let error = store
-        .admit_project_review_discovery(vec![valid, invalid], Vec::new())
+        .admit_project_review_discovery(vec![retry, valid, invalid], Vec::new())
         .await
-        .expect_err("invalid second candidate must roll back the first insert");
+        .expect_err("invalid candidate must roll back recovery and insertion");
 
     assert!(
         error
@@ -1389,6 +1401,13 @@ async fn review_discovery_admission_rolls_back_the_whole_batch() {
             .await
             .expect("load rolled back job")
     );
+    let failed = store
+        .load_project_review_job(project_id, failed_id)
+        .await
+        .expect("load rolled back failed job")
+        .expect("failed job remains durable");
+    assert_eq!(ProjectReviewJobStatus::Failed, failed.status);
+    assert_eq!(1, failed.attempt_count);
 }
 
 #[tokio::test]
@@ -1471,11 +1490,96 @@ async fn review_discovery_admission_batches_jobs_and_ci_watches() {
 }
 
 #[tokio::test]
+async fn review_discovery_requeues_same_logical_failed_job_until_attempts_exhausted() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut failed = test_review_job(project_id, 44, "failed-head", None);
+    failed.status = ProjectReviewJobStatus::Failed;
+    failed.attempt_count = 1;
+    failed.next_attempt_at = None;
+    failed.reviewer_agent_id = Some(reviewer_id);
+    failed.failure = Some(ProjectReviewFailure {
+        category: ProjectReviewFailureCategory::Provider,
+        code: None,
+        http_status: Some(401),
+        message: "provider credentials were rejected".to_string(),
+        retry: pl_protocol::RetryDisposition::Permanent,
+    });
+    failed.finished_at = Some(Utc::now());
+    let failed_id = failed.id;
+    let mut expected = failed.clone();
+    store
+        .save_project_review_job(failed)
+        .await
+        .expect("save failed job with attempts remaining");
+    let candidate = test_review_job(project_id, 44, "failed-head", None);
+    expected.status = ProjectReviewJobStatus::Queued;
+    expected.delivery_id = candidate.delivery_id.clone().or(expected.delivery_id);
+    expected.reason = candidate.reason.clone();
+    expected.first_retryable_failure_at = None;
+    expected.next_attempt_at = Some(candidate.created_at);
+    expected.reviewer_agent_id = None;
+    expected.active_run_id = None;
+    expected.lease_owner = None;
+    expected.lease_expires_at = None;
+    expected.failure = None;
+    expected.environment_warning = None;
+    expected.skip_reason = None;
+    expected.updated_at = candidate.updated_at;
+    expected.finished_at = None;
+
+    let admission = store
+        .admit_project_review_discovery(vec![candidate], Vec::new())
+        .await
+        .expect("requeue failed job with attempts remaining");
+
+    assert_eq!(Vec::<u64>::new(), admission.suppressed);
+    assert_eq!(Vec::<ProjectReviewJobSummary>::new(), admission.deduped);
+    assert_eq!(
+        vec![failed_id],
+        admission
+            .queued
+            .iter()
+            .map(|job| job.id)
+            .collect::<Vec<_>>()
+    );
+    let requeued = admission.queued.into_iter().next().expect("requeued job");
+    assert_eq!(expected, requeued);
+    let history = store
+        .load_project_pull_request_review_history(project_id, 44, 1, 10)
+        .await
+        .expect("load requeued job history");
+    assert_eq!(1, history.total_items);
+    assert_eq!(failed_id, history.items[0].job.id);
+
+    let claimed_at = requeued.next_attempt_at.expect("requeued due time");
+    let owner = "discovery-retry-worker".to_string();
+    let claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            claimed_at,
+            claimed_at + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim requeued job")
+        .expect("requeued job is due");
+    assert_eq!(failed_id, claimed.id);
+    let started = store
+        .begin_claimed_project_review_attempt(failed_id, owner, Uuid::new_v4(), claimed_at)
+        .await
+        .expect("begin next attempt on the same logical job");
+    assert_eq!(2, started.attempt_count);
+}
+
+#[tokio::test]
 async fn review_discovery_suppresses_exhausted_failed_head_only() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let mut failed = test_review_job(project_id, 44, "failed-head", None);
     failed.status = ProjectReviewJobStatus::Failed;
+    failed.attempt_count = failed.max_attempts;
     failed.next_attempt_at = None;
     failed.finished_at = Some(Utc::now());
     store
@@ -1508,6 +1612,48 @@ async fn review_discovery_suppresses_exhausted_failed_head_only() {
             .map(|job| job.head_sha.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn review_discovery_does_not_requeue_ambiguous_submission() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut failed = test_review_job(project_id, 45, "ambiguous-head", None);
+    failed.status = ProjectReviewJobStatus::Failed;
+    failed.attempt_count = 1;
+    failed.next_attempt_at = None;
+    failed.submission_intent = Some(ProjectReviewSubmissionIntent {
+        job_id: failed.id,
+        head_sha: failed.head_sha.clone(),
+        event: ProjectReviewDecision::RequestChanges,
+        body_hash: "sha256:ambiguous-review".to_string(),
+        comment_count: 1,
+        created_at: Utc::now(),
+    });
+    failed.finished_at = Some(Utc::now());
+    let failed_id = failed.id;
+    store
+        .save_project_review_job(failed)
+        .await
+        .expect("save ambiguous failed job");
+
+    let admission = store
+        .admit_project_review_discovery(
+            vec![test_review_job(project_id, 45, "ambiguous-head", None)],
+            Vec::new(),
+        )
+        .await
+        .expect("admit ambiguous failed head");
+
+    assert_eq!(vec![45], admission.suppressed);
+    assert_eq!(Vec::<ProjectReviewJobSummary>::new(), admission.queued);
+    let persisted = store
+        .load_project_review_job(project_id, failed_id)
+        .await
+        .expect("load ambiguous failed job")
+        .expect("ambiguous failed job remains durable");
+    assert_eq!(ProjectReviewJobStatus::Failed, persisted.status);
+    assert!(persisted.submission_intent.is_some());
 }
 
 #[tokio::test]

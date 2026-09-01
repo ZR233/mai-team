@@ -79,8 +79,44 @@ impl MaiStore {
                 validate_discovery_candidate(&candidate)?;
                 let has_active =
                     load_active_job(&transaction, candidate.project_id, candidate.pr)?.is_some();
-                if !has_active && latest_same_head_job_failed(&transaction, &candidate)? {
-                    admission.suppressed.push(candidate.pr);
+                if !has_active
+                    && let Some(failed) = latest_same_head_failed_job(&transaction, &candidate)?
+                {
+                    let attempts_remaining = failed.attempt_count < failed.max_attempts;
+                    let submission_is_unambiguous = failed.submission_intent_json.is_none()
+                        && failed.submission_receipt_json.is_none();
+                    if !attempts_remaining || !submission_is_unambiguous {
+                        admission.suppressed.push(candidate.pr);
+                        continue;
+                    }
+                    let updated = transaction.execute(
+                        "UPDATE project_review_jobs SET status = 'queued', \
+                         delivery_id = COALESCE(?1, delivery_id), reason = ?2, \
+                         first_retryable_failure_at = NULL, next_attempt_at = ?3, \
+                         reviewer_agent_id = NULL, active_run_id = NULL, lease_owner = NULL, \
+                         lease_expires_at = NULL, failure_json = NULL, \
+                         environment_warning_json = NULL, skip_reason = NULL, updated_at = ?4, \
+                         finished_at = NULL WHERE id = ?5 AND status = 'failed'",
+                        params![
+                            candidate.delivery_id,
+                            candidate.reason,
+                            candidate.created_at.to_rfc3339(),
+                            candidate.updated_at.to_rfc3339(),
+                            failed.id
+                        ],
+                    )?;
+                    if updated != 1 {
+                        return Err(StoreError::InvalidConfig(
+                            "failed review job changed during discovery admission".to_string(),
+                        ));
+                    }
+                    let failed_id = parse_uuid(&failed.id)?;
+                    let requeued = load_job(&transaction, failed_id)?
+                        .ok_or_else(|| {
+                            StoreError::InvalidConfig("requeued review job vanished".to_string())
+                        })?
+                        .into_summary()?;
+                    admission.queued.push(requeued);
                     continue;
                 }
                 let result = enqueue_in_transaction(
@@ -734,24 +770,27 @@ fn validate_discovery_watch(watch: &ProjectReviewCiWatch) -> Result<()> {
     Ok(())
 }
 
-fn latest_same_head_job_failed(
+fn latest_same_head_failed_job(
     connection: &Connection,
     candidate: &ProjectReviewJobSummary,
-) -> Result<bool> {
-    let status = connection
+) -> Result<Option<ProjectReviewJobRecord>> {
+    let sql = format!(
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs
+         WHERE project_id = ?1 AND pr = ?2 AND head_sha = ?3
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    let job = connection
         .query_row(
-            "SELECT status FROM project_review_jobs
-             WHERE project_id = ?1 AND pr = ?2 AND head_sha = ?3
-             ORDER BY created_at DESC, id DESC LIMIT 1",
+            &sql,
             params![
                 candidate.project_id.to_string(),
                 u64_to_i64(candidate.pr),
                 candidate.head_sha,
             ],
-            |row| row.get::<_, String>(0),
+            project_review_job_record,
         )
         .optional()?;
-    Ok(status.as_deref() == Some("failed"))
+    Ok(job.filter(|job| job.status == "failed"))
 }
 
 fn enqueue_on_path(

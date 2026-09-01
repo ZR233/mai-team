@@ -33,8 +33,10 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
   `Ignored`。
 - 手动重新审查遇到同一 PR 的活跃 Job 时直接返回该 Job，不访问 GitHub、也不创建重复 generation。
 - 历史 Job 已终止时，手动重新审查可以创建新 Job。
-- discovery 不为同一 head 已耗尽尝试并进入 `Failed` 的 Job 自动创建无限 generation；
-  新 head、Webhook 新事件和手动重新审查不受此抑制规则影响。
+- discovery 遇到同一 head 的 `Failed` Job 时不创建新 generation：只要原 Job 仍有尝试预算且
+  没有未解决的 `SubmissionIntent`，就在批量事务内把原 Job 恢复为 `Queued`，清除已删除的
+  Reviewer 所有权并继续递增原 `attempt_count`。尝试预算耗尽或提交结果仍有歧义时才计为
+  suppressed；新 head、Webhook 新事件和手动重新审查不受此规则影响。
 - `pull_request` webhook 单 PR eligibility 读取失败时不写内存队列，由 relay
   的失败确认机制重投；当前事件仅因 CI 尚未完成而不满足 eligibility 时，按
   `project + PR` 持久化 CI watch。相同 PR 的后续 delivery 更新同一 watch，新
@@ -74,8 +76,9 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 
 全部 GitHub 读取结束后，合格候选和 CI pending 候选在一个短 `BEGIN IMMEDIATE` 事务中
 分别批量写入 Job 和持久化 CI watch。任一写入失败整批回滚；同 head 去重、新 head
-supersede、CI watch 原子 upsert 和 PR 单活约束均复用同一 Store 不变量。只有真正新建的
-Job 发布 `project_review_queued`，deduped、watched 和 suppressed 只进入 discovery 计数。
+supersede、CI watch 原子 upsert 和 PR 单活约束均复用同一 Store 不变量。只有真正进入
+`Queued` 的新 Job 或受控恢复 Job 发布 `project_review_queued`，deduped、watched 和
+suppressed 只进入 discovery 计数。
 
 scheduler 在服务启动时立即扫描，此后以每轮开始时间为基准按固定 10 分钟周期运行；扫描超过
 一个周期时跳过已经错过的 tick，从完成时重新安排下一轮，避免补跑风暴。项目并发上限为 2，
@@ -137,6 +140,11 @@ PL 通过 `TurnFailure` 传递错误类别、provider code、HTTP status、用�
 PL 在单次模型请求内部仍可重试瞬态 provider 错误，但仅限尚未产生工具副作用的阶段。内部重试耗尽后，结构化失败交给 Job scheduler。
 
 每个 Job 最多五次尝试。第一次可重试失败开启 30 分钟窗口，后续四次本地退避依次为 5 秒、30 秒、2 分钟、5 分钟，并加入确定性的正负 20% jitter。Provider `Retry-After` 更长时优先使用，但不能把新尝试安排到窗口之外。窗口只限制启动新尝试，不中断已经正常运行的尝试。
+
+Job 因永久错误或重试窗口结束进入 `Failed` 后，后续 discovery 若确认 PR 仍满足 eligibility，
+可以使用同一 Job 的剩余尝试预算开启新的恢复窗口。恢复不复用已经按终态清理的 Reviewer，
+不重置 `attempt_count`，也不允许绕过未解决的 `SubmissionIntent`；因此外部凭据、Provider 或
+运行环境恢复后能够继续审查，同时每个 head 仍受单个逻辑 Job 的硬上限约束。
 
 鉴权、权限、输入校验、目标不存在和 Thread 损坏立即永久失败。head 变化进入 `Superseded`。瞬态 GitHub、relay 和工作区错误可进入 Job 重试，但同样必须持久化为结构化失败。
 
