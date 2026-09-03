@@ -69,9 +69,12 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 
 1. draft 跳过。
 2. `queued`、`requested`、`waiting`、`pending`、`in_progress` 等未完成 CI 状态会阻塞；CI conclusion 不参与阻塞判断。
-3. 查找当前 reviewer login 最近一次带 `submitted_at` 的 review。
-4. 能读取当前 head 提交时间时，仅当该时间晚于最近 review 才允许重审。
-5. 无法读取提交时间时，以 review `commit_id` 是否等于当前 head 兜底。
+3. 按稳定的 reviewer GitHub user ID 查找最近一次带 `submitted_at` 的 review。
+4. 当前 head SHA 与该 review 的 `commit_id` 都存在时，以两者是否精确相等作为权威判据：相等表示
+   当前 head 已审查，不相等则必须重审。不能用 Git commit 时间覆盖这个结论，因为延迟推送、
+   cherry-pick、rebase 或 force-push 都可能让新 head 的 commit 时间早于 review 提交时间。
+5. 只有缺少可比较的 head SHA 或 review `commit_id` 时，才退回时间判断：当前 head 提交时间晚于
+   最近 review 时允许重审，否则视为已经审查；时间也不可用时允许进入后续准入，避免静默漏审。
 6. PR 作者、其他人的 review 状态和 `mergeable_state` 不参与过滤。
 
 全部 GitHub 读取结束后，合格候选和 CI pending 候选在一个短 `BEGIN IMMEDIATE` 事务中
@@ -79,6 +82,15 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 supersede、CI watch 原子 upsert 和 PR 单活约束均复用同一 Store 不变量。只有真正进入
 `Queued` 的新 Job 或受控恢复 Job 发布 `project_review_queued`，deduped、watched 和
 suppressed 只进入 discovery 计数。
+
+discovery 同时统计 `closed`、`draft` 和 `already_reviewed`。这些字段表示 selector 在 GitHub
+读取阶段直接跳过的候选，和 Store 在批量准入阶段产生的 `suppressed` 不同。每个判定为
+`already_reviewed` 的候选还会以 debug 日志记录项目、PR 和 head SHA，便于核对“当前 head 已审”的
+判断；不能把 `eligible=0` 或 `suppressed=0` 当作所有 open PR 都已经正确审查的证据。
+
+周期兜底必须保留独立的端到端回归：当前 head 与最近 review `commit_id` 不同、但当前 head 的
+Git commit 时间早于 review 提交时间时，完整 discovery 扫描仍必须把该 PR 写入批量准入输入并
+形成 Queue Job。只覆盖单 PR webhook eligibility 不足以证明定期兜底没有退化。
 
 scheduler 在服务启动时立即扫描，此后以每轮开始时间为基准按固定 10 分钟周期运行；扫描超过
 一个周期时跳过已经错过的 tick，从完成时重新安排下一轮，避免补跑风暴。项目并发上限为 2，
@@ -196,8 +208,10 @@ schema 32 继续保留旧 Job/Run、intent、receipt、状态、用量和时间�
 
 `GET /projects/{id}/review-discovery` 返回 Runtime 内存快照，状态为 `disabled`、`idle`、
 `scanning`、`partial` 或 `backoff`，并包含上次开始/完成、下次计划时间、scanned、eligible、
-queued、deduped、watched、suppressed、errors 和最近错误。快照不写产品数据库；重启后先进入
-`scanning` 并立即生成新结果。
+queued、deduped、watched、closed、draft、already_reviewed、suppressed、errors 和最近错误。
+`closed`、`draft`、`already_reviewed` 是 selector skip reason 计数，`suppressed` 仅表示 Store 因
+尝试预算耗尽或提交结果有歧义而拒绝恢复的 Job。快照不写产品数据库；重启后先进入 `scanning`
+并立即生成新结果。
 
 每次快照变化发布 `project_review_discovery_updated` SSE。Web Review 页面用该事件精确失效
 discovery query，同时保留 60 秒低频刷新作为断线兜底；状态卡与 Job 状态、Run 状态分开展示。

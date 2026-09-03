@@ -90,6 +90,7 @@ pub(crate) async fn run_project_review_selector(
                 cancellation_token: cancellation_token.clone(),
             },
             &mut input,
+            &mut counts,
             &mut errors,
         )
         .await?;
@@ -116,6 +117,9 @@ pub(crate) async fn run_project_review_selector(
         queued = counts.queued,
         deduped = counts.deduped,
         watched = counts.watched,
+        closed = counts.closed,
+        draft = counts.draft,
+        already_reviewed = counts.already_reviewed,
         suppressed = counts.suppressed,
         errors = counts.errors,
         "project review discovery completed"
@@ -136,6 +140,7 @@ async fn evaluate_pull_request_page(
     ops: &impl ProjectReviewSelectorOps,
     page: PullRequestPageSelection<'_>,
     input: &mut ProjectReviewDiscoveryAdmissionInput,
+    counts: &mut ProjectReviewDiscoveryCounts,
     errors: &mut Vec<String>,
 ) -> Result<()> {
     let mut pending = FuturesUnordered::new();
@@ -173,7 +178,9 @@ async fn evaluate_pull_request_page(
             return Err(RuntimeError::TurnCancelled);
         }
         match result {
-            Ok(evaluated) => collect_evaluated_pull_request(input, errors, evaluated),
+            Ok(evaluated) => {
+                collect_evaluated_pull_request(page.project_id, input, counts, errors, evaluated)
+            }
             Err(error) => {
                 tracing::warn!(
                     project_id = %page.project_id,
@@ -187,7 +194,9 @@ async fn evaluate_pull_request_page(
 }
 
 fn collect_evaluated_pull_request(
+    project_id: ProjectId,
     input: &mut ProjectReviewDiscoveryAdmissionInput,
+    counts: &mut ProjectReviewDiscoveryCounts,
     errors: &mut Vec<String>,
     evaluated: EvaluatedProjectReviewPr,
 ) {
@@ -206,11 +215,21 @@ fn collect_evaluated_pull_request(
                 selection.pr
             ));
         }
-        Some(
-            ProjectReviewSkipReason::PullRequestClosed
-            | ProjectReviewSkipReason::Draft
-            | ProjectReviewSkipReason::AlreadyReviewedCurrentHead,
-        ) => {}
+        Some(ProjectReviewSkipReason::PullRequestClosed) => {
+            counts.closed = counts.closed.saturating_add(1);
+        }
+        Some(ProjectReviewSkipReason::Draft) => {
+            counts.draft = counts.draft.saturating_add(1);
+        }
+        Some(ProjectReviewSkipReason::AlreadyReviewedCurrentHead) => {
+            counts.already_reviewed = counts.already_reviewed.saturating_add(1);
+            tracing::debug!(
+                project_id = %project_id,
+                pr = selection.pr,
+                head_sha = ?selection.head_sha,
+                "project review discovery skipped current head already reviewed"
+            );
+        }
     }
 }
 
@@ -219,7 +238,8 @@ mod tests {
     use std::collections::HashMap;
 
     use mai_protocol::{
-        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus, now,
+        ProjectCloneStatus, ProjectReviewDiscoveryCounts, ProjectReviewOutcome,
+        ProjectReviewSkipReason, ProjectReviewStatus, ProjectStatus, now,
     };
     use pretty_assertions::assert_eq;
     use serde_json::{Value, json};
@@ -229,9 +249,12 @@ mod tests {
 
     use super::{
         ProjectReviewDiscoveryAdmissionInput, ProjectReviewDiscoveryAdmissionResult,
-        ProjectReviewIdentity, ProjectReviewSelectorOps, run_project_review_selector,
+        ProjectReviewIdentity, ProjectReviewSelectorOps, SelectedProjectReviewPr,
+        collect_evaluated_pull_request, run_project_review_selector,
     };
-    use crate::projects::review::eligibility::ProjectReviewEligibilityOps;
+    use crate::projects::review::eligibility::{
+        EvaluatedProjectReviewPr, ProjectReviewEligibilityOps,
+    };
     use crate::{ProjectReviewQueueSummary, RuntimeError};
 
     enum FakeGithubResponse {
@@ -298,6 +321,114 @@ mod tests {
             self.admissions.lock().await.push(input);
             Ok(self.admission_result.clone())
         }
+    }
+
+    #[test]
+    fn collect_exposes_ineligible_reason_counts() {
+        let project_id = Uuid::new_v4();
+        let mut input = ProjectReviewDiscoveryAdmissionInput::default();
+        let mut counts = ProjectReviewDiscoveryCounts::default();
+        let mut errors = Vec::new();
+        for (pr, skip_reason) in [
+            (1, ProjectReviewSkipReason::PullRequestClosed),
+            (2, ProjectReviewSkipReason::Draft),
+            (3, ProjectReviewSkipReason::AlreadyReviewedCurrentHead),
+        ] {
+            collect_evaluated_pull_request(
+                project_id,
+                &mut input,
+                &mut counts,
+                &mut errors,
+                EvaluatedProjectReviewPr {
+                    pr,
+                    head_sha: Some(format!("head-{pr}")),
+                    skip_reason: Some(skip_reason),
+                },
+            );
+        }
+
+        assert_eq!(ProjectReviewDiscoveryAdmissionInput::default(), input);
+        assert_eq!(
+            ProjectReviewDiscoveryCounts {
+                closed: 1,
+                draft: 1,
+                already_reviewed: 1,
+                ..Default::default()
+            },
+            counts
+        );
+        assert_eq!(Vec::<String>::new(), errors);
+    }
+
+    #[tokio::test]
+    async fn periodic_discovery_queues_changed_head_even_with_older_commit_time() {
+        let project_id = Uuid::new_v4();
+        let mut responses = HashMap::new();
+        responses.insert(
+            list_path(1),
+            FakeGithubResponse::Json(json!([pr_detail(2169, false, "new-head")])),
+        );
+        responses.insert(
+            pull_path(2169),
+            FakeGithubResponse::Json(pr_detail(2169, false, "new-head")),
+        );
+        responses.insert(
+            "/repos/owner/repo/pulls/2169/reviews?per_page=100&page=1".to_string(),
+            FakeGithubResponse::Json(json!([{
+                "user": {"id": 42, "login": "mai-reviewer"},
+                "state": "CHANGES_REQUESTED",
+                "submitted_at": "2026-05-16T08:00:00Z",
+                "commit_id": "old-head"
+            }])),
+        );
+        responses.insert(
+            "/repos/owner/repo/commits/new%2Dhead".to_string(),
+            FakeGithubResponse::Json(json!({
+                "commit": {"committer": {"date": "2026-05-16T07:00:00Z"}}
+            })),
+        );
+        responses.insert(
+            "/repos/owner/repo/commits/new%2Dhead/check-runs?per_page=100".to_string(),
+            FakeGithubResponse::Json(json!({
+                "check_runs": [{"status": "completed", "conclusion": "success"}]
+            })),
+        );
+        responses.insert(
+            "/repos/owner/repo/commits/new%2Dhead/status".to_string(),
+            FakeGithubResponse::Json(json!({"state": "success", "statuses": []})),
+        );
+        let ops = FakeSelectorOps::new(
+            responses,
+            ProjectReviewDiscoveryAdmissionResult {
+                queue: ProjectReviewQueueSummary {
+                    queued: vec![2169],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = run_project_review_selector(&ops, project_id, CancellationToken::new())
+            .await
+            .expect("run periodic discovery");
+
+        assert_eq!(
+            ProjectReviewDiscoveryCounts {
+                scanned: 1,
+                eligible: 1,
+                queued: 1,
+                ..Default::default()
+            },
+            result.counts
+        );
+        assert_eq!(Vec::<String>::new(), result.errors);
+        assert_eq!(
+            vec![SelectedProjectReviewPr {
+                pr: 2169,
+                head_sha: Some("new-head".to_string()),
+            }],
+            ops.admissions.lock().await[0].eligible
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,9 @@ describe("pull request review pagination", () => {
         queued: 1,
         deduped: 2,
         watched: 4,
+        closed: 1,
+        draft: 7,
+        already_reviewed: 6,
         suppressed: 1,
         errors: 1,
         last_error: "PR #19: GitHub unavailable",
@@ -44,6 +47,7 @@ describe("pull request review pagination", () => {
     expect(await screen.findByText("Partial")).toBeVisible()
     expect(screen.getByLabelText("PR discovery status")).toHaveTextContent("24")
     expect(screen.getByLabelText("PR discovery status")).toHaveTextContent("CI watched4")
+    expect(screen.getByLabelText("PR discovery status")).toHaveTextContent("Already reviewed6")
     expect(screen.getByText("PR #19: GitHub unavailable")).toBeVisible()
   })
 

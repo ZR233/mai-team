@@ -43,6 +43,9 @@ export function ReviewDiscoveryCard({ snapshot, loading, error, onRetry }: Revie
           <DiscoveryMetric label="Queued" value={snapshot.queued} />
           <DiscoveryMetric label="Deduped" value={snapshot.deduped} />
           <DiscoveryMetric label="CI watched" value={snapshot.watched} />
+          <DiscoveryMetric label="Closed" value={snapshot.closed} />
+          <DiscoveryMetric label="Draft" value={snapshot.draft} />
+          <DiscoveryMetric label="Already reviewed" value={snapshot.already_reviewed} />
           <DiscoveryMetric label="Suppressed" value={snapshot.suppressed} />
         </dl>
         {snapshot.errors > 0 && <p className="text-xs text-muted-foreground">{snapshot.errors} candidate {snapshot.errors === 1 ? "error" : "errors"}; other candidates were still processed.</p>}

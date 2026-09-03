@@ -199,6 +199,9 @@ export interface ProjectReviewDiscoverySnapshot {
   queued: number
   deduped: number
   watched: number
+  closed: number
+  draft: number
+  already_reviewed: number
   suppressed: number
   errors: number
   last_error?: string | null

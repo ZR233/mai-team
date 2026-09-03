@@ -106,17 +106,15 @@ fn already_reviewed_current_head(reviewer_user_id: u64, candidate: &PullRequestC
     let Some(reviewed_at) = latest_review.submitted_at else {
         return false;
     };
-    if let Some(latest_commit_at) = candidate.latest_commit_at {
-        return latest_commit_at <= reviewed_at;
-    }
     if let (Some(review_commit), Some(head_sha)) = (
         latest_review.commit_id.as_deref(),
         candidate.head_sha.as_deref(),
-    ) && review_commit == head_sha
-    {
-        return true;
+    ) {
+        return review_commit == head_sha;
     }
-    false
+    candidate
+        .latest_commit_at
+        .is_some_and(|latest_commit_at| latest_commit_at <= reviewed_at)
 }
 
 fn latest_reviewer_review(
@@ -290,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_rereview_when_matching_review_commit_is_older_than_latest_commit_time() {
+    fn suppresses_rereview_when_review_commit_matches_current_head() {
         let review_time = Utc::now() - TimeDelta::hours(1);
         let mut candidate = candidate(15);
         candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
@@ -303,20 +301,15 @@ mod tests {
 
         let selected = select_review_prs(42, vec![candidate]);
 
-        assert_eq!(
-            vec![ReviewSelection {
-                pr: 15,
-                head_sha: Some("head-15".to_string()),
-            }],
-            selected
-        );
+        assert_eq!(Vec::<ReviewSelection>::new(), selected);
     }
 
     #[test]
-    fn suppresses_pr_when_head_commit_is_not_newer_than_latest_review() {
-        let review_time = Utc::now();
+    fn allows_rereview_when_review_commit_differs_even_if_commit_time_is_older() {
+        let review_time = "2026-05-16T08:00:00Z".parse().expect("valid review time");
         let mut reviewed = candidate(12);
-        reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
+        reviewed.latest_commit_at =
+            Some("2026-05-16T07:00:00Z".parse().expect("valid commit time"));
         reviewed.reviews = vec![PullRequestReview {
             author_user_id: Some(42),
             state: Some("APPROVED".to_string()),
@@ -328,10 +321,16 @@ mod tests {
         let selected = select_review_prs(42, vec![reviewed, next]);
 
         assert_eq!(
-            vec![ReviewSelection {
-                pr: 13,
-                head_sha: Some("head-13".to_string()),
-            }],
+            vec![
+                ReviewSelection {
+                    pr: 12,
+                    head_sha: Some("head-12".to_string()),
+                },
+                ReviewSelection {
+                    pr: 13,
+                    head_sha: Some("head-13".to_string()),
+                },
+            ],
             selected
         );
     }
@@ -356,6 +355,30 @@ mod tests {
                 head_sha: Some("head-8".to_string()),
             }],
             selected
+        );
+    }
+
+    #[test]
+    fn falls_back_to_commit_time_when_review_commit_is_missing() {
+        let review_time = Utc::now();
+        let mut reviewed = candidate(19);
+        reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
+        reviewed.reviews = vec![PullRequestReview {
+            author_user_id: Some(42),
+            state: Some("APPROVED".to_string()),
+            submitted_at: Some(review_time),
+            commit_id: None,
+        }];
+        let mut changed = candidate(20);
+        changed.latest_commit_at = Some(review_time + TimeDelta::minutes(1));
+        changed.reviews = reviewed.reviews.clone();
+
+        assert_eq!(
+            vec![ReviewSelection {
+                pr: 20,
+                head_sha: Some("head-20".to_string()),
+            }],
+            select_review_prs(42, vec![reviewed, changed])
         );
     }
 

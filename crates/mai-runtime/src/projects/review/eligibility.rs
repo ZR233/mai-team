@@ -582,8 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_pr_eligibility_allows_rereview_when_matching_review_commit_is_older_than_head()
-    {
+    async fn single_pr_eligibility_allows_rereview_when_review_commit_differs_from_head() {
         let project_id = Uuid::new_v4();
         let ops = FakeEligibilityOps::new(vec![
             (
@@ -595,8 +594,8 @@ mod tests {
                 json!([
                     {
                         "user": { "id": 42, "login": "mai-bot-renamed" },
-                        "submitted_at": "2026-05-16T07:25:36Z",
-                        "commit_id": "head-616"
+                        "submitted_at": "2026-05-16T08:25:36Z",
+                        "commit_id": "old-head"
                     }
                 ]),
             ),

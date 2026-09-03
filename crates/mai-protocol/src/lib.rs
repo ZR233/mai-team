@@ -206,6 +206,12 @@ pub struct ProjectReviewDiscoveryCounts {
     pub queued: u64,
     pub deduped: u64,
     pub watched: u64,
+    #[serde(default)]
+    pub closed: u64,
+    #[serde(default)]
+    pub draft: u64,
+    #[serde(default)]
+    pub already_reviewed: u64,
     pub suppressed: u64,
     pub errors: u64,
 }
@@ -2189,6 +2195,9 @@ mod tests {
                     queued: 1,
                     deduped: 1,
                     watched: 2,
+                    closed: 1,
+                    draft: 2,
+                    already_reviewed: 3,
                     suppressed: 1,
                     errors: 1,
                 },
@@ -2200,6 +2209,9 @@ mod tests {
             assert_eq!(expected, value["state"]);
             assert_eq!(9, value["scanned"]);
             assert_eq!(2, value["watched"]);
+            assert_eq!(1, value["closed"]);
+            assert_eq!(2, value["draft"]);
+            assert_eq!(3, value["already_reviewed"]);
             assert!(value.get("counts").is_none());
         }
     }
