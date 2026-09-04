@@ -40,8 +40,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         mut resource: runtime_agent_creation::PreparedAgentResource,
     ) -> Result<AgentSummary> {
-        resource.include_canonical_runtime();
-        match self.register_framework_agent(resource.id()).await {
+        match self.register_prepared_framework_agent(&mut resource).await {
             Ok(()) => {
                 let summary = resource.commit();
                 self.events

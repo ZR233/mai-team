@@ -1,6 +1,17 @@
 use super::*;
 
 impl AgentRuntime {
+    /// 等待 PL Thread repository 进入不可继续的 fail-stop 状态。
+    ///
+    /// 调用方应终止当前 Runtime 并从 durable 状态重新启动，不能在同一进程内
+    /// 丢弃待写提交后继续运行。
+    pub async fn wait_for_fatal_error(&self) -> RuntimeError {
+        match self.agent_framework.get() {
+            Some(framework) => framework.host().wait_for_repository_failure().await,
+            None => RuntimeError::InvalidInput("agent framework is not started".to_string()),
+        }
+    }
+
     /// 先停止 PR discovery，再停止全部 PL actor并排空唯一 Thread 持久化写入器。
     pub async fn shutdown(&self) -> Result<()> {
         self.review_discovery_scheduler.shutdown().await?;
@@ -217,11 +228,16 @@ impl AgentRuntime {
             .ok_or_else(|| RuntimeError::InvalidInput("agent framework is not started".to_string()))
     }
 
-    pub(super) async fn register_framework_agent(&self, product_agent_id: AgentId) -> Result<()> {
+    pub(super) async fn register_prepared_framework_agent(
+        &self,
+        resource: &mut runtime_agent_creation::PreparedAgentResource,
+    ) -> Result<()> {
+        let product_agent_id = resource.id();
         let agent = self.agent(product_agent_id).await?;
         if let Some(parent_id) = agent.summary.read().await.parent_id {
             self.ensure_framework_agent(parent_id).await?;
         }
+        resource.include_canonical_runtime();
         self.register_resident_framework_agent(product_agent_id)
             .await
             .map(|_| ())
@@ -350,7 +366,7 @@ impl AgentRuntime {
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         framework
             .host()
-            .await_durable(&thread_id, snapshot.revision)
+            .await_durable(&snapshot.identity.id, snapshot.revision)
             .await?;
         Ok(snapshot)
     }

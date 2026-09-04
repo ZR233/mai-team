@@ -121,6 +121,13 @@ server 启动时：
 - Run 归档失败属于持久化边界失败，worker 保留 Job 的 `active_run_id` 与租约，等待过期恢复先归档 Run，再转换 Job；不得把它当成普通 Review 失败提前清空 Run 所有权。
 - 对旧版本已经留下的“Job 无 `active_run_id`、Run 仍未结束”状态，仅在 Job 没有其他 active Run 且租约已失效时归档为 `Interrupted`；恢复不删除 attempt 记录，也不覆盖仍有效的执行者。
 - 尚未过期的租约继续等待，支持滚动部署时的跨实例排他。
+- Thread repository 发生不可恢复的 revision conflict 时，server 以 fail-stop 方式退出并由生产
+  supervisor 自动重启；启动 singleton repair 根据非终态 Job 的 durable `reviewer_agent_id`
+  恢复唯一合法 owner，并删除没有任何非终态 Job ownership 的孤儿 Reviewer。不能让一个仍显示
+  `Ready`、但其 Thread 从未耐久化的残留 Agent 永久占据项目单 Reviewer 槽位。
+- worker 每次领取 Job 前也执行相同的 singleton repair，清理运行期间因取消、超时或旧版本缺陷
+  留下的无主 Reviewer；修复失败时不领取新 Job，等待下一轮重试，避免反复制造
+  `reviewer_slot_busy`。
 
 ## Reviewer 与 Thread 生命周期
 

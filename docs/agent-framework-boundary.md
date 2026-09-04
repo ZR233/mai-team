@@ -70,12 +70,20 @@ SQLite CAS transaction。ThreadActor 先提交内存权威状态并发布规范�
   event、trace 与 submission。canonical commit 不经过 Toasty 延迟事务，也不能在写锁内逐条
   `await`，从而避免读后升级争用和大批流式事实占锁数分钟；
 - SQLite 临时 busy/locked 保留队首提交并自动重试；revision conflict、数据不变量或非瞬时 I/O
-  失败固定为 writer 故障并传播给所有 barrier；
+  失败固定为 writer 故障并传播给所有 barrier。该故障表示进程内权威状态已无法安全追平 durable
+  状态，server 必须停止接收请求、受控结束 Runtime 并以非零状态退出；生产 supervisor 随后从
+  durable 状态重启。禁止在同一进程内清空故障或丢弃队首提交后继续运行；
 - 关机先停止接收，再排空全部已接受提交；
 - 从 durable Thread 恢复时以其 revision 初始化 barrier 水位。
 
 任何不可逆副作用前都必须越过对应 Thread revision 的 durability barrier。当前 GitHub 非 GET
 请求在产品 Typed Tool 内执行该约束，不能在未持久化 intent 或 Turn 事实时调用外部写接口。
+
+新 Agent 的父 Agent 恢复完成后，创建租约才把 rollback ownership 从产品资源升级为 canonical
+runtime，再调用 PL `handle.register`。注册一旦开始就可能已经发布内存 actor，因此后续任何错误都
+必须按 canonical 生命周期关闭，不能绕过 actor 直接删除产品记录。若错误来自 writer fail-stop，
+当前进程不得强删；server 退出重启后，启动修复根据 durable ownership 删除从未归属非终态任务的
+孤儿资源。
 
 ## 工具所有权
 

@@ -11,13 +11,11 @@ use super::worker::ProjectReviewWorkerOps;
 use crate::Result;
 
 const STARTUP_INTERRUPTED_ERROR: &str = "review interrupted by server restart";
-#[cfg(test)]
 const SELF_REPAIR_INTERRUPTED_ERROR: &str = "review interrupted by project reviewer self repair";
 
 #[derive(Clone, Copy)]
 pub(crate) enum ProjectReviewRepairReason {
     Startup,
-    #[cfg(test)]
     Runtime,
 }
 
@@ -25,7 +23,6 @@ impl ProjectReviewRepairReason {
     fn label(self) -> &'static str {
         match self {
             ProjectReviewRepairReason::Startup => "startup",
-            #[cfg(test)]
             ProjectReviewRepairReason::Runtime => "runtime",
         }
     }
@@ -33,7 +30,6 @@ impl ProjectReviewRepairReason {
     fn interrupted_error(self) -> &'static str {
         match self {
             ProjectReviewRepairReason::Startup => STARTUP_INTERRUPTED_ERROR,
-            #[cfg(test)]
             ProjectReviewRepairReason::Runtime => SELF_REPAIR_INTERRUPTED_ERROR,
         }
     }
@@ -41,7 +37,6 @@ impl ProjectReviewRepairReason {
     fn preserves_active_run(self) -> bool {
         match self {
             ProjectReviewRepairReason::Startup => false,
-            #[cfg(test)]
             ProjectReviewRepairReason::Runtime => true,
         }
     }

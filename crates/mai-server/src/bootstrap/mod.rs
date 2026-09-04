@@ -1,18 +1,28 @@
 use std::env;
 use std::fs;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mai_docker::DockerClient;
-use mai_runtime::RuntimeConfig;
+use mai_runtime::{RuntimeConfig, RuntimeError};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
 use crate::handlers::state::AppState;
 use crate::http::router;
 use crate::services::relay_manager::{DynamicGithubAppBackend, RelayManager};
+
+const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Eq, PartialEq)]
+enum ServerShutdownCause {
+    Signal,
+    FatalRuntime(String),
+}
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
@@ -123,21 +133,87 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 
     println!("Open http://{addr}/");
     info!("mai-team listening on http://{addr}");
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(cancel_on_shutdown(shutdown))
-        .await;
-    info!("HTTP connections drained");
-    relay.shutdown().await;
-    shutdown_runtime.shutdown().await?;
-    info!("runtime shutdown drained");
-    serve_result?;
-    Ok(())
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    tokio::pin!(server);
+    let shutdown_request =
+        select_shutdown_cause(shutdown_signal(), shutdown_runtime.wait_for_fatal_error());
+    tokio::pin!(shutdown_request);
+    let cause = tokio::select! {
+        cause = &mut shutdown_request => cause,
+        result = &mut server => {
+            shutdown.cancel();
+            let cleanup_result = complete_shutdown_with_timeout(async {
+                relay.shutdown().await;
+                shutdown_runtime.shutdown().await?;
+                Ok(())
+            }, SERVER_SHUTDOWN_TIMEOUT)
+            .await;
+            cleanup_result?;
+            result.context("HTTP server stopped unexpectedly")?;
+            anyhow::bail!("HTTP server stopped without a shutdown request");
+        }
+    };
+    match &cause {
+        ServerShutdownCause::Signal => info!("server shutdown signal received"),
+        ServerShutdownCause::FatalRuntime(failure) => {
+            error!("fatal agent runtime failure detected; restarting server: {failure}")
+        }
+    }
+    shutdown.cancel();
+    let shutdown_result = complete_shutdown_with_timeout(
+        async {
+            (&mut server)
+                .await
+                .context("HTTP server failed while draining")?;
+            info!("HTTP connections drained");
+            relay.shutdown().await;
+            shutdown_runtime.shutdown().await?;
+            info!("runtime shutdown drained");
+            Ok(())
+        },
+        SERVER_SHUTDOWN_TIMEOUT,
+    )
+    .await;
+    finish_server_shutdown(cause, shutdown_result)
 }
 
-async fn cancel_on_shutdown(shutdown: CancellationToken) {
-    shutdown_signal().await;
-    info!("server shutdown signal received");
-    shutdown.cancel();
+async fn select_shutdown_cause(
+    signal: impl Future<Output = ()>,
+    runtime_failure: impl Future<Output = RuntimeError>,
+) -> ServerShutdownCause {
+    tokio::select! {
+        biased;
+        failure = runtime_failure => ServerShutdownCause::FatalRuntime(failure.to_string()),
+        _ = signal => ServerShutdownCause::Signal,
+    }
+}
+
+async fn complete_shutdown_with_timeout(
+    shutdown: impl Future<Output = Result<()>>,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, shutdown)
+        .await
+        .with_context(|| {
+            format!(
+                "server shutdown timed out after {} seconds",
+                timeout.as_secs()
+            )
+        })?
+}
+
+fn finish_server_shutdown(cause: ServerShutdownCause, shutdown_result: Result<()>) -> Result<()> {
+    match cause {
+        ServerShutdownCause::Signal => shutdown_result,
+        ServerShutdownCause::FatalRuntime(failure) => {
+            if let Err(shutdown_error) = shutdown_result {
+                warn!("cleanup after fatal failure did not drain cleanly: {shutdown_error}");
+            }
+            anyhow::bail!("fatal agent runtime failure requires restart: {failure}");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -216,6 +292,36 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains(&format!("failed to bind MAI_BIND_ADDR {addr}")));
         assert!(message.contains("set MAI_BIND_ADDR"));
+    }
+
+    #[tokio::test]
+    async fn fatal_runtime_failure_requests_server_restart() {
+        let cause = select_shutdown_cause(std::future::pending(), async {
+            RuntimeError::InvalidInput("Thread writer is blocked".to_string())
+        })
+        .await;
+
+        assert_eq!(
+            ServerShutdownCause::FatalRuntime(
+                "invalid input: Thread writer is blocked".to_string()
+            ),
+            cause
+        );
+        let error = finish_server_shutdown(cause, Ok(()))
+            .expect_err("fatal runtime failure must return a process error");
+        assert!(error.to_string().contains("requires restart"));
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_timeout_bounds_stuck_http_drain() {
+        let result = complete_shutdown_with_timeout(
+            std::future::pending::<Result<()>>(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("stuck drain must be bounded");
+
+        assert!(result.to_string().contains("server shutdown timed out"));
     }
 
     #[tokio::test]

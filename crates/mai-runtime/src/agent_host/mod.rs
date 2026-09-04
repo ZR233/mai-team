@@ -70,6 +70,10 @@ impl MaiAgentHost {
     pub(crate) async fn shutdown_repository(&self) -> crate::Result<()> {
         self.repository.shutdown().await
     }
+
+    pub(crate) async fn wait_for_repository_failure(&self) -> crate::RuntimeError {
+        self.repository.wait_for_failure().await
+    }
 }
 
 impl AgentRuntimeHost for MaiAgentHost {

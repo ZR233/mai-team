@@ -17,7 +17,7 @@ use pl_core::{
 use pl_model::TokenUsage;
 use pl_protocol::{AgentSessionSnapshot, TurnBillingRecord};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::{Result, RuntimeError};
@@ -39,6 +39,10 @@ impl MaiAgentRepository {
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.writer.shutdown().await
+    }
+
+    pub(crate) async fn wait_for_failure(&self) -> RuntimeError {
+        self.writer.wait_for_failure().await
     }
 }
 
@@ -110,7 +114,7 @@ struct ThreadWriter {
     store: Arc<MaiStore>,
     queue: Mutex<VecDeque<QueuedCommit>>,
     durable: Mutex<HashMap<String, u64>>,
-    failure: Mutex<Option<String>>,
+    failure: watch::Sender<Option<String>>,
     task: Mutex<Option<JoinHandle<()>>>,
     work: Notify,
     progress: Notify,
@@ -124,7 +128,7 @@ impl ThreadWriter {
             store,
             queue: Mutex::new(VecDeque::new()),
             durable: Mutex::new(HashMap::new()),
-            failure: Mutex::new(None),
+            failure: watch::Sender::new(None),
             task: Mutex::new(None),
             work: Notify::new(),
             progress: Notify::new(),
@@ -320,10 +324,7 @@ impl ThreadWriter {
 
     fn requeue_failed(&self, commit: QueuedCommit, error: String) {
         self.requeue_retry(commit);
-        *self
-            .failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        self.failure.send_replace(Some(error));
         self.progress.notify_waiters();
     }
 
@@ -344,17 +345,29 @@ impl ThreadWriter {
     }
 
     fn check_failure(&self) -> Result<()> {
-        if let Some(error) = self
-            .failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+        if let Some(error) = self.failure_message() {
             return Err(RuntimeError::InvalidInput(format!(
                 "Thread writer is blocked: {error}"
             )));
         }
         Ok(())
+    }
+
+    async fn wait_for_failure(&self) -> RuntimeError {
+        let mut failure = self.failure.subscribe();
+        loop {
+            if let Some(error) = failure.borrow_and_update().clone() {
+                return RuntimeError::InvalidInput(format!("Thread writer is blocked: {error}"));
+            }
+            failure
+                .changed()
+                .await
+                .expect("Thread writer failure sender lives as long as its receiver");
+        }
+    }
+
+    fn failure_message(&self) -> Option<String> {
+        self.failure.borrow().clone()
     }
 }
 
@@ -638,6 +651,10 @@ mod tests {
             .await_durable(&thread_id, 1)
             .await
             .expect("revision 1 durable");
+        let failure_waiter = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { writer.wait_for_failure().await })
+        };
         writer
             .enqueue(commit("thread-a", None, 2, PersistenceClass::Standard))
             .await
@@ -648,6 +665,16 @@ mod tests {
             .await
             .expect_err("conflict must fail the barrier");
         assert!(error.to_string().contains("revision conflict"));
+        let signalled = tokio::time::timeout(Duration::from_secs(1), failure_waiter)
+            .await
+            .expect("fatal writer failure must wake its supervisor")
+            .expect("failure waiter task");
+        assert!(signalled.to_string().contains("revision conflict"));
+        let late_signalled =
+            tokio::time::timeout(Duration::from_secs(1), writer.wait_for_failure())
+                .await
+                .expect("late supervisor must observe the retained fatal failure");
+        assert!(late_signalled.to_string().contains("revision conflict"));
         assert_eq!(writer.pending.load(Ordering::Acquire), 1);
         assert_eq!(
             store

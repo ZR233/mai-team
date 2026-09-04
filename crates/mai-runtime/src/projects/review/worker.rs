@@ -543,6 +543,23 @@ async fn run_project_review_pool_worker(
                 continue;
             }
         }
+        if let Err(error) = repair_project_review_singleton(
+            &ops.ops,
+            ops.project_id,
+            50,
+            ProjectReviewRepairReason::Runtime,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = %ops.project_id,
+                "failed to reconcile project reviewer ownership before claiming a Job: {error}"
+            );
+            if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
+                break;
+            }
+            continue;
+        }
         let job = match ops
             .ops
             .claim_due_project_review_job(
@@ -850,6 +867,18 @@ mod tests {
             &self,
             request: FinishReviewRun,
         ) -> crate::Result<()> {
+            if let Some(run) = self
+                .review_runs
+                .lock()
+                .await
+                .iter_mut()
+                .find(|run| run.id == request.run_id)
+            {
+                run.finished_at = Some(now());
+                run.status = request.status.clone();
+                run.outcome = request.outcome.clone();
+                run.error = request.error.clone();
+            }
             self.finished_runs.lock().await.push(request);
             Ok(())
         }
@@ -1440,6 +1469,10 @@ mod tests {
 
         async fn delete_agent(&self, agent_id: Uuid) -> crate::Result<()> {
             self.deleted_agents.lock().await.push(agent_id);
+            self.auto_reviewers
+                .lock()
+                .await
+                .retain(|agent| agent.id != agent_id);
             Ok(())
         }
     }
@@ -2103,6 +2136,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_worker_repairs_reviewer_that_becomes_stale_after_startup() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let mut reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
+        let reviewer_id = reviewer.id;
+        reviewer.runtime = None;
+        ops.set_auto_reviewers(vec![reviewer]).await;
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: Some("delivery-42".to_string()),
+                reason: "runtime self repair".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.reviewed_prs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
     async fn runtime_repair_keeps_consistent_reviewer_and_deletes_extra_stale_reviewer() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
@@ -2243,6 +2318,27 @@ mod tests {
             .expect("startup repair");
 
         assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_purges_unowned_ready_reviewer_without_runtime() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let mut reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
+        let reviewer_id = reviewer.id;
+        reviewer.runtime = None;
+        ops.set_auto_reviewers(vec![reviewer]).await;
+
+        repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Startup)
+            .await
+            .expect("startup repair");
+
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        let project = ops.project.summary.read().await;
+        assert_eq!(None, project.current_reviewer_agent_id);
+        assert_eq!(ProjectReviewStatus::Idle, project.review_status);
     }
 
     #[tokio::test]
