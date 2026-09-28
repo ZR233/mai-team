@@ -8,7 +8,8 @@ use futures::Stream;
 use serde::Deserialize;
 
 use mai_protocol::{
-    AgentId, SendMessageRequest, SendMessageResponse, ThreadSnapshot, ThreadTurnPage,
+    AgentId, SendMessageRequest, SendMessageResponse, ThreadSnapshot, ThreadTurnHistory,
+    ThreadTurnPage,
 };
 
 use super::state::{ApiError, AppState};
@@ -44,6 +45,19 @@ pub(crate) async fn list_thread_turns(
             .runtime
             .thread_turns(thread_id, query.cursor.as_deref(), limit)
             .await?,
+    ))
+}
+
+pub(crate) async fn get_active_thread_turn(
+    State(state): State<Arc<AppState>>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<Option<ThreadTurnHistory>>, ApiError> {
+    let agent_id = AgentId::parse_str(&thread_id).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid product Thread id `{thread_id}`: {error}"),
+    })?;
+    Ok(Json(
+        state.runtime.active_thread_turn_history(agent_id).await?,
     ))
 }
 

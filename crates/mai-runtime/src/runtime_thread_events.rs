@@ -223,22 +223,14 @@ impl AgentRuntime {
         project_thread_snapshot(&summary, &state)
     }
 
-    /// 从 pl-core 的权威当前 Turn 与已提交 typed effect 组成运行中 Review 聊天。
-    /// 不为旧会话启动容器；调用方只在 reviewer 当前驻留时使用此视图。
-    pub(crate) async fn active_review_turn_history(
+    /// 从 pl-core 的权威当前 Turn 与已提交 typed effect 组成运行中聊天。
+    pub async fn active_thread_turn_history(
         self: &Arc<Self>,
         agent_id: AgentId,
-        input_id: &str,
     ) -> Result<Option<ThreadTurnHistory>> {
-        if self.resident_thread(agent_id).is_none() {
-            return Ok(None);
-        }
         let thread_id = agent_id.to_string();
         let snapshot = self.thread_snapshot(thread_id.clone()).await?;
-        let Some(turn) = snapshot
-            .active_turn
-            .filter(|turn| turn.input_id.as_deref() == Some(input_id))
-        else {
+        let Some(turn) = snapshot.active_turn else {
             return Ok(None);
         };
         self.await_agent_durable(agent_id, snapshot.revision)
@@ -278,6 +270,21 @@ impl AgentRuntime {
             turn,
             context_disposition: ThreadContextDisposition::Active,
         }))
+    }
+
+    /// Review Run 只展示归属本次 input 的活动 Turn；冷 reviewer 无需为读取 Run 启动容器。
+    pub(crate) async fn active_review_turn_history(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        input_id: &str,
+    ) -> Result<Option<ThreadTurnHistory>> {
+        if self.resident_thread(agent_id).is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .active_thread_turn_history(agent_id)
+            .await?
+            .filter(|history| history.turn.input_id.as_deref() == Some(input_id)))
     }
 
     /// 用 canonical Thread effect 分页读取一个 Thread 的 Turn history。

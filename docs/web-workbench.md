@@ -22,7 +22,8 @@ frame 合批，不能使整个工作台重渲染。
 Thread stream 首帧必须是 authoritative snapshot，随后只应用同一 `threadId` 的 notification。
 客户端用 generation 隔离旧连接，要求 Thread revision 严格连续，并按 Item revision 应用 delta。
 `Lagged`、revision gap、Item ownership 失败或协议不变量失败都会关闭当前连接并重新获取 snapshot；
-历史分页只走 `ThreadTurnPage`，不依赖 SSE replay。
+已结束 Turn 的历史分页走 `ThreadTurnPage`，运行中 Turn 的已提交条目走
+`/threads/{id}/active-turn`；两者都不依赖 SSE replay。
 
 ## 视觉系统
 

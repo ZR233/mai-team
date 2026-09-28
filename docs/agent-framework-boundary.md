@@ -175,7 +175,8 @@ PL command/state transition 产生。
 
 `GET /threads/{threadId}/events` 直接桥接 PL `ThreadSubscriptionUpdate`。首帧是 authoritative
 snapshot；channel lag、Thread revision gap、Item revision gap 或 ownership 失败使当前 generation
-失效，Web 重新订阅。历史分页只读取 `ThreadTurnPage`。
+失效，Web 重新订阅。终态历史分页读取 `ThreadTurnPage`；运行中 Turn 的已提交条目通过
+`/threads/{threadId}/active-turn` 读取同一 PL typed effect，不等待 Turn 结束。
 
 项目、任务、Review、provider、settings 和产品资源使用独立 `/events/product`。产品事件不得
 携带 Thread timeline，也不得触发旧 Agent runtime 字段的兼容解析。

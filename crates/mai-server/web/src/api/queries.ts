@@ -1,7 +1,7 @@
 import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
 
 import { api } from "@/api/client"
-import type { ThreadTurnPage } from "@/events/thread-events.generated"
+import type { ThreadTurnHistory, ThreadTurnPage } from "@/events/thread-events.generated"
 import type {
   AgentDetail,
   AgentSummary,
@@ -24,6 +24,7 @@ export const queryKeys = {
   agents: ["agents"] as const,
   agent: (id: string) => ["agents", id] as const,
   threadTurns: (threadId: string) => ["threads", threadId, "turns"] as const,
+  activeThreadTurn: (threadId: string, turnId: string) => ["threads", threadId, "active-turn", turnId] as const,
   environments: ["environments"] as const,
   environment: (id: string) => ["environments", id] as const,
   projects: ["projects"] as const,
@@ -80,6 +81,13 @@ export const threadTurnsQuery = (threadId: string) => infiniteQueryOptions({
   initialPageParam: undefined as string | undefined,
   getNextPageParam: (lastPage) => lastPage.nextCursor,
   enabled: Boolean(threadId),
+})
+
+export const activeThreadTurnQuery = (threadId: string, turnId: string | null) => queryOptions({
+  queryKey: queryKeys.activeThreadTurn(threadId, turnId || "none"),
+  queryFn: () => api<ThreadTurnHistory | null>(`/threads/${encodeURIComponent(threadId)}/active-turn`),
+  enabled: Boolean(threadId && turnId),
+  refetchInterval: 5_000,
 })
 
 export const environmentsQuery = () => queryOptions({

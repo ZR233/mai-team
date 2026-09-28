@@ -1,7 +1,7 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
-  const updates = { "thread-a": snapshotUpdate("thread-a"), "thread-b": snapshotUpdate("thread-b") }
+  const updates = { "thread-a": snapshotUpdate("thread-a"), "thread-b": snapshotUpdate("thread-b"), "thread-c": activeSnapshotUpdate("thread-c") }
   await installThreadStreamFixture(page, updates)
   await installApiFixture(page)
 })
@@ -71,6 +71,8 @@ test("Thread timeline 在全部视口可用", async ({ page }) => {
   await expect(page.getByRole("feed", { name: "Conversation timeline" })).toBeVisible()
   await expect(page.getByRole("article", { name: "Mai Team response" })).toContainText("Alpha message")
   await expect(page.locator("strong").filter({ hasText: "future-model" })).toBeVisible()
+  await expect(page.getByText("Tokens 1,380")).toBeVisible()
+  await expect(page.getByText("Context 1.2K / 128.0K")).toBeVisible()
 
   // 历史来自 `/threads/{id}/turns`：首帧不含 items，更早的 Turn 通过 cursor 分页加载。
   await page.getByRole("button", { name: "Load earlier history" }).click()
@@ -95,6 +97,12 @@ test("Thread timeline 在全部视口可用", async ({ page }) => {
   expect(consoleProblems).toEqual([])
 })
 
+test("运行中 Turn 显示已提交历史和活动状态", async ({ page }) => {
+  await page.goto("/chat/env-c")
+  await expect(page.getByRole("article", { name: "You message" })).toContainText("Review current pull request")
+  await expect(page.getByRole("feed", { name: "Conversation timeline" })).toContainText("Thinking")
+})
+
 async function installApiFixture(page: Page) {
   await page.route("**/*", async (route) => {
     const request = route.request()
@@ -103,6 +111,7 @@ async function installApiFixture(page: Page) {
     if (path === "/environments") return json(route, [environment("env-a", "Environment A", "thread-a"), environment("env-b", "Environment B", "thread-b")])
     if (path === "/environments/env-a") return json(route, environment("env-a", "Environment A", "thread-a"))
     if (path === "/environments/env-b") return json(route, environment("env-b", "Environment B", "thread-b"))
+    if (path === "/environments/env-c") return json(route, environment("env-c", "Environment C", "thread-c"))
     if (path === "/providers") return json(route, providerFixture())
     if (path === "/skills") return json(route, {
       skills: [{ name: "project-review", description: "Review project changes", path: "/skills/project-review/SKILL.md", scope: "project", enabled: true }],
@@ -111,6 +120,7 @@ async function installApiFixture(page: Page) {
     })
     const turns = path.match(/^\/threads\/([^/]+)\/turns$/)
     if (turns) return json(route, threadTurnPage(decodeURIComponent(turns[1]), new URL(request.url()).searchParams.get("cursor")))
+    if (path === "/threads/thread-c/active-turn") return json(route, activeTurnHistory())
     if (path.startsWith("/threads/") && path.endsWith("/messages") && request.method() === "POST") return json(route, { turn_id: "turn-next" })
     return route.continue()
   })
@@ -173,6 +183,26 @@ function snapshotUpdate(threadId: string) {
   }
 }
 
+function activeSnapshotUpdate(threadId: string) {
+  return {
+    type: "snapshot",
+    snapshot: {
+      ...threadSnapshot(threadId, threadId),
+      activeTurn: { id: `${threadId}:running`, threadId, revision: 1, state: { kind: "running", data: { startedAt: 1, phase: "thinking" } }, updatedAt: 1 },
+    },
+  }
+}
+
+function activeTurnHistory() {
+  const threadId = "thread-c"
+  const turnId = `${threadId}:running`
+  return {
+    turn: { id: turnId, threadId, revision: 1, state: { kind: "running", data: { startedAt: 1, phase: "thinking" } }, updatedAt: 1 },
+    contextDisposition: "active",
+    items: [{ id: `${threadId}:user`, threadId, turnId, ordinal: 1, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: "Review current pull request", lifecycle: { kind: "completed", data: { completedAt: 1 } } } } }],
+  }
+}
+
 const THREAD_TEXTS: Record<string, string> = { "thread-a": "Alpha message", "thread-b": "Beta message" }
 
 // `/threads/{id}/turns` 的一页：Turn 终态从新到旧返回，`nextCursor` 指向更早的一页。
@@ -210,7 +240,7 @@ function completedTurn(threadId: string, turnId: string, updatedAt: number) {
 }
 
 function usageSnapshot() {
-  return { hasIncompleteUsage: false, model: "future-model", latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
+  return { hasIncompleteUsage: false, model: "future-model", contextWindow: 128000, latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
 }
 
 function threadSnapshot(threadId: string, title: string) {

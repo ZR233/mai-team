@@ -166,6 +166,10 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::threads::list_thread_turns),
         )
         .route(
+            "/threads/{thread_id}/active-turn",
+            get(handlers::threads::get_active_thread_turn),
+        )
+        .route(
             "/threads/{thread_id}/messages",
             post(handlers::threads::send_message),
         )

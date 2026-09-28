@@ -344,6 +344,7 @@ impl TurnAccumulator {
     fn record_attempt(&mut self, attempt: &AttemptUpdate) {
         let request = RequestAttempt {
             request_metadata: attempt.request_metadata.clone(),
+            usage_binding: attempt.usage_binding.clone(),
             tool_projection: attempt.tool_projection.clone(),
             turn_id: attempt.turn_id.clone(),
             attempt_id: attempt.attempt_id.clone(),
@@ -828,6 +829,7 @@ mod tests {
     ) -> AttemptUpdate {
         AttemptUpdate {
             request_metadata: None,
+            usage_binding: None,
             tool_projection: None,
             turn_id: turn.to_owned(),
             attempt_id: attempt_id.to_owned(),
@@ -1234,6 +1236,7 @@ mod tests {
         let mut failing = start_effect(2, "turn-1");
         failing.attempt = Some(AttemptUpdate {
             request_metadata: None,
+            usage_binding: None,
             tool_projection: None,
             turn_id: "turn-1".to_owned(),
             attempt_id: "turn-1:0".to_owned(),
