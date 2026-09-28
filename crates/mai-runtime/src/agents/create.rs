@@ -104,6 +104,7 @@ pub(crate) async fn create_agent_record(
     ops.save_agent(&summary, system_prompt.as_deref()).await?;
     let agent = Arc::new(AgentRecord {
         summary: RwLock::new(summary.clone()),
+        registration_pending: std::sync::atomic::AtomicBool::new(true),
         container: RwLock::new(None),
         mcp: RwLock::new(None),
         review_context: RwLock::new(None),

@@ -432,6 +432,7 @@ mod tests {
                 updated_at: timestamp,
                 usage: RuntimeUsageSnapshot::default(),
             }),
+            registration_pending: std::sync::atomic::AtomicBool::new(false),
             container: RwLock::new(None),
             mcp: RwLock::new(None),
             review_context: RwLock::new(None),

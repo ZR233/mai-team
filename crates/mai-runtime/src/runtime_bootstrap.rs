@@ -1,6 +1,7 @@
 use super::*;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pl_core::context::ResourceAccess;
 use pl_core::persistence::SqliteSessionStore;
@@ -10,6 +11,12 @@ use pl_core::thread::{
 };
 
 use crate::thread_host::{self, ProductRoute, ThreadToolRequest};
+
+#[derive(Clone, Copy)]
+enum ThreadAssemblyMode {
+    ReuseResident,
+    RequireNew,
+}
 
 impl AgentRuntime {
     /// 等待 Runtime 进入不可继续的 fail-stop 状态。
@@ -85,6 +92,7 @@ impl AgentRuntime {
             let summary = persisted.summary;
             let agent = Arc::new(AgentRecord {
                 summary: RwLock::new(summary.clone()),
+                registration_pending: AtomicBool::new(false),
                 container: RwLock::new(None),
                 mcp: RwLock::new(None),
                 review_context: RwLock::new(None),
@@ -331,8 +339,15 @@ impl AgentRuntime {
         } else {
             thread_host::ThreadSeed::default()
         };
-        self.assemble_thread_spec(agent, thread_id, checkpoint, store, seed)
-            .await
+        self.assemble_thread_spec(
+            agent,
+            thread_id,
+            checkpoint,
+            store,
+            seed,
+            ThreadAssemblyMode::ReuseResident,
+        )
+        .await
     }
 
     /// 用调用方冻结的上下文继承装配一个全新的 child Thread。
@@ -366,8 +381,15 @@ impl AgentRuntime {
         })?;
         let mut seed = self.seed_for_agent(&agent).await;
         seed.context.extend(inherited);
-        self.assemble_thread_spec(agent, thread_id, None, store, seed)
-            .await
+        self.assemble_thread_spec(
+            agent,
+            thread_id,
+            None,
+            store,
+            seed,
+            ThreadAssemblyMode::RequireNew,
+        )
+        .await
     }
 
     /// 生成一个新 Thread 的静态初始指令。
@@ -394,6 +416,7 @@ impl AgentRuntime {
         checkpoint: Option<ThreadCheckpoint>,
         store: SqliteSessionStore,
         seed: thread_host::ThreadSeed,
+        mode: ThreadAssemblyMode,
     ) -> Result<thread_kernel::ResidentThread> {
         let summary = agent.summary.read().await.clone();
         let route = {
@@ -453,10 +476,11 @@ impl AgentRuntime {
                 },
             },
         };
-        self.thread_kernel
-            .assemble(spec)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+        let assembled = match mode {
+            ThreadAssemblyMode::ReuseResident => self.thread_kernel.assemble_or_get(spec).await,
+            ThreadAssemblyMode::RequireNew => self.thread_kernel.assemble(spec).await,
+        };
+        assembled.map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
 
     /// 返回一个已经完整发布的驻留 Thread；不触发装配。
@@ -482,9 +506,15 @@ impl AgentRuntime {
         if let Some(resident) = self.resident_thread(product_agent_id) {
             return Ok(resident);
         }
+        // 创建流程会先公开产品资源，再装配 Thread。读取方不能抢先用普通 seed
+        // 装配协作 child，也不能提前占用 Review reviewer 的 Thread 身份。
+        let agent = self.agent(product_agent_id).await?;
+        if agent.registration_pending.load(Ordering::Acquire) {
+            return Err(RuntimeError::ThreadNotFound(product_agent_id.to_string()));
+        }
         match self.assemble_thread(product_agent_id).await {
             Ok(resident) => Ok(resident),
-            // 并发装配同 id 时内核会拒绝第二个装配者；此时已发布 owner 才是权威结果。
+            // 关闭等其他状态改变后，允许使用并发路径刚发布的 owner。
             Err(error) => self.resident_thread(product_agent_id).ok_or(error),
         }
     }

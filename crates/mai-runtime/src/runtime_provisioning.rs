@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 use pl_protocol::AgentWorkspaceAssignmentSnapshot;
 
@@ -97,6 +98,9 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         match registered {
             Ok(_) => {
+                if let Ok(agent) = self.agent(resource.id()).await {
+                    agent.registration_pending.store(false, Ordering::Release);
+                }
                 let summary = resource.commit();
                 self.events
                     .publish(MaiProductEventKind::AgentCreated {

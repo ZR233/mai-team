@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
@@ -100,6 +100,8 @@ pub(crate) struct TaskRecord {
 
 pub(crate) struct AgentRecord {
     pub(crate) summary: RwLock<AgentSummary>,
+    /// 新建 Agent 的产品资源尚未移交给 canonical Thread owner。
+    pub(crate) registration_pending: AtomicBool,
     pub(crate) container: RwLock<Option<ContainerHandle>>,
     pub(crate) mcp: RwLock<Option<Arc<ContainerMcpRuntime>>>,
     pub(crate) review_context: RwLock<Option<Arc<ProjectReviewContext>>>,

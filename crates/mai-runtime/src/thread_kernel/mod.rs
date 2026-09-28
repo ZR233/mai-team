@@ -139,6 +139,11 @@ struct Reservation {
     id: String,
 }
 
+enum AssemblySlot {
+    Resident(ResidentThread),
+    Reserved(Reservation),
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.registry.state().creating.remove(&self.id);
@@ -167,6 +172,20 @@ impl ThreadKernel {
     pub async fn assemble(&self, spec: ThreadSpec) -> Result<ResidentThread, ThreadKernelError> {
         let reservation = self.reserve(&spec.id)?;
         self.assemble_reserved(spec, &reservation).await
+    }
+
+    /// 恢复普通产品 Thread 时，同一 id 的并发读取和注册共用已发布 owner。
+    ///
+    /// 协作 child 的首次装配必须使用 [`Self::assemble`]，因为它携带调用方冻结的
+    /// 继承 context，不能复用一个由普通恢复路径提前构造的 owner。
+    pub async fn assemble_or_get(
+        &self,
+        spec: ThreadSpec,
+    ) -> Result<ResidentThread, ThreadKernelError> {
+        match self.reserve_or_lookup(&spec.id).await? {
+            AssemblySlot::Resident(resident) => Ok(resident),
+            AssemblySlot::Reserved(reservation) => self.assemble_reserved(spec, &reservation).await,
+        }
     }
 
     /// 只返回已经完整发布且仍处于 Open 生命周期的驻留 Thread。
@@ -276,6 +295,42 @@ impl ThreadKernel {
             registry: self.0.clone(),
             id: id.to_owned(),
         })
+    }
+
+    async fn reserve_or_lookup(&self, id: &str) -> Result<AssemblySlot, ThreadKernelError> {
+        if id.is_empty() {
+            return Err(ThreadKernelError::Identity(id.to_owned()));
+        }
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.0.state();
+                if state.closing {
+                    return Err(ThreadKernelError::Closed);
+                }
+                if let Some(entry) = state.entries.get(id) {
+                    if entry.ready && entry.thread.snapshot().lifecycle == ThreadLifecycle::Open {
+                        return Ok(AssemblySlot::Resident(ResidentThread {
+                            handle: entry.thread.clone(),
+                            input_driver: entry.input_driver,
+                        }));
+                    }
+                    if !state.creating.contains(id) {
+                        return Err(ThreadKernelError::Identity(id.to_owned()));
+                    }
+                }
+                if !state.creating.contains(id) {
+                    state.creating.insert(id.to_owned());
+                    return Ok(AssemblySlot::Reserved(Reservation {
+                        registry: self.0.clone(),
+                        id: id.to_owned(),
+                    }));
+                }
+            }
+            changed.await;
+        }
     }
 
     async fn assemble_reserved(
@@ -420,5 +475,34 @@ impl ThreadKernel {
             handle: thread,
             input_driver,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_restore_waits_for_the_existing_assembly_slot() {
+        let kernel = ThreadKernel::default();
+        let first = kernel.reserve("agent-thread").unwrap();
+        let waiting_kernel = kernel.clone();
+        let mut waiting =
+            tokio::spawn(async move { waiting_kernel.reserve_or_lookup("agent-thread").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("concurrent restore must wake after the first assembly exits")
+            .expect("restore task must complete")
+            .expect("identity must become reservable after failed assembly");
+        assert!(matches!(result, AssemblySlot::Reserved(_)));
     }
 }
