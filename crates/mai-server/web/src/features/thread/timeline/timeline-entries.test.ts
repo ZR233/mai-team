@@ -49,6 +49,7 @@ describe("buildTimelineEntries PL v2 投影", () => {
       first,
       item({ kind: "skill", data: { activation: { name: "review", source: "system", providerId: "local", resourceBase: { kind: "directory", path: "/skills/review" }, turnId: "turn-1", cause: { kind: "tool", toolCallId: "call" }, activatedAt: 1 } } }),
       item({ kind: "thinking", data: { summary: ["  "], lifecycle: completed } }),
+      item({ kind: "raw", data: { payloads: [{ format: "legacy", version: 1, content: "{}" }], notice: "unsupported codec", recordedAt: 1 } }),
       item({ kind: "file", data: { path: "README.md", completedAt: 1 } }),
       toolCall(),
     ])

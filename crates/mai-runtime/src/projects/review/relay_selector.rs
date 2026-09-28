@@ -168,6 +168,8 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::TurnCancelled)
         | Err(RuntimeError::Docker(_))
         | Err(RuntimeError::Model(_))
+        | Err(RuntimeError::Thread(_))
+        | Err(RuntimeError::SessionStore(_))
         | Err(RuntimeError::Store(_))
         | Err(RuntimeError::InvalidInput(_))
         | Err(RuntimeError::Io(_))

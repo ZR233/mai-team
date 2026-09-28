@@ -1,18 +1,11 @@
-use std::pin::Pin;
-
-use pl_core::skill::{
-    ModeSkillMetadata, SkillCandidate, SkillDefinition, SkillInvocationPolicy, SkillProvider,
-    SkillProviderId, SkillProviderObservation, SkillProviderRequest, SkillResourceBase,
-    SkillSourceKind, SkillSummary,
-};
-use pl_protocol::{PureError, Result};
-use tokio_util::sync::CancellationToken;
+//! mai Review 会话固定的产品指令。
+//!
+//! Review Mode 不是可调用的 Skill：它由 mai 在装配 Review Thread 时注入，
+//! 因此这里只暴露稳定的标识与指令正文，不注册 SkillProvider。
 
 pub(crate) const REVIEW_MODE_ID: &str = "mode.review";
-const REVIEW_MODE_PROVIDER_ID: &str = "mai-review-mode";
-const REVIEW_MODE_LOCATOR: &str = "mai://mode.review";
 
-/// mai 产品 Review 会话唯一允许的 PL Mode 指令。
+/// mai 产品 Review 会话唯一允许的固定指令。
 pub(crate) const REVIEW_MODE_CONTENT: &str = r#"# Review 模式
 
 你正在执行一个由 mai Review Job 创建并固定目标版本的真实代码审查会话。
@@ -28,127 +21,14 @@ pub(crate) const REVIEW_MODE_CONTENT: &str = r#"# Review 模式
 - Review 的外部提交、回执和最终状态由 mai 产品流程负责，不要绕过该流程直接写入 GitHub。
 "#;
 
-/// 将 mai 固定 Review 行为注册为普通 PL Mode Skill Provider。
-#[derive(Debug)]
-pub(crate) struct MaiReviewModeProvider {
-    id: SkillProviderId,
-}
-
-impl MaiReviewModeProvider {
-    pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
-            id: SkillProviderId::new(REVIEW_MODE_PROVIDER_ID)?,
-        })
-    }
-
-    fn summary(&self) -> SkillSummary {
-        SkillSummary {
-            name: REVIEW_MODE_ID.to_string(),
-            description: "mai 真实 GitHub Review 会话的固定执行模式".to_string(),
-            category: None,
-            platforms: Vec::new(),
-            source: SkillSourceKind::System,
-            provider_id: self.id.clone(),
-            invocation: SkillInvocationPolicy {
-                model_invocable: false,
-                user_invocable: false,
-            },
-            resource_base: SkillResourceBase::Opaque {
-                description: "mai embedded review mode".to_string(),
-            },
-            mode: Some(ModeSkillMetadata {
-                display_name: "Review".to_string(),
-                order: 10,
-            }),
-        }
-    }
-
-    fn revision() -> String {
-        pl_core::canonical_content_hash(REVIEW_MODE_CONTENT.as_bytes())
-    }
-
-    fn validate_candidate(&self, candidate: &SkillCandidate) -> Result<()> {
-        if candidate.summary != self.summary()
-            || candidate.locator != REVIEW_MODE_LOCATOR
-            || candidate.revision != Self::revision()
-        {
-            return Err(PureError::ConfigError(
-                "frozen mai Review Mode candidate no longer matches its provider".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl SkillProvider for MaiReviewModeProvider {
-    fn id(&self) -> &SkillProviderId {
-        &self.id
-    }
-
-    fn list<'a>(
-        &'a self,
-        request: SkillProviderRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<SkillProviderObservation>> + Send + 'a>> {
-        Box::pin(async move {
-            ensure_active(&request.cancellation)?;
-            Ok(SkillProviderObservation {
-                candidates: vec![SkillCandidate {
-                    summary: self.summary(),
-                    locator: REVIEW_MODE_LOCATOR.to_string(),
-                    revision: Self::revision(),
-                    rank: 0,
-                    local_order: 0,
-                }],
-                complete: true,
-                warnings: Vec::new(),
-            })
-        })
-    }
-
-    fn load<'a>(
-        &'a self,
-        candidate: &'a SkillCandidate,
-        cancellation: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = Result<SkillDefinition>> + Send + 'a>> {
-        Box::pin(async move {
-            ensure_active(&cancellation)?;
-            self.validate_candidate(candidate)?;
-            Ok(SkillDefinition {
-                summary: self.summary(),
-                revision: Self::revision(),
-                content: REVIEW_MODE_CONTENT.to_string(),
-            })
-        })
-    }
-
-    fn read_resource<'a>(
-        &'a self,
-        candidate: &'a SkillCandidate,
-        _relative_path: &'a str,
-        cancellation: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(async move {
-            ensure_active(&cancellation)?;
-            self.validate_candidate(candidate)?;
-            Err(PureError::ConfigError(
-                "mai Review Mode does not expose support resources".to_string(),
-            ))
-        })
-    }
-}
-
-fn ensure_active(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        return Err(PureError::ConfigError(
-            "mai Review Mode operation was cancelled".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::REVIEW_MODE_CONTENT;
+    use super::{REVIEW_MODE_CONTENT, REVIEW_MODE_ID};
+
+    #[test]
+    fn review_mode_id_is_stable() {
+        assert_eq!(REVIEW_MODE_ID, "mode.review");
+    }
 
     #[test]
     fn review_mode_requires_explicit_project_skill_activation() {

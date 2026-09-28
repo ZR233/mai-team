@@ -1,14 +1,18 @@
 use super::*;
 use crate::schema::SETTING_SCHEMA_VERSION;
 use mai_protocol::{
-    McpServerScope, McpServerTransport, ProjectCloneStatus, ProjectReviewDecision,
-    ProjectReviewEnvironmentWarning, ProjectReviewFailure, ProjectReviewFailureCategory,
-    ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus,
-    ProjectReviewStatus, ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt,
-    ProjectStatus, ThreadContextDisposition, ThreadItem, ThreadItemState, ThreadTextChannel,
-    ThreadTurnHistory, Turn, TurnState,
+    AgentResourceSnapshot, AgentResourceState, AgentRole, McpServerScope, McpServerTransport,
+    ProjectCloneStatus, ProjectReviewDecision, ProjectReviewEnvironmentWarning,
+    ProjectReviewFailure, ProjectReviewFailureCategory, ProjectReviewJobSource,
+    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ProjectStatus,
+    ThreadContextDisposition, ThreadItem, ThreadItemState, ThreadTextChannel, ThreadTurnHistory,
+    Turn, TurnState,
 };
-use pl_protocol::{CompletedTurnState, ThreadContentLifecycle, ThreadTextItem, TurnCompletion};
+use pl_protocol::{
+    AgentWorkspaceAssignmentSnapshot, AgentWorkspaceMode, CompletedTurnState,
+    ThreadContentLifecycle, ThreadTextItem, TurnCompletion,
+};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -60,10 +64,62 @@ fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> 
     }
 }
 
+fn test_agent_summary(
+    id: AgentId,
+    review_run_id: Option<Uuid>,
+    timestamp: DateTime<Utc>,
+) -> AgentSummary {
+    AgentSummary {
+        id,
+        parent_id: None,
+        task_id: None,
+        project_id: None,
+        role: review_run_id.map(|_| AgentRole::Reviewer),
+        profile_id: None,
+        workspace: None,
+        review_run_id,
+        name: format!("agent-{id}"),
+        resource: AgentResourceSnapshot {
+            state: AgentResourceState::Ready,
+            error: None,
+        },
+        runtime: None,
+        last_turn: None,
+        container_id: None,
+        docker_image: "ubuntu:latest".to_string(),
+        provider_id: "provider".to_string(),
+        provider_name: "Provider".to_string(),
+        model: "model".to_string(),
+        reasoning_effort: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+        usage: RuntimeUsageSnapshot::default(),
+    }
+}
+
+fn test_workspace_assignment() -> AgentWorkspaceAssignmentSnapshot {
+    AgentWorkspaceAssignmentSnapshot {
+        mode: AgentWorkspaceMode::Directory,
+        project_root: "/workspace".to_string(),
+        root: "/workspace".to_string(),
+        writable_paths: Some(vec!["src".to_string()]),
+        worktree: None,
+    }
+}
+
+fn persisted_agent(snapshot: &RuntimeSnapshot, id: AgentId) -> &PersistedAgent {
+    snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.summary.id == id)
+        .expect("persisted agent")
+}
+
 fn completed_turn(id: String, thread_id: String, started_at: i64, completed_at: i64) -> Turn {
     Turn {
         id,
         thread_id,
+        input_id: None,
         revision: 1,
         state: TurnState::Completed(CompletedTurnState::new(
             Some(started_at),
@@ -112,6 +168,176 @@ async fn open_in_data_dir_uses_standard_layout() {
     assert_eq!(
         store.artifact_index_dir(),
         data_dir.join("artifacts").join("index")
+    );
+}
+
+#[tokio::test]
+async fn agent_review_run_id_round_trips_and_plain_agents_stay_none() {
+    let (_dir, store) = store().await;
+    let timestamp = Utc::now();
+    let review_run_id = Uuid::new_v4();
+    let review_agent_id = Uuid::new_v4();
+    let plain_agent_id = Uuid::new_v4();
+
+    store
+        .save_agent(
+            &test_agent_summary(review_agent_id, Some(review_run_id), timestamp),
+            None,
+        )
+        .await
+        .expect("save review thread agent");
+    store
+        .save_agent(
+            &test_agent_summary(plain_agent_id, None, timestamp),
+            Some("prompt"),
+        )
+        .await
+        .expect("save plain agent");
+
+    let snapshot = store.load_runtime_snapshot(0).await.expect("snapshot");
+    assert_eq!(
+        persisted_agent(&snapshot, review_agent_id)
+            .summary
+            .review_run_id,
+        Some(review_run_id)
+    );
+    let plain = persisted_agent(&snapshot, plain_agent_id);
+    assert_eq!(plain.summary.review_run_id, None);
+    assert_eq!(plain.system_prompt.as_deref(), Some("prompt"));
+}
+
+#[tokio::test]
+async fn agent_review_run_id_loading_rejects_invalid_persisted_value() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
+        .await
+        .expect("save agent");
+
+    let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
+    connection
+        .execute(
+            "UPDATE agents SET review_run_id = 'not-a-uuid' WHERE id = ?1",
+            rusqlite::params![agent_id.to_string()],
+        )
+        .expect("store invalid review run id");
+
+    assert!(
+        store.load_runtime_snapshot(0).await.is_err(),
+        "loading must reject an invalid persisted review run id instead of falling back to a plain agent"
+    );
+}
+
+#[tokio::test]
+async fn agent_profile_and_workspace_round_trip_and_plain_agents_stay_none() {
+    let (_dir, store) = store().await;
+    let timestamp = Utc::now();
+    let assigned_agent_id = Uuid::new_v4();
+    let plain_agent_id = Uuid::new_v4();
+    let workspace = test_workspace_assignment();
+    let mut assigned_agent = test_agent_summary(assigned_agent_id, None, timestamp);
+    assigned_agent.profile_id = Some("executor".to_string());
+    assigned_agent.workspace = Some(workspace.clone());
+
+    store
+        .save_agent(&assigned_agent, None)
+        .await
+        .expect("save assigned agent");
+    store
+        .save_agent(&test_agent_summary(plain_agent_id, None, timestamp), None)
+        .await
+        .expect("save plain agent");
+
+    let snapshot = store.load_runtime_snapshot(0).await.expect("snapshot");
+    let assigned = &persisted_agent(&snapshot, assigned_agent_id).summary;
+    assert_eq!(assigned.profile_id.as_deref(), Some("executor"));
+    assert_eq!(assigned.workspace.as_ref(), Some(&workspace));
+
+    let plain = &persisted_agent(&snapshot, plain_agent_id).summary;
+    assert_eq!(plain.profile_id, None);
+    assert_eq!(plain.workspace, None);
+}
+
+#[tokio::test]
+async fn deleted_agents_schedule_session_retirement_and_recreation_cancels_it() {
+    let (_dir, store) = store().await;
+    let deleted = Uuid::new_v4();
+    let active = Uuid::new_v4();
+    let now = Utc::now();
+    for id in [deleted, active] {
+        store
+            .save_agent(&test_agent_summary(id, None, now), None)
+            .await
+            .expect("save agent");
+    }
+    store.delete_agent(deleted).await.expect("delete agent");
+    assert_eq!(
+        store
+            .expired_agent_sessions(now + chrono::TimeDelta::days(1), 100)
+            .await
+            .expect("expired sessions"),
+        vec![deleted]
+    );
+    assert_eq!(
+        store
+            .expired_agent_sessions(now - chrono::TimeDelta::days(1), 100)
+            .await
+            .expect("not yet expired"),
+        Vec::<AgentId>::new()
+    );
+    store
+        .save_agent(&test_agent_summary(deleted, None, now), None)
+        .await
+        .expect("recreate agent");
+    assert_eq!(
+        store
+            .expired_agent_sessions(now + chrono::TimeDelta::days(1), 100)
+            .await
+            .expect("retirement cancelled"),
+        Vec::<AgentId>::new()
+    );
+    store.delete_agent(deleted).await.expect("delete again");
+    store
+        .complete_agent_session_retirement(deleted)
+        .await
+        .expect("complete retirement");
+    assert_eq!(
+        store
+            .expired_agent_sessions(now + chrono::TimeDelta::days(1), 100)
+            .await
+            .expect("retirement complete"),
+        Vec::<AgentId>::new()
+    );
+}
+
+#[tokio::test]
+async fn agent_workspace_loading_rejects_invalid_persisted_json() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
+        .await
+        .expect("save agent");
+
+    let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
+    connection
+        .execute(
+            "UPDATE agents SET workspace_json = ?1 WHERE id = ?2",
+            rusqlite::params![
+                r#"{"mode":"directory","projectRoot":"/workspace"}"#,
+                agent_id.to_string()
+            ],
+        )
+        .expect("store invalid workspace JSON");
+
+    let error = store
+        .load_runtime_snapshot(0)
+        .await
+        .expect_err("loading must reject malformed persisted workspace JSON");
+    assert!(
+        matches!(error, StoreError::Json(_)),
+        "expected strict JSON error, got {error:?}"
     );
 }
 
@@ -594,13 +820,14 @@ async fn project_review_runs_round_trip_and_prune() {
                 summary: Some("approved".to_string()),
                 error: None,
                 failure: None,
-                token_usage: TokenUsage {
+                usage: RuntimeUsageSnapshot {
                     prompt_tokens: 100,
                     cached_prompt_tokens: 60,
                     cache_write_tokens: 0,
                     completion_tokens: 20,
                     reasoning_tokens: 5,
                     total_tokens: 120,
+                    ..Default::default()
                 },
                 history_status: Default::default(),
                 history_archive_id: None,
@@ -635,14 +862,15 @@ async fn project_review_runs_round_trip_and_prune() {
     assert_eq!(runs[0].outcome, Some(ProjectReviewOutcome::ReviewSubmitted));
     assert_eq!(runs[0].review_event, Some(ProjectReviewDecision::Approve));
     assert_eq!(
-        runs[0].token_usage,
-        TokenUsage {
+        runs[0].usage,
+        RuntimeUsageSnapshot {
             prompt_tokens: 100,
             cached_prompt_tokens: 60,
             cache_write_tokens: 0,
             completion_tokens: 20,
             reasoning_tokens: 5,
             total_tokens: 120,
+            ..Default::default()
         }
     );
     let detail = store
@@ -730,7 +958,7 @@ async fn review_run_retention_removes_reference_to_missing_job() {
                 summary: None,
                 error: Some("missing job".to_string()),
                 failure: None,
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history_status: Default::default(),
                 history_archive_id: None,
                 history_archived_at: None,
@@ -829,60 +1057,6 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .expect("remaining logs");
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].category, "tool");
-}
-
-#[tokio::test]
-async fn agent_log_retention_preserves_rows_owned_by_a_live_thread() {
-    let (_dir, store) = store().await;
-    let agent_id = Uuid::new_v4();
-    let thread_id = Uuid::new_v4().to_string();
-    let timestamp = Utc::now() - chrono::TimeDelta::days(30);
-    let connection = rusqlite::Connection::open(&store.path).expect("open sqlite");
-    connection
-        .execute(
-            "INSERT INTO thread_runtime_documents (
-                thread_id, revision, document_json, snapshot_json, updated_at
-             ) VALUES (?1, 0, '{}', NULL, 0)",
-            rusqlite::params![thread_id],
-        )
-        .expect("insert live thread");
-    drop(connection);
-    for observed_thread_id in [Some(thread_id.clone()), None] {
-        store
-            .append_agent_log_entry(&AgentLogEntry {
-                id: Uuid::new_v4(),
-                agent_id,
-                thread_id: observed_thread_id,
-                turn_id: None,
-                level: "info".to_string(),
-                category: "retention".to_string(),
-                message: "old".to_string(),
-                details: json!({}),
-                timestamp,
-            })
-            .await
-            .expect("append log");
-    }
-
-    assert_eq!(
-        1,
-        store
-            .prune_agent_logs_before_batch(Utc::now(), 500)
-            .await
-            .expect("prune")
-    );
-    let remaining = store
-        .list_agent_logs(
-            agent_id,
-            AgentLogFilter {
-                limit: 100,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("remaining");
-    assert_eq!(1, remaining.len());
-    assert_eq!(Some(thread_id), remaining[0].thread_id);
 }
 
 #[tokio::test]
@@ -1114,7 +1288,7 @@ async fn delete_project_removes_review_runs() {
                 summary: None,
                 error: None,
                 failure: None,
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history_status: Default::default(),
                 history_archive_id: None,
                 history_archived_at: None,
@@ -1229,7 +1403,8 @@ async fn schema_version_mismatch_is_rejected_without_data_loss() {
         .await
         .err()
         .expect("old schema must be rejected");
-    assert!(error.to_string().contains("mai-migrate"));
+    assert!(error.to_string().contains("仅支持 36"));
+    assert!(error.to_string().contains("创建新数据目录"));
     let connection = rusqlite::Connection::open(db_path).expect("inspect preserved database");
     let preserved: i64 = connection
         .query_row(
@@ -2406,7 +2581,7 @@ async fn review_attempt_start_atomically_increments_job_and_creates_run() {
             summary: None,
             error: None,
             failure: None,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
             history_status: Default::default(),
             history_archive_id: None,
             history_archived_at: None,
@@ -2524,7 +2699,7 @@ async fn submitted_attempt_archives_run_before_releasing_job_ownership() {
             summary: Some("approved".to_string()),
             error: None,
             failure: None,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
             history_status: Default::default(),
             history_archive_id: None,
             history_archived_at: None,
@@ -3301,7 +3476,7 @@ async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
             summary: None,
             error: None,
             failure: None,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
             history_status: Default::default(),
             history_archive_id: None,
             history_archived_at: None,
@@ -3486,7 +3661,7 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
                 summary: Some("approved".to_string()),
                 error: None,
                 failure: None,
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history_status: Default::default(),
                 history_archive_id: None,
                 history_archived_at: None,
@@ -3547,10 +3722,10 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
 }
 
 #[tokio::test]
-async fn review_job_retention_keeps_the_exact_seven_day_boundary() {
+async fn review_job_retention_keeps_the_exact_five_day_boundary() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
-    let cutoff = Utc::now() - chrono::TimeDelta::days(7);
+    let cutoff = Utc::now() - chrono::TimeDelta::days(5);
     let mut expired = test_review_job(project_id, 70, "head-70", None);
     expired.status = ProjectReviewJobStatus::Succeeded;
     expired.finished_at = Some(cutoff - chrono::TimeDelta::milliseconds(1));
@@ -3573,7 +3748,7 @@ async fn review_job_retention_keeps_the_exact_seven_day_boundary() {
         store
             .prune_project_review_jobs_before_batch(cutoff, Utc::now(), 100)
             .await
-            .expect("prune seven-day history")
+            .expect("prune five-day history")
     );
     assert!(
         store
@@ -3699,7 +3874,7 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                 summary: None,
                 error: None,
                 failure: None,
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history_status: Default::default(),
                 history_archive_id: None,
                 history_archived_at: None,

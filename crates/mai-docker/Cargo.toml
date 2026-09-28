@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-pl-core.workspace = true
+pl-tool.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -77,9 +77,13 @@ impl AgentRuntime {
             task_id: Some(request.environment_id),
             project_id: None,
             role: Some(AgentRole::Planner),
+            review_run_id: None,
+            profile_id: Some(AgentRole::Planner.to_string()),
+            workspace: None,
             name: request.name,
             resource: mai_protocol::AgentResourceSnapshot::default(),
             runtime: None,
+            last_turn: None,
             container_id: None,
             docker_image,
             provider_id: UNCONFIGURED_PROVIDER_ID.to_string(),
@@ -88,7 +92,7 @@ impl AgentRuntime {
             reasoning_effort: None,
             created_at,
             updated_at: created_at,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         };
         self.deps.store.save_agent(&summary, None).await?;
         let agent = Arc::new(AgentRecord {
@@ -96,6 +100,7 @@ impl AgentRuntime {
             container: RwLock::new(None),
             mcp: RwLock::new(None),
             review_context: RwLock::new(None),
+            skill_catalog: RwLock::new(None),
             system_prompt: None,
         });
         self.state

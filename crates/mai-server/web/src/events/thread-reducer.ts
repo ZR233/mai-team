@@ -1,21 +1,46 @@
 import type {
-  ThreadItem,
-  ThreadItemDelta,
-  ThreadItemState,
+  InteractionRequest,
   ThreadNotificationEnvelope,
   ThreadSnapshot,
 } from "@/events/thread-events.generated"
 
+/**
+ * Thread 投影错误：权威首帧或 typed 通知无法拼成连续视图。
+ *
+ * 任何不一致（Thread 身份、水位缺口、跨 Thread 载荷）都直接抛出而不是降级拼接，
+ * 由事件控制器重新订阅并回到权威首帧。
+ */
 export class ThreadProjectionError extends Error {}
 
+/**
+ * 校验权威首帧属于目标 Thread，并逐项校验它携带的 typed 载荷所有权。
+ *
+ * 首帧是唯一的权威状态来源：历史 Turn/items 不在这里，由 `/threads/{id}/turns`
+ * 的 typed page 单独读取。
+ */
 export function validateThreadSnapshot(threadId: string, snapshot: ThreadSnapshot): ThreadSnapshot {
   if (snapshot.thread.id !== threadId) {
     throw new ThreadProjectionError(`Thread snapshot mismatch: expected ${threadId}, got ${snapshot.thread.id}`)
   }
-  for (const item of snapshot.items) validateItemOwner(threadId, item)
-  return { ...snapshot, items: [...snapshot.items].sort(compareItems) }
+  if (snapshot.activeTurn && snapshot.activeTurn.threadId !== threadId) {
+    throw new ThreadProjectionError(`Active Turn belongs to Thread ${snapshot.activeTurn.threadId}, expected ${threadId}`)
+  }
+  if (snapshot.runtime && snapshot.runtime.threadId !== threadId) {
+    throw new ThreadProjectionError(`Runtime snapshot belongs to Thread ${snapshot.runtime.threadId}, expected ${threadId}`)
+  }
+  for (const interaction of snapshot.interactions) validateInteractionOwner(threadId, interaction)
+  return snapshot
 }
 
+/**
+ * 把一条 typed 通知拼接到当前权威快照上。
+ *
+ * 通知只维护 Thread 级状态：Turn 生命周期、interaction、runtime、activity 与 storage。
+ * 它不携带历史 Turn/items，因此这里既不伪造也不追加历史条目。
+ *
+ * `envelope.baseRevision` 必须等于当前水位、`envelope.revision` 必须恰好 +1；任何缺口都
+ * 说明视图有洞，直接失败让调用方重同步。
+ */
 export function applyThreadNotification(
   current: ThreadSnapshot,
   envelope: ThreadNotificationEnvelope,
@@ -24,138 +49,61 @@ export function applyThreadNotification(
   if (envelope.threadId !== threadId) {
     throw new ThreadProjectionError(`Thread notification mismatch: expected ${threadId}, got ${envelope.threadId}`)
   }
-  const expected = current.revision + 1
-  if (envelope.revision !== expected) {
-    throw new ThreadProjectionError(`Thread revision gap: expected ${expected}, got ${envelope.revision}`)
-  }
 
   const notification = envelope.notification
   if (notification.type === "lagged") {
     throw new ThreadProjectionError(`Thread subscription lagged by ${notification.dropped} notifications`)
   }
+  if (envelope.baseRevision !== current.revision) {
+    throw new ThreadProjectionError(`Thread revision gap: expected base ${current.revision}, got ${envelope.baseRevision}`)
+  }
+  const expected = current.revision + 1
+  if (envelope.revision !== expected) {
+    throw new ThreadProjectionError(`Thread revision must advance by one: expected ${expected}, got ${envelope.revision}`)
+  }
 
-  let next: ThreadSnapshot = { ...current, revision: envelope.revision }
+  const next: ThreadSnapshot = { ...current, revision: envelope.revision }
   switch (notification.type) {
     case "turnStarted":
     case "turnUpdated":
       validateTurnOwner(threadId, notification.turn.threadId)
-      next = { ...next, activeTurn: notification.turn }
-      break
+      return { ...next, activeTurn: notification.turn }
     case "turnCompleted":
       validateTurnOwner(threadId, notification.turn.threadId)
-      next = { ...next, activeTurn: undefined }
-      break
-    case "itemStarted":
-    case "itemCompleted":
-      next = { ...next, items: upsertItem(next.items, threadId, notification.item) }
-      break
-    case "itemDelta":
-      next = { ...next, items: applyItemDelta(next.items, notification.delta, envelope.emittedAt) }
-      break
-    case "interactionChanged": {
-      const id = String(notification.interaction.interactionId ?? "")
-      const interactions = next.interactions.filter((entry) => String(entry.interactionId ?? "") !== id)
-      next = { ...next, interactions: [...interactions, notification.interaction] }
-      break
-    }
+      return next.activeTurn?.id === notification.turn.id ? { ...next, activeTurn: undefined } : next
+    case "interactionChanged":
+      validateInteractionOwner(threadId, notification.interaction)
+      return { ...next, interactions: upsertInteraction(next.interactions, notification.interaction) }
     case "threadRuntimeUpdated":
-      validateTurnOwner(threadId, notification.runtime.threadId)
-      next = { ...next, runtime: notification.runtime }
-      break
-  }
-  return next
-}
-
-function upsertItem(items: ThreadItem[], threadId: string, incoming: ThreadItem): ThreadItem[] {
-  validateItemOwner(threadId, incoming)
-  const current = items.find((item) => item.id === incoming.id)
-  if (current) {
-    if (current.threadId !== incoming.threadId || current.turnId !== incoming.turnId) {
-      throw new ThreadProjectionError(`Item ${incoming.id} crossed Thread or Turn ownership`)
-    }
-    if (incoming.revision < current.revision) {
-      throw new ThreadProjectionError(`Item ${incoming.id} revision regressed from ${current.revision} to ${incoming.revision}`)
-    }
-  }
-  return [...items.filter((item) => item.id !== incoming.id), incoming].sort(compareItems)
-}
-
-function applyItemDelta(items: ThreadItem[], delta: ThreadItemDelta, emittedAt: number): ThreadItem[] {
-  const index = items.findIndex((item) => item.id === delta.itemId)
-  if (index < 0) throw new ThreadProjectionError(`Delta references missing Item ${delta.itemId}`)
-  const item = items[index]
-  const expected = item.revision + 1
-  if (delta.revision !== expected) {
-    throw new ThreadProjectionError(`Item ${item.id} revision gap: expected ${expected}, got ${delta.revision}`)
-  }
-  const updated = {
-    ...item,
-    revision: delta.revision,
-    updatedAt: emittedAt,
-    state: appendDelta(item.state, delta),
-  }
-  const next = [...items]
-  next[index] = updated
-  return next
-}
-
-function appendDelta(state: ThreadItemState, delta: ThreadItemDelta): ThreadItemState {
-  const change = delta.delta
-  switch (change.kind) {
-    case "text":
-      if (state.kind === "text") return { ...state, data: { ...state.data, text: state.data.text + change.data.delta } }
-      break
-    case "thinkingSummary":
-      if (state.kind === "thinking") return { ...state, data: { ...state.data, summary: appendChunk(state.data.summary, change.data.chunkIndex, change.data.delta) } }
-      break
-    case "thinkingContent":
-      if (state.kind === "thinking") return { ...state, data: { ...state.data, content: appendChunk(state.data.content, change.data.chunkIndex, change.data.delta) } }
-      break
-    case "plan":
-      if (state.kind === "plan") return { ...state, data: { ...state.data, content: state.data.content + change.data.delta } }
-      break
-    case "toolArguments":
-      if (state.kind === "tool") {
-        return {
-          ...state,
-          data: {
-            invocation: { ...state.data.invocation, arguments: (state.data.invocation.arguments ?? "") + change.data.delta },
-            state: { kind: "streaming", data: null },
-          },
-        }
+      if (notification.runtime.threadId !== threadId) {
+        throw new ThreadProjectionError(`Runtime snapshot belongs to Thread ${notification.runtime.threadId}, expected ${threadId}`)
       }
-      break
-    case "toolResult":
-      if (state.kind === "tool" && state.data.state.kind === "running") {
-        return {
-          ...state,
-          data: {
-            ...state.data,
-            state: { kind: "running", data: { streamedOutput: (state.data.state.data.streamedOutput ?? "") + change.data.delta } },
-          },
-        }
-      }
-      break
+      return { ...next, runtime: notification.runtime }
+    case "activityChanged":
+      return { ...next, activity: notification.activity ?? undefined }
+    case "storageChanged":
+      return { ...next, storage: notification.storage ?? undefined }
   }
-  throw new ThreadProjectionError(`Delta ${change.kind} is invalid for Item state ${state.kind}`)
 }
 
-function appendChunk(chunks: string[] | undefined, chunkIndex: number, delta: string): string[] {
-  const next = [...(chunks ?? [])]
-  if (chunkIndex > next.length) throw new ThreadProjectionError(`Delta skipped reasoning chunk ${next.length}`)
-  if (chunkIndex === next.length) next.push("")
-  next[chunkIndex] += delta
-  return next
+function upsertInteraction(interactions: InteractionRequest[], incoming: InteractionRequest): InteractionRequest[] {
+  const index = interactions.findIndex((entry) => entry.interactionId === incoming.interactionId)
+  if (index < 0) return [...interactions, incoming]
+  const current = interactions[index]
+  if (incoming.revision < current.revision) {
+    throw new ThreadProjectionError(`Interaction ${incoming.interactionId} revision regressed from ${current.revision} to ${incoming.revision}`)
+  }
+  const updated = [...interactions]
+  updated[index] = incoming
+  return updated
 }
 
-function validateItemOwner(threadId: string, item: ThreadItem) {
-  if (item.threadId !== threadId) throw new ThreadProjectionError(`Item ${item.id} belongs to Thread ${item.threadId}`)
+function validateInteractionOwner(threadId: string, interaction: InteractionRequest) {
+  if (interaction.scope.threadId !== threadId) {
+    throw new ThreadProjectionError(`Interaction ${interaction.interactionId} belongs to Thread ${interaction.scope.threadId}, expected ${threadId}`)
+  }
 }
 
 function validateTurnOwner(threadId: string, actual: string) {
   if (actual !== threadId) throw new ThreadProjectionError(`Turn belongs to Thread ${actual}, expected ${threadId}`)
-}
-
-function compareItems(left: ThreadItem, right: ThreadItem) {
-  return left.ordinal - right.ordinal || left.id.localeCompare(right.id)
 }

@@ -2,19 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mai_docker::DockerClient;
 use mai_protocol::{McpServerConfig, McpStartupStatus};
-use pl_core::{
-    AgentModelConfig, BuiltinMcpServerState, EffectiveMcpServerConfig, McpAvailabilityKind,
-    McpConnector, McpResetScope, McpRuntime, McpRuntimeHandle, McpServerTransport,
+use pl_model::config::AgentModelConfig;
+use pl_tool::mcp::config::{EffectiveMcpServerConfig, McpServerTransport};
+use pl_tool::mcp::{
+    McpAvailabilityKind, McpConnector, McpResetScope, McpRuntime, McpRuntimeHandle,
 };
 use tokio::sync::RwLock;
 
 use super::McpServerStatus;
+use super::builtin;
+use crate::config::MaiBuiltinMcpServerState;
 use crate::{Result, RuntimeError};
 
 pub(crate) struct ContainerMcpSettings {
     pub(crate) enabled: bool,
     pub(crate) user_servers: BTreeMap<String, McpServerConfig>,
-    pub(crate) builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
+    pub(crate) builtin_servers: BTreeMap<String, MaiBuiltinMcpServerState>,
     pub(crate) models: AgentModelConfig,
 }
 
@@ -75,7 +78,7 @@ impl ContainerMcpRuntime {
         &self,
         enabled: bool,
         user_servers: &BTreeMap<String, McpServerConfig>,
-        builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
+        builtin_states: &BTreeMap<String, MaiBuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<()> {
         self.handle
@@ -91,7 +94,7 @@ impl ContainerMcpRuntime {
         &self,
         enabled: bool,
         user_servers: &BTreeMap<String, McpServerConfig>,
-        builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
+        builtin_states: &BTreeMap<String, MaiBuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<()> {
         self.handle
@@ -108,7 +111,7 @@ impl ContainerMcpRuntime {
         &self,
         enabled: bool,
         user_servers: &BTreeMap<String, McpServerConfig>,
-        builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
+        builtin_states: &BTreeMap<String, MaiBuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<BTreeMap<String, EffectiveMcpServerConfig>> {
         self.update_required_servers(enabled, user_servers).await;
@@ -211,15 +214,15 @@ fn rewrite_sidecar_stdio(
 
 pub(crate) fn effective_servers(
     user_servers: &BTreeMap<String, McpServerConfig>,
-    builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
+    builtin_states: &BTreeMap<String, MaiBuiltinMcpServerState>,
     models: &AgentModelConfig,
 ) -> Result<BTreeMap<String, EffectiveMcpServerConfig>> {
     let user = user_servers
         .iter()
         .map(|(id, config)| (id.clone(), core_config(config)))
         .collect();
-    pl_core::validate_mcp_servers(&user).map_err(RuntimeError::Model)?;
-    let mut effective = pl_core::effective_mcp_servers(&user, builtin_states, models);
+    builtin::validate_user_servers(&user).map_err(RuntimeError::Model)?;
+    let mut effective = builtin::effective_servers(&user, builtin_states, models);
     for (id, config) in user_servers {
         if let Some(server) = effective.get_mut(id) {
             server.bearer_token = config
@@ -237,8 +240,8 @@ pub(crate) fn effective_servers(
     Ok(effective)
 }
 
-fn core_config(config: &McpServerConfig) -> pl_core::McpServerConfig {
-    pl_core::McpServerConfig {
+fn core_config(config: &McpServerConfig) -> pl_tool::mcp::config::McpServerConfig {
+    pl_tool::mcp::config::McpServerConfig {
         enabled: config.enabled,
         transport: match config.transport {
             mai_protocol::McpServerTransport::Stdio => McpServerTransport::Stdio,
@@ -278,16 +281,19 @@ mod tests {
         DockerClient::new("mai-team/test:latest")
     }
 
-    fn effective(id: &str, config: pl_core::McpServerConfig) -> EffectiveMcpServerConfig {
+    fn effective(
+        id: &str,
+        config: pl_tool::mcp::config::McpServerConfig,
+    ) -> EffectiveMcpServerConfig {
         EffectiveMcpServerConfig {
             id: id.to_string(),
             config,
-            source_kind: pl_core::McpServerSourceKind::User,
+            source_kind: pl_tool::mcp::config::McpServerSourceKind::User,
             source_label: id.to_string(),
             source_detail: None,
-            status_kind: pl_core::McpServerStatusKind::Enabled,
+            status_kind: pl_tool::mcp::config::McpServerStatusKind::Enabled,
             status_message: None,
-            mutation_policy: pl_core::McpServerMutationPolicy::UserEditable,
+            mutation_policy: pl_tool::mcp::config::McpServerMutationPolicy::UserEditable,
             bearer_token: None,
             tool_effect: None,
         }
@@ -299,7 +305,7 @@ mod tests {
             "local".to_string(),
             effective(
                 "local",
-                pl_core::McpServerConfig {
+                pl_tool::mcp::config::McpServerConfig {
                     transport: McpServerTransport::Stdio,
                     command: Some("npx".to_string()),
                     args: vec!["-y".to_string(), "server".to_string()],
@@ -339,7 +345,7 @@ mod tests {
             "remote".to_string(),
             effective(
                 "remote",
-                pl_core::McpServerConfig {
+                pl_tool::mcp::config::McpServerConfig {
                     transport: McpServerTransport::StreamableHttp,
                     url: Some("https://mcp.example/stream".to_string()),
                     ..Default::default()
@@ -391,7 +397,7 @@ mod tests {
 
     #[test]
     fn zhipu_provider_enables_all_builtin_servers_from_one_token() {
-        let registry = pl_core::builtin_provider_catalog();
+        let registry = pl_model::config::builtin_provider_catalog();
         let mut provider = registry
             .presets
             .into_iter()
@@ -400,7 +406,10 @@ mod tests {
             .provider;
         provider.bearer_token = Some("coding-plan-token".to_string());
         let models = AgentModelConfig {
-            providers: BTreeMap::from([(pl_core::ProviderId::new("zhipu").unwrap(), provider)]),
+            providers: BTreeMap::from([(
+                pl_model::config::ProviderId::new("zhipu").unwrap(),
+                provider,
+            )]),
             routes: BTreeMap::new(),
         };
 
@@ -416,7 +425,7 @@ mod tests {
             ]
         );
         assert!(effective.values().all(|server| {
-            server.status_kind == pl_core::McpServerStatusKind::Enabled
+            server.status_kind == pl_tool::mcp::config::McpServerStatusKind::Enabled
                 && server.bearer_token.as_deref() == Some("coding-plan-token")
         }));
         assert_eq!(

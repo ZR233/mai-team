@@ -24,6 +24,8 @@ function succeeded(output: Partial<ThreadToolOutput> = {}): ThreadToolState {
 describe("buildToolActivity 原生状态映射", () => {
   it("穷尽映射进行态与终态", () => {
     const active: ThreadToolState[] = [
+      { kind: "queued", data: null },
+      { kind: "cancelling", data: { streamedOutput: "" } },
       { kind: "started", data: null },
       { kind: "streaming", data: null },
       { kind: "awaitingApproval", data: null },
@@ -37,6 +39,7 @@ describe("buildToolActivity 原生状态映射", () => {
     expect(buildToolActivity(toolCallItem({ kind: "failed", data: { failedAt: 1, failure: { kind: "timedOut", message: "timeout" } } })).outcome).toBe("timedOut")
     expect(buildToolActivity(toolCallItem({ kind: "denied", data: { deniedAt: 1, reason: "not allowed" } })).outcome).toBe("denied")
     expect(buildToolActivity(toolCallItem({ kind: "cancelled", data: { cancelledAt: 1, reason: "stop" } })).outcome).toBe("interrupted")
+    expect(buildToolActivity(toolCallItem({ kind: "interrupted", data: { interruptedAt: 1, reason: "runtime restart" } })).outcome).toBe("interrupted")
   })
 
   it("非零退出码判定为失败", () => {

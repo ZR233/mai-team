@@ -92,11 +92,14 @@ mod tests {
             snapshot.schema_version,
             mai_protocol::PROVIDER_CATALOG_SCHEMA_VERSION
         );
+        assert!(snapshot.presets.iter().any(|preset| {
+            preset.id == "openai-compatible" && preset.suggested_model.is_empty()
+        }));
         assert!(
             snapshot
                 .presets
                 .iter()
-                .all(|preset| !preset.suggested_model.is_empty())
+                .any(|preset| { preset.id == "deepseek" && !preset.suggested_model.is_empty() })
         );
 
         assert_eq!(etag.to_str().unwrap(), format!("\"{}\"", snapshot.revision));

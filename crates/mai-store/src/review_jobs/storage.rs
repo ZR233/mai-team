@@ -175,14 +175,10 @@ pub(crate) fn project_review_run_summary_record(
         summary: row.get(12)?,
         error: row.get(13)?,
         failure_json: row.get(14)?,
-        input_tokens: row.get(15)?,
-        cached_input_tokens: row.get(16)?,
-        output_tokens: row.get(17)?,
-        reasoning_output_tokens: row.get(18)?,
-        total_tokens: row.get(19)?,
-        history_status: row.get(20)?,
-        history_archive_id: row.get(21)?,
-        history_archived_at: row.get(22)?,
+        usage_json: row.get(15)?,
+        history_status: row.get(16)?,
+        history_archive_id: row.get(17)?,
+        history_archived_at: row.get(18)?,
     })
 }
 

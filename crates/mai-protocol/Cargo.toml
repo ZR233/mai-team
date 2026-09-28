@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
-pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true
 serde.workspace = true

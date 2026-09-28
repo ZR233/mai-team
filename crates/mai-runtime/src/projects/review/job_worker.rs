@@ -458,6 +458,8 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
         },
         RuntimeError::Model(error) => model_runtime_failure(error),
         RuntimeError::Store(_)
+        | RuntimeError::Thread(_)
+        | RuntimeError::SessionStore(_)
         | RuntimeError::ProjectReviewRunFinalization { .. }
         | RuntimeError::PullRequestStateRefresh(_) => (
             ProjectReviewFailureCategory::Internal,

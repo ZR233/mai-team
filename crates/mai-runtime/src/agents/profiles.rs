@@ -133,6 +133,17 @@ impl AgentProfilesManager {
             .find(|profile| profile.id == id)
     }
 
+    /// 按 id 解析一个启用中的产品 Profile；缺失或禁用时返回 `None`。
+    ///
+    /// 这是运行时的生产入口：协作 host 用它把 `spawn_agent` 的 `profile_id` 解析成冻结的
+    /// 角色、系统指令与能力集，而不是从配置文件或调用参数猜测权限。
+    pub fn resolve(&self, id: &str) -> Option<AgentProfile> {
+        self.load_outcome()
+            .profiles
+            .into_iter()
+            .find(|profile| profile.enabled && profile.id == id)
+    }
+
     #[cfg(test)]
     pub fn resolve_for_slot(
         &self,
@@ -562,6 +573,27 @@ mod tests {
             .resolve_for_slot("project.maintainer", Some("missing"))
             .expect("default");
         assert_eq!(default.id, "project-maintainer");
+    }
+
+    #[test]
+    fn resolve_returns_the_enabled_profile_for_an_exact_id() {
+        let dir = tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("project-maintainer");
+        fs::create_dir_all(&agent_dir).expect("mkdir");
+        fs::write(
+            agent_dir.join(AGENT_FILE),
+            "---\nid: project-maintainer\nname: Project Maintainer\ndescription: Maintains projects.\nslot: project.maintainer\nversion: 1\ncapabilities:\n  spawn_agents: true\n---\nbody",
+        )
+        .expect("write");
+        let manager = AgentProfilesManager::with_roots(vec![(
+            dir.path().to_path_buf(),
+            AgentProfileScope::Repo,
+        )]);
+
+        let resolved = manager.resolve("project-maintainer").expect("profile");
+        assert_eq!(resolved.id, "project-maintainer");
+        assert!(resolved.capabilities.spawn_agents);
+        assert!(manager.resolve("missing").is_none());
     }
 
     #[test]

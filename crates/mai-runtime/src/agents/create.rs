@@ -2,9 +2,12 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentId, AgentRole, AgentSummary, CreateAgentRequest, ProjectId, TaskId, TokenUsage, now,
+    AgentId, AgentRole, AgentSummary, CreateAgentRequest, ProjectId, RuntimeUsageSnapshot, TaskId,
+    now,
 };
+use pl_protocol::AgentWorkspaceAssignmentSnapshot;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use super::normalize_reasoning_effort;
 use crate::Result;
@@ -16,6 +19,12 @@ pub(crate) struct CreateAgentRecordContext {
     pub(crate) task_id: Option<TaskId>,
     pub(crate) project_id: Option<ProjectId>,
     pub(crate) role: Option<AgentRole>,
+    /// 内部 Review Thread 身份，只能由 `ContainerSource::ProjectReviewWorkspace` 派生。
+    pub(crate) review_run_id: Option<Uuid>,
+    /// 创建时冻结的产品 Profile 身份。
+    pub(crate) profile_id: String,
+    /// 创建时冻结的工作区分配；根 Agent 使用产品默认工作区。
+    pub(crate) workspace: Option<AgentWorkspaceAssignmentSnapshot>,
 }
 
 /// 已写入产品状态、等待后续生命周期所有者接管的新 agent。
@@ -33,7 +42,7 @@ pub(crate) trait AgentCreateOps: Send + Sync {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> impl Future<Output = Result<pl_core::ResolvedModelRoute>> + Send;
+    ) -> impl Future<Output = Result<pl_model::config::ResolvedModelRoute>> + Send;
 
     fn save_agent(
         &self,
@@ -75,9 +84,13 @@ pub(crate) async fn create_agent_record(
         task_id: context.task_id,
         project_id: context.project_id,
         role: context.role,
+        review_run_id: context.review_run_id,
+        profile_id: Some(context.profile_id),
+        workspace: context.workspace,
         name,
         resource: mai_protocol::AgentResourceSnapshot::default(),
         runtime: None,
+        last_turn: None,
         container_id: None,
         docker_image,
         provider_id: provider_selection.provider_id.to_string(),
@@ -86,7 +99,7 @@ pub(crate) async fn create_agent_record(
         reasoning_effort,
         created_at,
         updated_at: created_at,
-        token_usage: TokenUsage::default(),
+        usage: RuntimeUsageSnapshot::default(),
     };
     ops.save_agent(&summary, system_prompt.as_deref()).await?;
     let agent = Arc::new(AgentRecord {
@@ -94,6 +107,7 @@ pub(crate) async fn create_agent_record(
         container: RwLock::new(None),
         mcp: RwLock::new(None),
         review_context: RwLock::new(None),
+        skill_catalog: RwLock::new(None),
         system_prompt,
     });
 

@@ -8,9 +8,9 @@ pub(crate) use mai_protocol::{
     ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
     ProjectPullRequestReviewStatusSummary, ProjectPullRequestReviewSummary,
     ProjectReviewJobSummary, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
-    RelaySettingsRequest, RelaySettingsResponse, SkillsConfigRequest, TaskId, TaskPlan, TaskReview,
-    TaskSummary, ThreadId, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary,
-    TurnId,
+    RelaySettingsRequest, RelaySettingsResponse, RuntimeUsageSnapshot, SkillsConfigRequest, TaskId,
+    TaskPlan, TaskReview, TaskSummary, ThreadId, ToolOutputArtifactInfo, ToolTraceDetail,
+    ToolTraceSummary, TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;
@@ -43,7 +43,6 @@ mod settings;
 mod sqlite_busy;
 mod store;
 mod tasks;
-mod thread_runtime;
 
 #[cfg(test)]
 mod tests;
@@ -61,11 +60,6 @@ pub use review_jobs::{
 };
 pub use sqlite_busy::is_retryable_sqlite_error;
 pub use store::MaiStore;
-pub use thread_runtime::{
-    StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,
-    StoredThreadSubmissionPage, StoredThreadTraceEvent, ThreadRuntimeCommitDocument,
-    ThreadRuntimeCommitOutcome, ThreadRuntimeTurnCommit,
-};
 
 pub(crate) use convert::*;
 

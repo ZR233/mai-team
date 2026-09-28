@@ -85,7 +85,7 @@ async fn read_lines(
             "startLine": start_line,
             "endLine": end_line,
             "nextStartLine": has_more.then_some(end_line + 1),
-            "contentHash": pl_core::canonical_content_hash(text.as_bytes()),
+            "contentHash": pl_core::context::content_hash(text.as_bytes()),
             "text": text,
         }))
     })
@@ -116,7 +116,7 @@ async fn read_bytes(
             "endByteExclusive": end_byte,
             "nextStartByte": (end_byte < total_bytes).then_some(end_byte),
             "totalBytes": total_bytes,
-            "contentHash": pl_core::canonical_content_hash(&bytes),
+            "contentHash": pl_core::context::content_hash(&bytes),
             "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
         }))
     })

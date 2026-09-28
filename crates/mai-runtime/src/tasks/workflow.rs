@@ -67,11 +67,7 @@ pub(crate) async fn run_task_workflow(
     .await?;
     let mut executor_summary = ops.wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT).await?;
     for round in 1..=REVIEW_ROUND_LIMIT {
-        if let Some(outcome) = failed_turn_outcome(&executor_summary) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "executor turn ended with outcome {outcome:?}"
-            )));
-        }
+        ensure_completed_turn(&executor_summary, "executor")?;
         let reviewer = ops
             .spawn_task_role_agent(
                 executor.id,
@@ -89,11 +85,7 @@ pub(crate) async fn run_task_workflow(
         )
         .await?;
         let reviewer_summary = ops.wait_agent(reviewer.id, TASK_AGENT_WAIT_TIMEOUT).await?;
-        if let Some(outcome) = failed_turn_outcome(&reviewer_summary) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "reviewer turn ended with outcome {outcome:?}"
-            )));
-        }
+        ensure_completed_turn(&reviewer_summary, "reviewer")?;
         let latest_review = task.reviews.read().await.last().cloned();
         let Some(review) = latest_review else {
             return Err(RuntimeError::InvalidInput(
@@ -138,12 +130,11 @@ pub(crate) async fn run_task_workflow(
     Ok(())
 }
 
-fn failed_turn_outcome(summary: &AgentSummary) -> Option<&pl_protocol::TurnOutcome> {
-    summary
-        .runtime
-        .as_ref()?
-        .last_turn
-        .as_ref()
-        .map(|turn| &turn.outcome)
-        .filter(|outcome| !matches!(outcome, pl_protocol::TurnOutcome::Completed(_)))
+fn ensure_completed_turn(summary: &AgentSummary, role: &str) -> Result<()> {
+    match summary.last_turn.as_ref().map(|turn| &turn.state) {
+        Some(pl_protocol::TurnState::Completed(_)) => Ok(()),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "{role} turn did not complete: {other:?}"
+        ))),
+    }
 }

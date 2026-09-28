@@ -1,12 +1,24 @@
 use super::*;
 
 impl AgentRuntime {
+    /// 等待一个 Thread 的提交水位达到 `revision` 且已经 durable。
+    ///
+    /// 只观察 canonical Thread 的 typed 持久化事实（提交水位与 durable 水位），不读取旧
+    /// store 的 thread runtime，也不解释任何 SQLite 原始表。
     pub(crate) async fn await_agent_durable(&self, agent_id: AgentId, revision: u64) -> Result<()> {
-        let thread_id = agent_host::canonical_id(agent_id)?;
-        let framework = self.agent_framework.get().ok_or_else(|| {
-            RuntimeError::InvalidInput("agent framework is not started".to_string())
-        })?;
-        framework.host().await_durable(&thread_id, revision).await
+        let resident = self.ensure_thread(agent_id).await?;
+        let mut snapshots = resident.handle.subscribe();
+        loop {
+            let Some(snapshot) = snapshots.next().await else {
+                return Err(durable_wait_closed(agent_id, revision));
+            };
+            if durable_through(&snapshot, revision) {
+                return Ok(());
+            }
+            if snapshot.lifecycle == pl_core::thread::ThreadLifecycle::Closed {
+                return Err(durable_wait_closed(agent_id, revision));
+            }
+        }
     }
 
     pub async fn update_agent(
@@ -41,14 +53,11 @@ impl AgentRuntime {
 
     pub async fn get_agent(&self, agent_id: AgentId) -> Result<AgentDetail> {
         let agent = self.agent(agent_id).await?;
-        let canonical_id = agent_host::canonical_id(agent_id)?;
-        let snapshot = self.ensure_framework_agent(agent_id).await?;
-        let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
-        let mut summary = agent.summary.read().await.clone();
-        summary.token_usage = agent_host::aggregate_usage(&runtime);
-        let purpose = agent_host::product_thread_purpose(&agent).await;
+        let resident = self.ensure_thread(agent_id).await?;
+        let state = resident.handle.snapshot();
+        let (summary, thread) = self.project_agent_thread(agent.as_ref(), &state).await?;
         Ok(AgentDetail {
-            thread: agent_host::thread_metadata(&summary, &snapshot, purpose),
+            thread: thread.thread,
             summary,
         })
     }
@@ -90,33 +99,54 @@ impl AgentRuntime {
     ) -> Result<TurnId> {
         let agent = self.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
-        let thread_id = agent_host::canonical_id(agent_id)?;
-        let framework = self.framework_handle()?;
-        let snapshot = self.ensure_framework_agent(agent_id).await?;
-        runtime_thread_events::ensure_live_message_target(&summary, &snapshot)?;
-        let turn_id = framework
-            .submit(
-                thread_id.clone(),
-                pl_core::AgentSubmitRequest::start(thread_id, message)
-                    .with_mail_id(Uuid::new_v4().to_string())
-                    .with_metadata(json!({ "skillMentions": skill_mentions })),
-            )
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        Ok(turn_id.into_string())
+        if summary.resource.state != AgentResourceState::Ready {
+            return Err(RuntimeError::ThreadNotFound(summary.id.to_string()));
+        }
+        let resident = self.ensure_thread(agent_id).await?;
+        let state = resident.handle.snapshot();
+        if state.lifecycle != pl_core::thread::ThreadLifecycle::Open {
+            return Err(RuntimeError::ThreadNotFound(summary.id.to_string()));
+        }
+        let mut input = product_message_input(message.clone(), skill_mentions.clone())?;
+        let catalog = agent.skill_catalog.read().await.clone();
+        match catalog {
+            Some(catalog) => {
+                // 与 Thread 的 `skill_view` 使用同一冻结目录，直接调用 PL 的用户技能选择与加载。
+                let loaded = catalog
+                    .load_user_invocations_with_selections(
+                        &message,
+                        &skill_mentions,
+                        &input.id,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+                    .map_err(RuntimeError::Model)?;
+                if let Some(instruction) = loaded.instruction {
+                    input.context.push(pl_core::context::ContextContent::Text {
+                        text: instruction.into(),
+                    });
+                }
+            }
+            None if !skill_mentions.is_empty() => {
+                return Err(RuntimeError::InvalidInput(
+                    "this Thread has no enabled Skill catalog".to_string(),
+                ));
+            }
+            None => {}
+        }
+        let accepted = resident
+            .handle
+            .submit_input_and_continue(input, resident.input_driver)
+            .await?;
+        // 受理回执的身份就是 canonical InputRecord 的身份：Turn 只在后续执行时创建，
+        // 因此这里返回输入身份而不是当时的空 turn id。
+        Ok(accepted.input.id)
     }
 
     pub async fn cancel_agent(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
         self.agent(agent_id).await?;
-        let canonical_id = agent_host::canonical_id(agent_id)?;
-        let handle = self.framework_handle()?;
-        let snapshot = self.ensure_framework_agent(agent_id).await?;
-        if let Some(turn_id) = snapshot.active_turn_id().cloned() {
-            handle
-                .cancel_turn(canonical_id, turn_id)
-                .await
-                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        }
+        let resident = self.ensure_thread(agent_id).await?;
+        resident.handle.interrupt_turn(None).await?;
         Ok(())
     }
 
@@ -126,19 +156,33 @@ impl AgentRuntime {
         turn_id: TurnId,
     ) -> Result<()> {
         self.agent(agent_id).await?;
-        let canonical_id = agent_host::canonical_id(agent_id)?;
-        let handle = self.framework_handle()?;
-        let snapshot = self.ensure_framework_agent(agent_id).await?;
-        let Some(active_turn_id) = snapshot.active_turn_id().cloned() else {
+        let resident = self.ensure_thread(agent_id).await?;
+        let state = resident.handle.snapshot();
+        let Some(active) = state
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.state == pl_core::thread::TurnState::Running)
+        else {
             return Ok(());
         };
-        if active_turn_id.as_str() != turn_id {
+        // 标识别名：调用方可能持有开跑时受理的输入身份（`send_message` 的返回值），也可能
+        // 持有投影出的活动 Turn 身份。两者指向同一段执行；都不匹配时保持旧的空操作语义。
+        let matches =
+            active.turn_id == turn_id || active.input_id.as_deref() == Some(turn_id.as_str());
+        if !matches {
             return Ok(());
         }
-        handle
-            .cancel_turn(canonical_id, active_turn_id)
+        match resident
+            .handle
+            .interrupt_turn(Some(active.turn_id.clone()))
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+        {
+            Ok(_) => Ok(()),
+            // 运行中的 Turn 已经在比对后结束或换成了另一个 Turn；取消请求已经失去目标。
+            Err(pl_core::thread::ThreadError::InvalidIdentity) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -284,14 +328,12 @@ impl AgentRuntime {
         name: &str,
     ) -> PathBuf {
         let namespace = agent_id.to_string();
-        pl_core::tool::output_format::capture::tool_output_artifact_file_path(
-            pl_core::tool::output_format::capture::ToolOutputArtifactPathRequest::new(
-                &self.artifact_files_root,
-                call_id,
-                artifact_id,
-                name,
-            )
-            .with_namespace(&namespace),
+        crate::turn::container::tool_output_artifact_file_path(
+            &self.artifact_files_root,
+            &namespace,
+            call_id,
+            artifact_id,
+            name,
         )
     }
 
@@ -341,35 +383,44 @@ impl AgentRuntime {
         role: AgentRole,
         name: Option<String>,
     ) -> Result<AgentSummary> {
-        self.ensure_framework_agent(parent_agent_id).await?;
-        let parent_runtime_id = agent_host::canonical_id(parent_agent_id)?;
-        let child_id = AgentId::new_v4();
-        let thread_id = pl_core::ThreadId::new(child_id.to_string())?;
-        let profile = agent_host::agent_profile(&self.mai_config.read().await.models, role)?;
-        let mut session = pl_core::ThreadContextState::empty();
-        session.session.replace_agent_profile(Some(profile.clone()));
-        let result = self
-            .framework_handle()?
-            .spawn(pl_core::AgentSpawnRequest {
-                thread_id,
-                parent_id: parent_runtime_id,
-                role: pl_core::AgentRoleId::new(role.to_string())?,
-                session,
-                initial_turn_id: None,
-                initial_message: None,
-                metadata: json!({
-                    "name": name.clone(),
-                    "taskName": name,
-                    "profileId": profile.profile_id,
-                    "workspaceMode": profile.workspace_mode,
-                    "writablePaths": null,
-                }),
-            })
+        // 父 Thread 必须先驻留：child 的容器从父容器克隆，父子 Thread 关系是产品事实。
+        self.ensure_thread(parent_agent_id).await?;
+        let parent = self.agent(parent_agent_id).await?;
+        let parent_summary = parent.summary.read().await.clone();
+        let role_id = pl_model::config::AgentRoleId::new(agent_role_label(role))?;
+        let profile = self
+            .mai_config
+            .read()
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        let (_, child) = agent_host::product_agent(self, &result.snapshot.identity.id).await?;
-        let summary = child.summary.read().await.clone();
-        Ok(summary)
+            .models
+            .resolve(&role_id)
+            .map_err(RuntimeError::Model)?;
+        let parent_container_id = self.container_id(parent_agent_id).await?;
+        // 冻结 Profile 的 provider/model/effort 与系统指令在创建产品记录时就写入 child，
+        // child 的驻留 Thread 随后由产品创建流程统一装配。
+        let resource = self
+            .create_agent_resource_with_container_source(
+                AgentId::new_v4(),
+                CreateAgentRequest {
+                    name,
+                    provider_id: Some(profile.provider_id.to_string()),
+                    model: Some(profile.model.slug.clone()),
+                    reasoning_effort: profile.effort.map(|effort| effort.as_str().to_string()),
+                    docker_image: Some(parent_summary.docker_image.clone()),
+                    parent_id: Some(parent_agent_id),
+                    system_prompt: Some(agents::task_role_system_prompt(role).to_string()),
+                },
+                agents::ContainerSource::CloneFrom {
+                    parent_container_id,
+                    docker_image: parent_summary.docker_image.clone(),
+                    workspace_volume: None,
+                },
+                parent_summary.task_id,
+                parent_summary.project_id,
+                Some(role),
+            )
+            .await?;
+        self.register_prepared_agent(resource).await
     }
 
     pub(super) async fn start_agent_turn(
@@ -385,34 +436,253 @@ impl AgentRuntime {
         agent_id: AgentId,
         timeout: Duration,
     ) -> Result<AgentSummary> {
-        let agent = self.agent(agent_id).await?;
-        let canonical_id = agent_host::canonical_id(agent_id)?;
-        self.ensure_framework_agent(agent_id).await?;
-        tokio::time::timeout(
-            timeout,
-            self.framework_handle()?.wait_until_idle(canonical_id),
-        )
-        .await
-        .map_err(|_| RuntimeError::InvalidInput("waiting for agent timed out".to_string()))?
-        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        let summary = agent.summary.read().await.clone();
-        Ok(summary)
+        tokio::time::timeout(timeout, self.wait_thread_settled(agent_id, None))
+            .await
+            .map_err(|_| RuntimeError::InvalidInput("waiting for agent timed out".to_string()))??;
+        Ok(self.get_agent(agent_id).await?.summary)
     }
 
-    pub(super) async fn wait_agent_until_complete_with_cancel(
+    /// 等待一个 Thread 进入稳定状态并返回最近的终态 Turn。
+    ///
+    /// 稳定状态是“空闲”或“故障”：两者都表示当前已经没有可继续推进的执行，调用方必须
+    /// 从 typed 事实（例如最后一条终态 Turn）判断成败，而不是把故障当成仍在运行。取消令牌
+    /// 命中时返回 [`RuntimeError::TurnCancelled`]，不消费任何未返回的 Turn。
+    pub(super) async fn wait_agent_turn(
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> Result<pl_core::AgentWaitResult> {
+    ) -> Result<ThreadWaitOutcome> {
         self.agent(agent_id).await?;
-        let canonical_id = agent_host::canonical_id(agent_id)?;
-        self.ensure_framework_agent(agent_id).await?;
-        let handle = self.framework_handle()?;
-        tokio::select! {
-            result = handle.wait_until_idle(canonical_id) => {
-                result.map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+        self.ensure_thread(agent_id).await?;
+        self.wait_thread_settled(agent_id, Some(cancellation_token))
+            .await?;
+        let last_turn = self.last_terminal_turn(agent_id).await?;
+        Ok(ThreadWaitOutcome { last_turn })
+    }
+
+    /// 订阅一个驻留 Thread，直到它空闲或故障；取消令牌命中则立即返回取消。
+    async fn wait_thread_settled(
+        &self,
+        agent_id: AgentId,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<pl_core::thread::ThreadSnapshot> {
+        let resident = self.ensure_thread(agent_id).await?;
+        let mut snapshots = resident.handle.subscribe();
+        loop {
+            let next = match cancellation {
+                Some(token) => tokio::select! {
+                    snapshot = snapshots.next() => snapshot,
+                    () = token.cancelled() => return Err(RuntimeError::TurnCancelled),
+                },
+                None => snapshots.next().await,
+            };
+            let Some(snapshot) = next else {
+                return Err(RuntimeError::ThreadNotFound(agent_id.to_string()));
+            };
+            match thread_projection::status(&snapshot) {
+                ThreadStatus::Idle | ThreadStatus::Faulted => return Ok(snapshot),
+                ThreadStatus::Closed => {
+                    return Err(RuntimeError::ThreadNotFound(agent_id.to_string()));
+                }
+                ThreadStatus::Queued
+                | ThreadStatus::Running
+                | ThreadStatus::WaitingTool
+                | ThreadStatus::WaitingInteraction
+                | ThreadStatus::Cancelling
+                | ThreadStatus::Closing => continue,
             }
-            () = cancellation_token.cancelled() => Err(RuntimeError::TurnCancelled),
         }
     }
+
+    /// 把一个驻留 Thread 的 canonical 状态投影成产品摘要与权威首帧。
+    ///
+    /// typed 累计用量来自 core 的 [`pl_core::thread::UsageSummary`]，产品摘要里不保留任何
+    /// 从旧 `thread_runtime` 或 SQLite 原始表反推的用量。
+    async fn project_agent_thread(
+        &self,
+        agent: &crate::state::AgentRecord,
+        state: &pl_core::thread::ThreadSnapshot,
+    ) -> Result<(AgentSummary, ThreadSnapshot)> {
+        let mut summary = agent.summary.read().await.clone();
+        summary.usage = canonical_usage(&state.usage_summary, summary.updated_at.timestamp());
+        summary.last_turn = self.last_terminal_turn(summary.id).await?;
+        let thread = project_thread_snapshot(&summary, state)?;
+        summary.runtime = Some(thread.clone());
+        Ok((summary, thread))
+    }
+}
+
+/// 一次“等待到稳定”的 canonical 结果。
+///
+/// 最近一条已提交的终态 Turn（core typed 投影，不从工具文本猜测）。
+pub(crate) struct ThreadWaitOutcome {
+    /// 最近一条终态 Turn；没有可读终态时为 `None`。
+    pub last_turn: Option<Turn>,
+}
+
+impl ThreadWaitOutcome {
+    /// 最近一条终态 Turn 是否被取消。
+    pub(crate) fn last_turn_cancelled(&self) -> bool {
+        matches!(
+            self.last_turn.as_ref().map(|turn| &turn.state),
+            Some(TurnState::Cancelled(_))
+        )
+    }
+}
+
+/// 产品消息在 [`pl_core::thread::input::ThreadInput`] 中的 payload 格式。
+///
+/// `context` 承载模型可见的用户文本，payload 只承载产品路由事实（技能提及）。消费这条
+/// payload 的 turn 准备路径由 Thread 装配所有权负责读取；它必须按格式与版本解码，不得
+/// 从非类型化 metadata 猜测。
+const PRODUCT_MESSAGE_FORMAT: &str = "mai.thread.message";
+const PRODUCT_MESSAGE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductMessagePayload<'a> {
+    text: &'a str,
+    skill_mentions: &'a [String],
+}
+
+/// 由一条产品消息构造 canonical [`pl_core::thread::input::ThreadInput`]。
+///
+/// 输入身份由产品生成，正文同时进入模型可见 context；技能提及只进入 payload，不改变模型
+/// 可见文本。
+fn product_message_input(
+    message: String,
+    skill_mentions: Vec<String>,
+) -> Result<pl_core::thread::input::ThreadInput> {
+    let content = serde_json::to_string(&ProductMessagePayload {
+        text: &message,
+        skill_mentions: &skill_mentions,
+    })
+    .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    let payload = pl_core::context::OpaquePayload::new(
+        PRODUCT_MESSAGE_FORMAT,
+        PRODUCT_MESSAGE_VERSION,
+        content,
+    )
+    .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    Ok(pl_core::thread::input::ThreadInput {
+        id: Uuid::new_v4().to_string(),
+        payload,
+        context: vec![pl_core::context::ContextContent::Text {
+            text: message.into(),
+        }],
+    })
+}
+
+/// 用产品元数据与 canonical Thread 状态投影产品首帧。
+///
+/// 会话级位置取产品容器工作区；child 的冻结工作区收据优先于根 Agent 的项目默认路径。
+pub(crate) fn project_thread_snapshot(
+    summary: &AgentSummary,
+    state: &pl_core::thread::ThreadSnapshot,
+) -> Result<ThreadSnapshot> {
+    let mode = product_thread_mode(summary);
+    let (workspace_mode, workspace_path) = match summary.workspace.as_ref() {
+        Some(assignment) => {
+            let mode = match assignment.mode {
+                pl_protocol::AgentWorkspaceMode::Worktree => {
+                    pl_protocol::ThreadWorkspaceMode::Worktree
+                }
+                pl_protocol::AgentWorkspaceMode::Unrestricted
+                | pl_protocol::AgentWorkspaceMode::Directory => {
+                    pl_protocol::ThreadWorkspaceMode::Local
+                }
+            };
+            (mode, assignment.root.clone())
+        }
+        None if summary.project_id.is_some() => (
+            pl_protocol::ThreadWorkspaceMode::Local,
+            crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string(),
+        ),
+        None => (
+            pl_protocol::ThreadWorkspaceMode::Local,
+            "/workspace".to_string(),
+        ),
+    };
+    let metadata = thread_projection::ThreadProjectionMetadata {
+        mode,
+        workspace_mode,
+        workspace_path: &workspace_path,
+    };
+    thread_projection::project_snapshot(summary, state, &metadata)
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+}
+
+/// Review 会话使用 Review Mode，Task/Project 会话使用 Task Mode，其余使用 Simple Mode。
+fn product_thread_mode(summary: &AgentSummary) -> ThreadModeId {
+    if summary.review_run_id.is_some() {
+        return ThreadModeId::new(crate::skills::REVIEW_MODE_ID)
+            .expect("mai Review Mode is a valid Thread ModeId");
+    }
+    if summary.task_id.is_some() || summary.project_id.is_some() {
+        ThreadModeId::task()
+    } else {
+        ThreadModeId::simple()
+    }
+}
+
+/// 把 core 的 typed 累计用量投影成产品用量快照。
+fn canonical_usage(usage: &pl_core::thread::UsageSummary, updated_at: i64) -> RuntimeUsageSnapshot {
+    RuntimeUsageSnapshot {
+        has_incomplete_usage: usage.has_incomplete_usage,
+        model: usage.model.clone(),
+        context_window: usage.context_window,
+        latest_context_tokens: usage.latest_context_tokens,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        // 缓存未命中是有效缓存样本里未被命中的输入 token。
+        cache_miss_tokens: usage
+            .cache_input_tokens
+            .saturating_sub(usage.cache_read_tokens),
+        reasoning_tokens: usage.reasoning_tokens,
+        inference_count: usage.inference_count,
+        total_tokens: usage.total_tokens,
+        estimated_costs: runtime_cost_amounts(&usage.estimated_costs),
+        estimated_cache_savings: runtime_cost_amounts(&usage.estimated_cache_savings),
+        has_unpriced_usage: usage.has_unpriced_usage,
+        updated_at,
+    }
+}
+
+fn runtime_cost_amounts(
+    costs: &[pl_core::thread::UsageCost],
+) -> Vec<pl_protocol::RuntimeCostAmount> {
+    costs
+        .iter()
+        .map(|cost| pl_protocol::RuntimeCostAmount {
+            currency: cost.currency.clone(),
+            amount: cost.amount,
+        })
+        .collect()
+}
+
+impl AgentRuntime {
+    /// 从 pl-core 的 typed 持久化历史读取最近一条完整终态 Turn。
+    pub(crate) async fn last_terminal_turn(&self, agent_id: AgentId) -> Result<Option<Turn>> {
+        Ok(self
+            .thread_turns(agent_id.to_string(), None, 1)
+            .await?
+            .turns
+            .into_iter()
+            .next()
+            .map(|history| history.turn))
+    }
+}
+
+/// 提交水位已覆盖 `revision`，且挂载存储时 durable 水位也已追上。
+fn durable_through(snapshot: &pl_core::thread::ThreadSnapshot, revision: u64) -> bool {
+    snapshot.commit_sequence >= revision
+        && (!snapshot.persistence.attached || snapshot.persistence.durable_sequence >= revision)
+}
+
+fn durable_wait_closed(agent_id: AgentId, revision: u64) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "Thread `{agent_id}` closed before revision {revision} became durable"
+    ))
 }

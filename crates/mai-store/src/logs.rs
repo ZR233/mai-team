@@ -228,14 +228,12 @@ async fn prune_observability_rows(
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(30))?;
         let transaction = connection.transaction()?;
+        // 产品日志与 tool trace 是纯 mai 产品数据，只按时间保留；
+        // 旧版曾用 thread_runtime_documents 保护的 live Thread 已不再由本存储维护。
         let sql = format!(
             "DELETE FROM {table} WHERE id IN (
                 SELECT observed.id FROM {table} observed
                 WHERE observed.{timestamp_column} < ?1
-                  AND (observed.thread_id IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM thread_runtime_documents live
-                      WHERE live.thread_id = observed.thread_id
-                  ))
                 ORDER BY observed.{timestamp_column} ASC, observed.id ASC
                 LIMIT ?2
              )"

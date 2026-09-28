@@ -107,13 +107,13 @@ function isVisibleItem(item: ThreadItem): boolean {
     case "agent":
     case "turn":
     case "inference":
+    case "raw":
     case "file":
     case "contextCompaction":
       return false
     case "thinking":
       return [...(item.state.data.summary ?? []), ...(item.state.data.content ?? [])].some((part) => part.trim().length > 0)
     case "text":
-    case "plan":
     case "skill":
     case "tool":
       return true

@@ -20,6 +20,7 @@ pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true
 pl-trace.workspace = true
+pl-tool.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 schemars.workspace = true

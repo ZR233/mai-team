@@ -1,58 +1,32 @@
 import { describe, expect, it } from "vitest"
 
-import type { AgentRuntimeState, AgentSummary } from "@/api/product-types"
+import type { AgentSummary } from "@/api/product-types"
+import type { ThreadStatus } from "@/events/thread-events.generated"
 import { agentCanRunThread, agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 
-const turn = { turnId: "turn-1" }
+describe("PL Thread 与 Agent 产品资源状态", () => {
+  it("只允许可继续执行的 Thread 状态接收新消息", () => {
+    const accepting: ThreadStatus[] = ["idle", "queued", "running", "waitingTool", "waitingInteraction"]
+    const rejecting: ThreadStatus[] = ["cancelling", "closing", "closed", "faulted"]
 
-describe("PL v2 Agent tagged state", () => {
-  it("只允许 canonical accepting-work 状态接收新消息", () => {
-    const accepting: AgentRuntimeState[] = [
-      { kind: "idle", data: null },
-      { kind: "queued", data: turn },
-      { kind: "running", data: turn },
-      { kind: "waitingTool", data: turn },
-      { kind: "waitingInteraction", data: { ...turn, interactionId: "interaction-1" } },
-    ]
-    const rejecting: AgentRuntimeState[] = [
-      { kind: "cancelling", data: turn },
-      { kind: "closing", data: null },
-      { kind: "closed", data: null },
-      {
-        kind: "faulted",
-        data: {
-          error: { code: "runtimeFault", message: "failed", retryable: false },
-          turnId: "turn-1",
-          classification: "recoverableRuntime",
-        },
-      },
-    ]
-
-    expect(accepting.map((state) => agentCanRunThread(agent(state)))).toEqual([
-      true,
-      true,
-      true,
-      true,
-      true,
-    ])
-    expect(rejecting.map((state) => agentCanRunThread(agent(state)))).toEqual([
-      false,
-      false,
-      false,
-      false,
-    ])
+    expect(accepting.map((status) => agentCanRunThread(agent(status)))).toEqual(
+      accepting.map(() => true),
+    )
+    expect(rejecting.map((status) => agentCanRunThread(agent(status)))).toEqual(
+      rejecting.map(() => false),
+    )
   })
 
-  it("产品资源状态与 PL 执行状态保持正交", () => {
-    expect(agentPresentationStatus(agent({ kind: "running", data: turn }, "deleting"))).toBe("deleting")
-    expect(agentCanRunThread(agent({ kind: "idle", data: null }, "provisioning"))).toBe(false)
-    expect(agentPresentationStatus(agent({ kind: "waitingTool", data: turn }), "streaming")).toBe("streaming")
-    expect(agentPresentationStatus(agent({ kind: "closed", data: null }), "streaming")).toBe("closed")
+  it("产品资源状态与 PL Thread 状态保持正交", () => {
+    expect(agentPresentationStatus(agent("running", "deleting"))).toBe("deleting")
+    expect(agentCanRunThread(agent("idle", "provisioning"))).toBe(false)
+    expect(agentPresentationStatus(agent("waitingTool"), "streaming")).toBe("streaming")
+    expect(agentPresentationStatus(agent("closed"), "streaming")).toBe("closed")
   })
 })
 
 function agent(
-  state: AgentRuntimeState,
+  status: ThreadStatus,
   resourceState: AgentSummary["resource"]["state"] = "ready",
 ): AgentSummary {
   return {
@@ -60,21 +34,31 @@ function agent(
     name: "Agent",
     resource: { state: resourceState, error: null },
     runtime: {
-      identity: { id: "agent-1", parentId: null, role: "executor", depth: 0 },
-      state,
-      pendingInputs: 0,
-      progress: null,
-      lastTurn: null,
+      schemaVersion: 1,
       revision: 1,
-      eventSequence: 1,
-      updatedAt: 1,
+      thread: {
+        id: "agent-1",
+        projectId: "project-1",
+        title: "Agent",
+        mode: "mode.simple",
+        workspaceMode: "local",
+        workspacePath: "/workspace/repo",
+        rootThreadId: "agent-1",
+        role: "executor",
+        agentPath: "agent-1",
+        status,
+        createdAt: 1,
+        updatedAt: 1,
+        archived: false,
+      },
+      interactions: [],
     },
     provider_id: "provider",
     provider_name: "Provider",
     model: "model",
     created_at: "2026-08-26T00:00:00Z",
     updated_at: "2026-08-26T00:00:00Z",
-    token_usage: {
+    usage: {
       promptTokens: 0,
       cachedPromptTokens: 0,
       cacheWriteTokens: 0,

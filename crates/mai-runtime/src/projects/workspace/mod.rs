@@ -4,7 +4,7 @@ use mai_protocol::ProjectId;
 #[cfg(test)]
 use mai_protocol::preview;
 #[cfg(test)]
-use pl_core::{GIT_TOKEN_ENV, git_askpass_script};
+use pl_tool::git::{GIT_TOKEN_ENV, git_askpass_script};
 #[cfg(test)]
 use tokio::process::Command;
 
@@ -13,12 +13,14 @@ use crate::Result;
 use crate::RuntimeError;
 
 pub(crate) mod docker_reconcile;
+pub(crate) mod git_shell;
 pub(crate) mod lease;
 pub(crate) mod manager;
 pub(crate) mod paths;
 pub(crate) mod reconcile;
 pub(crate) mod repository;
 
+pub(crate) use git_shell::{git_shell_credential_prelude, git_shell_retry_function};
 pub(crate) use manager::{
     AGENT_WORKSPACE_REPO_PATH, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };

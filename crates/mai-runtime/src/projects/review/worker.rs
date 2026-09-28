@@ -680,10 +680,17 @@ fn project_reviewer_agent_is_active(agent: &AgentSummary) -> bool {
     matches!(
         agent.resource.state,
         AgentResourceState::Provisioning | AgentResourceState::Ready
-    ) && agent
-        .runtime
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.state.is_operational())
+    ) && agent.runtime.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.thread.status,
+            mai_protocol::ThreadStatus::Idle
+                | mai_protocol::ThreadStatus::Queued
+                | mai_protocol::ThreadStatus::Running
+                | mai_protocol::ThreadStatus::WaitingTool
+                | mai_protocol::ThreadStatus::WaitingInteraction
+                | mai_protocol::ThreadStatus::Cancelling
+        )
+    })
 }
 
 async fn wait_for_project_review_signal(
@@ -735,12 +742,9 @@ mod tests {
         ProjectReviewDecision, ProjectReviewFailureCategory, ProjectReviewHistoryStatus,
         ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewJobSummary,
         ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
-        ProjectStatus, ProjectSummary, TokenUsage, TurnId, now,
+        ProjectStatus, ProjectSummary, RuntimeUsageSnapshot, TurnId, now,
     };
-    use pl_protocol::{
-        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, ClosedAgentState, RunningAgentState,
-        ThreadId, WaitingToolAgentState,
-    };
+    use pl_protocol::{ThreadSnapshot, ThreadStatus, Turn};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
@@ -2634,57 +2638,50 @@ mod tests {
         test_state: TestReviewerState,
     ) -> mai_protocol::AgentSummary {
         let id = Uuid::new_v4();
-        let turn_id = pl_protocol::TurnId::new(Uuid::new_v4().to_string()).expect("turn id");
+        let thread_id = id.to_string();
+        let turn_id = Uuid::new_v4().to_string();
         let mut resource = AgentResourceSnapshot {
             state: AgentResourceState::Ready,
             error: None,
         };
-        let runtime_state = match test_state {
+        let mut runtime = ThreadSnapshot::empty(thread_id.clone());
+        match test_state {
             TestReviewerState::WaitingTool => {
-                AgentState::WaitingTool(WaitingToolAgentState::new(turn_id.clone()))
+                runtime.thread.status = ThreadStatus::WaitingTool;
+                runtime.active_turn = Some(Turn::queued(turn_id.clone(), thread_id.clone(), 1));
             }
             TestReviewerState::Deleting => {
                 resource.state = AgentResourceState::Deleting;
-                AgentState::Running(RunningAgentState::new(turn_id.clone()))
+                runtime.thread.status = ThreadStatus::Running;
+                runtime.active_turn = Some(Turn::queued(turn_id.clone(), thread_id.clone(), 1));
             }
             TestReviewerState::Running => {
-                AgentState::Running(RunningAgentState::new(turn_id.clone()))
+                runtime.thread.status = ThreadStatus::Running;
+                runtime.active_turn = Some(Turn::queued(turn_id.clone(), thread_id.clone(), 1));
             }
             TestReviewerState::Failed => {
                 resource.state = AgentResourceState::Failed;
                 resource.error = Some("reviewer failed".to_string());
-                AgentState::idle()
+                // runtime 保持 Idle，对应旧 AgentState::idle 语义。
             }
             TestReviewerState::Deleted => {
                 resource.state = AgentResourceState::Deleted;
-                AgentState::Closed(ClosedAgentState::new())
+                runtime.thread.status = ThreadStatus::Closed;
             }
-        };
+        }
         mai_protocol::AgentSummary {
             id,
             parent_id: Some(maintainer_agent_id),
             task_id: None,
             project_id: Some(project_id),
             role: Some(AgentRole::Reviewer),
+            profile_id: None,
+            workspace: None,
+            review_run_id: None,
             name: "reviewer".to_string(),
             resource,
-            runtime: Some(AgentSnapshot {
-                identity: AgentIdentity {
-                    id: ThreadId::new(id.to_string()).expect("thread id"),
-                    parent_id: Some(
-                        ThreadId::new(maintainer_agent_id.to_string()).expect("parent id"),
-                    ),
-                    role: AgentRoleId::new("reviewer").expect("role"),
-                    depth: 1,
-                },
-                state: runtime_state,
-                pending_inputs: 0,
-                progress: None,
-                last_turn: None,
-                revision: 1,
-                event_sequence: 1,
-                updated_at: 1,
-            }),
+            runtime: Some(runtime),
+            last_turn: None,
             container_id: Some("container".to_string()),
             docker_image: "unused".to_string(),
             provider_id: "mock".to_string(),
@@ -2693,7 +2690,7 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             created_at: now(),
             updated_at: now(),
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         }
     }
 
@@ -2719,7 +2716,7 @@ mod tests {
             summary: None,
             error: None,
             failure: None,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
             history_status: ProjectReviewHistoryStatus::Available,
             history_archive_id: None,
             history_archived_at: None,

@@ -1,25 +1,17 @@
-use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
+use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsageSnapshot};
 
-pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
-    let snapshot = pl_core::ModelTokenUsageSnapshot::from(usage);
-    model_token_usage(&snapshot)
+pub fn completion_response_usage(usage: &pl_protocol::UsageReport) -> TokenUsageSnapshot {
+    usage.totals().public_snapshot()
 }
 
-pub fn model_token_usage(snapshot: &pl_core::ModelTokenUsageSnapshot) -> TokenUsage {
-    TokenUsage {
-        prompt_tokens: snapshot.input_tokens(),
-        cached_prompt_tokens: snapshot.cached_input_tokens(),
-        cache_write_tokens: snapshot.cache_write_tokens(),
-        completion_tokens: snapshot.output_tokens(),
-        reasoning_tokens: snapshot.reasoning_output_tokens(),
-        total_tokens: snapshot.total_tokens(),
-    }
+pub fn model_token_usage(accounting: &pl_protocol::InferenceAccounting) -> TokenUsageSnapshot {
+    completion_response_usage(&accounting.usage)
 }
 
 pub fn completion_response_to_model_response(
-    response: pl_model::CompletionResponse,
+    response: pl_model::completion::CompletionResponse,
 ) -> ModelResponse {
-    let snapshot = pl_core::completion_response_snapshot(&response);
+    let snapshot = pl_model::completion::completion_response_snapshot(&response);
     let output = snapshot
         .output()
         .iter()
@@ -42,12 +34,12 @@ pub fn completion_response_to_model_response(
                     raw_arguments: function_call.raw_arguments().to_string(),
                 };
             }
-            unreachable!("pl-core response output snapshot has no visible projection")
+            unreachable!("pl-model response output snapshot has no visible projection")
         })
         .collect();
     ModelResponse {
         id: snapshot.id().map(ToString::to_string),
         output,
-        usage: Some(model_token_usage(snapshot.usage())),
+        usage: Some(model_token_usage(snapshot.accounting())),
     }
 }

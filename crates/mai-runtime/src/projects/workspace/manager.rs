@@ -805,11 +805,15 @@ mod tests {
             project_id: Some(project_id),
             parent_id: None,
             role: None,
+            profile_id: None,
+            workspace: None,
+            review_run_id: None,
             resource: AgentResourceSnapshot {
                 state: AgentResourceState::Ready,
                 error: None,
             },
             runtime: None,
+            last_turn: None,
             model: "model".to_string(),
             provider_id: "provider".to_string(),
             provider_name: "provider".to_string(),
@@ -818,7 +822,7 @@ mod tests {
             container_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            token_usage: Default::default(),
+            usage: Default::default(),
         }
     }
 

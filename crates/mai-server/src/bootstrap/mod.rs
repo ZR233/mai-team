@@ -71,6 +71,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
         projects_root: paths.projects_root.clone(),
+        sessions_root: paths.data_dir.join("sessions"),
         cache_root: paths.cache_dir.clone(),
         artifact_files_root: paths.artifact_files_root.clone(),
         sidecar_image: config.images.sidecar_image,
@@ -419,6 +420,7 @@ mod tests {
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 projects_root: dir.path().join("projects"),
+                sessions_root: dir.path().join("sessions"),
                 cache_root: dir.path().join("cache"),
                 artifact_files_root: dir.path().join("artifacts/files"),
                 sidecar_image: "sidecar:latest".to_string(),

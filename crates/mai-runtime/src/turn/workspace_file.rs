@@ -1,12 +1,15 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use pl_core::{
-    AgentWorkspace, ContainerBackend, ContainerExecRequest, ContainerWorkspaceFileBackend,
-    PureError, WorkspaceBoundary, WorkspaceFileBackend, WorkspaceFileListRequest,
+use pl_protocol::PureError;
+use pl_tool::container::{ContainerBackend, ContainerExecRequest};
+use pl_tool::shell::shell_quote_word;
+use pl_tool::workspace::{AgentWorkspace, WorkspaceBoundary};
+use pl_tool::workspace_file::{
+    ContainerWorkspaceFileBackend, WorkspaceFileBackend, WorkspaceFileListRequest,
     WorkspaceFileListResult, WorkspaceFileReadBytesRequest, WorkspaceFileReadRequest,
     WorkspaceFileRemoveRequest, WorkspaceFileStat, WorkspaceFileStatRequest,
-    WorkspaceFileWriteRequest, shell_quote_word,
+    WorkspaceFileWriteRequest,
 };
 
 use super::container::MaiContainerBackend;
@@ -44,12 +47,12 @@ impl MaiWorkspaceFileBackend {
         }
     }
 
-    async fn resolve_read(&self, path: &str, cwd: Option<&str>) -> pl_core::Result<String> {
+    async fn resolve_read(&self, path: &str, cwd: Option<&str>) -> pl_protocol::Result<String> {
         self.resolve_path(path, cwd, &self.policy.read_roots, "read_file")
             .await
     }
 
-    async fn resolve_write(&self, path: &str, cwd: Option<&str>) -> pl_core::Result<String> {
+    async fn resolve_write(&self, path: &str, cwd: Option<&str>) -> pl_protocol::Result<String> {
         self.resolve_path(path, cwd, &self.policy.writable_roots, "apply_patch")
             .await
     }
@@ -60,7 +63,7 @@ impl MaiWorkspaceFileBackend {
         cwd: Option<&str>,
         allowed_roots: &[PathBuf],
         tool: &str,
-    ) -> pl_core::Result<String> {
+    ) -> pl_protocol::Result<String> {
         let lexical = self.policy.resolve(path, cwd, allowed_roots, tool)?;
         let command = format!(
             "resolved=$(readlink -f -- {path}) || exit 2; printf '%s' \"$resolved\"",
@@ -101,23 +104,26 @@ impl MaiWorkspaceFileBackend {
 }
 
 impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
-    async fn default_cwd(&self) -> pl_core::Result<String> {
+    async fn default_cwd(&self) -> pl_protocol::Result<String> {
         Ok(self.policy.default_cwd.to_string_lossy().into_owned())
     }
 
-    async fn stat(&self, request: WorkspaceFileStatRequest) -> pl_core::Result<WorkspaceFileStat> {
+    async fn stat_optional(
+        &self,
+        request: WorkspaceFileStatRequest,
+    ) -> pl_protocol::Result<Option<WorkspaceFileStat>> {
         let path = self
             .resolve_read(&request.path, request.cwd.as_deref())
             .await?;
         self.inner
-            .stat(WorkspaceFileStatRequest {
+            .stat_optional(WorkspaceFileStatRequest {
                 path,
                 cwd: Some("/".to_string()),
             })
             .await
     }
 
-    async fn read_text(&self, request: WorkspaceFileReadRequest) -> pl_core::Result<String> {
+    async fn read_text(&self, request: WorkspaceFileReadRequest) -> pl_protocol::Result<String> {
         let path = self
             .resolve_read(&request.path, request.cwd.as_deref())
             .await?;
@@ -129,7 +135,10 @@ impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
             .await
     }
 
-    async fn read_bytes(&self, request: WorkspaceFileReadBytesRequest) -> pl_core::Result<Vec<u8>> {
+    async fn read_bytes(
+        &self,
+        request: WorkspaceFileReadBytesRequest,
+    ) -> pl_protocol::Result<Vec<u8>> {
         let path = self
             .resolve_read(&request.path, request.cwd.as_deref())
             .await?;
@@ -142,12 +151,13 @@ impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
             .await
     }
 
-    async fn write_text(&self, request: WorkspaceFileWriteRequest) -> pl_core::Result<()> {
+    async fn write_text(&self, request: WorkspaceFileWriteRequest) -> pl_protocol::Result<()> {
         let path = self
             .resolve_write(&request.path, request.cwd.as_deref())
             .await?;
         self.inner
             .write_text(WorkspaceFileWriteRequest {
+                mode: request.mode,
                 path,
                 cwd: Some("/".to_string()),
                 content: request.content,
@@ -155,7 +165,7 @@ impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
             .await
     }
 
-    async fn remove_file(&self, request: WorkspaceFileRemoveRequest) -> pl_core::Result<()> {
+    async fn remove_file(&self, request: WorkspaceFileRemoveRequest) -> pl_protocol::Result<()> {
         let path = self
             .resolve_write(&request.path, request.cwd.as_deref())
             .await?;
@@ -170,7 +180,7 @@ impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
     async fn list(
         &self,
         request: WorkspaceFileListRequest,
-    ) -> pl_core::Result<WorkspaceFileListResult> {
+    ) -> pl_protocol::Result<WorkspaceFileListResult> {
         let path = self
             .resolve_read(&request.path, request.cwd.as_deref())
             .await?;
@@ -200,7 +210,7 @@ impl WorkspaceFilePolicy {
         cwd: Option<&str>,
         allowed_roots: &[PathBuf],
         tool: &str,
-    ) -> pl_core::Result<String> {
+    ) -> pl_protocol::Result<String> {
         let candidate = normalized_container_path(&self.default_cwd, cwd, path)
             .map_err(|error| file_error(tool, error))?;
         if allowed_roots

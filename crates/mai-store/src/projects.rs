@@ -147,11 +147,7 @@ impl MaiStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
-            input_tokens: u64_to_i64(run.summary.token_usage.prompt_tokens),
-            cached_input_tokens: u64_to_i64(run.summary.token_usage.cached_prompt_tokens),
-            output_tokens: u64_to_i64(run.summary.token_usage.completion_tokens),
-            reasoning_output_tokens: u64_to_i64(run.summary.token_usage.reasoning_tokens),
-            total_tokens: u64_to_i64(run.summary.token_usage.total_tokens),
+            usage_json: serde_json::to_string(&run.summary.usage)?,
             history_json: run
                 .history
                 .as_ref()
@@ -186,8 +182,7 @@ impl MaiStore {
                 let mut statement = connection.prepare(
                     "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                      started_at, finished_at, status, outcome, review_event, pr, summary, error, \
-                     failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                     reasoning_output_tokens, total_tokens, history_status, history_archive_id, \
+                     failure_json, usage_json, history_status, history_archive_id, \
                      history_archived_at \
                      FROM project_review_runs WHERE project_id = ?1 AND started_at >= ?2 \
                      ORDER BY started_at DESC, id DESC LIMIT ?3 OFFSET ?4",
@@ -208,8 +203,7 @@ impl MaiStore {
                 let mut statement = connection.prepare(
                     "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                      started_at, finished_at, status, outcome, review_event, pr, summary, error, \
-                     failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                     reasoning_output_tokens, total_tokens, history_status, history_archive_id, \
+                     failure_json, usage_json, history_status, history_archive_id, \
                      history_archived_at \
                      FROM project_review_runs WHERE project_id = ?1 \
                      ORDER BY started_at DESC, id DESC LIMIT ?2 OFFSET ?3",

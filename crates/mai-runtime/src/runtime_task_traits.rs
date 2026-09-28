@@ -281,6 +281,9 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
                         task_id: Some(request.environment_id),
                         project_id: None,
                         role: Some(AgentRole::Planner),
+                        review_run_id: None,
+                        profile_id: AgentRole::Planner.to_string(),
+                        workspace: None,
                     },
                 )
                 .await?

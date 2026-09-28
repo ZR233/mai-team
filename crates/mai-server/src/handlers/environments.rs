@@ -47,11 +47,11 @@ pub(crate) async fn send_message(
     Path(id): Path<EnvironmentId>,
     Json(request): Json<SendMessageRequest>,
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
-    let turn_id = state
+    let input_id = state
         .runtime
         .send_environment_message(id, request.message, request.skill_mentions)
         .await?;
-    Ok(Json(SendMessageResponse { turn_id }))
+    Ok(Json(SendMessageResponse { input_id }))
 }
 
 pub(crate) async fn list_artifacts(

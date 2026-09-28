@@ -1,137 +1,95 @@
+//! mai 产品 Thread 的工具装配入口。
+//!
+//! 该模块把 mai 已经解析好的 Agent、工作区后端与配置结果装配成 `ThreadSpec` 需要的
+//! `Vec<pl_model::runtime::HostedTool>` 与 `Vec<pl_core::tool::opaque::Registration>`。
+//! 模型路由、provider 能力判定与 Web Search 规划仍由 mai 自己负责；这里不读取配置，
+//! 也不重新实现任何 pl-tool 已经提供的工具。
+
 use std::sync::Arc;
 
 use mai_protocol::AgentId;
-use pl_core::{
-    AgentExecutionPolicy, AgentRuntimeHandle, AgentToolSet, CoreRuntimeProfile,
-    ThreadId as FrameworkThreadId, ToolGroupId, TurnEngine, TurnEngineBuilder,
-};
+use pl_core::tool::opaque::Registration;
+use pl_tool::skill::FrozenSkillCatalog;
 
 use crate::state::AgentRecord;
+use crate::tools::git::NativeGitToolRuntime;
+use crate::turn::tool_sets::{
+    MaiSearchBinding, SearchVisibility, ThreadCollaborationTools, ThreadToolCatalog,
+    ThreadWorkspaceTools, skill_registrations, standard_registrations,
+};
 use crate::{AgentRuntime, Result};
 
-/// mai-team 产品动作工具的原生工具组标识。
-pub(crate) const PRODUCT_TOOL_GROUP: &str = "mai-product";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 协作工具是否对本 Thread 可见。
 pub(crate) enum CollaborationAvailability {
-    Enabled,
+    /// 挂载协作工具组；父子关系与角色许可由 host 实现判定。
+    Enabled(Arc<dyn ThreadCollaborationTools>),
+    /// 不挂载协作工具组。
     Disabled,
 }
 
-pub(crate) struct MaiFrameworkKernelBuildContext {
+/// mai 侧一次 Thread 工具装配的全部输入。
+///
+/// `workspace`、`git` 与 `mcp` 的物理资源由各自迁移方构造；`search` 是 mai 配置层已经
+/// 规划好的搜索绑定。装配产物中的每个注册项只能转移给一个 Thread。
+pub(crate) struct MaiThreadToolContext {
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) agent: Arc<AgentRecord>,
     pub(crate) agent_id: AgentId,
-    pub(crate) framework_agent_id: FrameworkThreadId,
-    pub(crate) framework_runtime: AgentRuntimeHandle,
-    pub(crate) policy: AgentExecutionPolicy,
-    pub(crate) workspace: pl_core::AgentWorkspace,
-    pub(crate) profiles: Vec<pl_protocol::AgentProfileSnapshot>,
-    pub(crate) agent_tools: AgentToolSet,
-    pub(crate) skill_catalog: Option<Arc<pl_core::skill::FrozenSkillCatalog>>,
-    pub(crate) exclusive_web_search: bool,
+    pub(crate) workspace: Arc<dyn ThreadWorkspaceTools>,
+    pub(crate) git: Option<NativeGitToolRuntime>,
+    pub(crate) skill_catalog: Option<Arc<FrozenSkillCatalog>>,
+    pub(crate) mcp: Vec<Registration>,
     pub(crate) collaboration: CollaborationAvailability,
+    pub(crate) search: MaiSearchBinding,
 }
 
-/// 为 PL Agent Runtime 构造 mai turn engine。
+/// 装配一个 Thread 的完整工具目录。
 ///
-/// 每个产品 Agent 只绑定一个持久 `AgentToolSet`。产品、技能与协作能力都以原生工具组
-/// 安装；exclusive Web Search 直接卸载其余组，不保留名称过滤或双路径注册。
-pub(crate) async fn build_mai_turn_engine(
-    builder: TurnEngineBuilder,
-    runtime_profile: CoreRuntimeProfile,
-    ctx: MaiFrameworkKernelBuildContext,
-) -> Result<TurnEngine> {
-    let mut engine = builder
-        .with_agent_tool_set(ctx.agent_tools.clone())
-        .with_runtime_profile(runtime_profile)
-        .build();
-    if ctx.exclusive_web_search {
-        for group in [
-            "builtin",
-            PRODUCT_TOOL_GROUP,
-            "skills",
-            "collaboration",
-            "mcp",
-        ] {
-            engine.agent_tools().uninstall(&ToolGroupId::new(group));
-        }
-        return Ok(engine);
+/// `SearchVisibility::Exclusive` 时只保留搜索工具与 provider 托管声明，其它本地工具组
+/// 与协作工具都不挂载；这是旧引擎“卸载其余工具组”语义的等价实现。
+pub(crate) async fn assemble_thread_tools(ctx: MaiThreadToolContext) -> Result<ThreadToolCatalog> {
+    let MaiThreadToolContext {
+        runtime,
+        agent,
+        agent_id,
+        workspace,
+        git,
+        skill_catalog,
+        mcp,
+        collaboration,
+        search,
+    } = ctx;
+    let MaiSearchBinding {
+        hosted_tools,
+        registrations: search_registrations,
+        visibility,
+    } = search;
+    let mut catalog = ThreadToolCatalog::new();
+    for tool in hosted_tools {
+        catalog.push_hosted(tool);
+    }
+    catalog.extend(search_registrations);
+    if visibility == SearchVisibility::Exclusive {
+        return Ok(catalog);
     }
 
-    let summary = ctx.agent.summary.read().await.clone();
-    let workspace_root = ctx.workspace.root().to_string_lossy().into_owned();
-    let workspace_backend = Arc::new(super::container::MaiContainerBackend::new(
-        ctx.runtime.clone(),
-        ctx.agent_id,
-    ));
-    let workspace_file_backend = Arc::new(super::workspace_file::MaiWorkspaceFileBackend::new(
-        workspace_backend,
-        &ctx.workspace,
-    ));
-    let command_backend = Arc::new(super::command::MaiCommandBackend::new(
-        ctx.runtime.clone(),
-        ctx.agent_id,
-        &workspace_root,
-    ));
-    let git_runtime =
-        crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent).await?;
-    let capabilities =
-        pl_core::ToolCapabilityConfig::hosted_workspace().with_git(git_runtime.is_some());
-    let installer = pl_core::BuiltinToolInstaller::host_provided(capabilities)
-        .with_command_backend(command_backend)
-        .with_workspace_file_backend(workspace_file_backend);
-    if let Some(git_runtime) = git_runtime {
-        installer
-            .with_git_tools(
-                git_runtime.config,
-                git_runtime.backend,
-                git_runtime.credential_provider,
-            )
-            .install_agent_workspace(&mut engine, ctx.workspace.clone(), None)
-            .await?;
-    } else {
-        installer
-            .install_agent_workspace(&mut engine, ctx.workspace.clone(), None)
-            .await?;
+    catalog.extend(workspace.command_registrations()?);
+    catalog.extend(workspace.workspace_file_registrations()?);
+    if let Some(git) = git {
+        catalog.extend(git.registrations(workspace.tool_workspace().authorization())?);
     }
-
-    let product_tools = super::product_tools::MaiProductTools::new(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-    )
-    .tools(&summary)?;
-    engine
-        .agent_tools()
-        .install(ToolGroupId::new(PRODUCT_TOOL_GROUP), product_tools)?;
-    if let Some(catalog) = ctx.skill_catalog {
-        engine.install_skill_tools_from_catalog(catalog, pl_core::SkillToolMode::ReadOnly)?;
-    } else {
-        engine.agent_tools().uninstall(&ToolGroupId::new("skills"));
+    if let Some(skill_catalog) = skill_catalog {
+        catalog.extend(skill_registrations(&skill_catalog)?);
     }
-
-    match ctx.collaboration {
-        CollaborationAvailability::Enabled => {
-            let collaboration = pl_core::AgentCollaborationTools::new(
-                ctx.framework_runtime,
-                ctx.framework_agent_id,
-                pl_core::AgentCollaborationToolConfig {
-                    policy: ctx.policy.collaboration,
-                    session_runtime: engine.tool_session_runtime(),
-                    workspace_root: ctx.workspace.project_root().to_path_buf(),
-                    profiles: ctx.profiles,
-                },
-            );
-            engine
-                .agent_tools()
-                .install(ToolGroupId::new("collaboration"), collaboration.tools())?;
-        }
-        CollaborationAvailability::Disabled => {
-            engine
-                .agent_tools()
-                .uninstall(&ToolGroupId::new("collaboration"));
-        }
+    catalog.extend(mcp);
+    let summary = agent.summary.read().await.clone();
+    let product_tools = super::product_tools::MaiProductTools::new(runtime, agent, agent_id)
+        .registrations(&summary)?;
+    catalog.extend(product_tools);
+    catalog.extend(standard_registrations()?);
+    match collaboration {
+        CollaborationAvailability::Enabled(host) => catalog.extend(host.registrations()?),
+        CollaborationAvailability::Disabled => {}
     }
-    Ok(engine)
+    Ok(catalog)
 }

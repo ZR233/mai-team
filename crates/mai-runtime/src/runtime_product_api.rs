@@ -106,18 +106,29 @@ impl AgentRuntime {
             .resolve_role_provider_selection(AgentRole::Planner, None, None)
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let client = pl_core::ModelTurnClient::from_route(&selection)?;
-        let session =
-            pl_core::AgentSession::from_messages(vec![pl_core::user_text_message(message)]);
-        let request =
-            pl_core::ModelTurnRequest::from_route(&selection).with_instructions(instructions);
+        let client = pl_model::runtime::ModelTurnClient::from_route(&selection)?;
+        let input = vec![pl_model::completion::ModelContextItem::from(
+            pl_model::completion::Message {
+                role: pl_model::completion::MessageRole::User,
+                content: pl_model::completion::MessageContent::text(message),
+                presentation: Default::default(),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_result: None,
+                metadata: Default::default(),
+            },
+        )];
+        let request = pl_model::runtime::ModelTurnRequest::from_route(&selection)
+            .with_instructions(instructions);
         let title = client
             .complete_text(
-                &session,
+                &input,
                 request,
-                pl_core::ModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+                pl_model::runtime::ModelTurnOptions::default()
+                    .with_cancellation(CancellationToken::new()),
             )
-            .await?;
+            .await
+            .map_err(|error| RuntimeError::Model(error.into()))?;
         let title = title.trim().to_string();
         if title.is_empty() {
             return Ok("New Task".to_string());

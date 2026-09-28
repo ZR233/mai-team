@@ -56,11 +56,11 @@ pub(crate) async fn send_message(
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid product Thread id `{thread_id}`: {error}"),
     })?;
-    let turn_id = state
+    let input_id = state
         .runtime
         .send_message(agent_id, request.message, request.skill_mentions)
         .await?;
-    Ok(Json(SendMessageResponse { turn_id }))
+    Ok(Json(SendMessageResponse { input_id }))
 }
 
 pub(crate) async fn events(

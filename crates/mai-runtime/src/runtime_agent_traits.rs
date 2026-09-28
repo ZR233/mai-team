@@ -49,16 +49,10 @@ impl agents::AgentPurgeOps for AgentRuntime {
 
 impl agents::AgentDeleteOps for AgentRuntime {
     async fn close_canonical_agent(&self, agent_id: AgentId) -> Result<()> {
-        self.ensure_framework_agent(agent_id).await?;
+        // 只撤销当前 agent 的订阅；typed close 语义由 `close_thread` 保留，关闭失败时
+        // 驻留 owner 仍在，调用方可对同一 id 重试。
         self.state.thread_subscriptions.invalidate(agent_id).await;
-        match self
-            .framework_handle()?
-            .retire(agent_host::canonical_id(agent_id)?)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) => Err(RuntimeError::InvalidInput(error.to_string())),
-        }
+        self.close_thread(agent_id).await
     }
 
     async fn close_product_agent_resources(&self, agent_id: AgentId) -> Result<()> {
@@ -164,7 +158,7 @@ impl agents::AgentUpdateOps for AgentRuntime {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> Result<pl_core::ResolvedModelRoute> {
+    ) -> Result<pl_model::config::ResolvedModelRoute> {
         self.resolve_role_provider_selection(role, provider_id, model)
             .await
     }
@@ -190,7 +184,7 @@ impl agents::AgentCreateOps for AgentRuntime {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> Result<pl_core::ResolvedModelRoute> {
+    ) -> Result<pl_model::config::ResolvedModelRoute> {
         self.resolve_role_provider_selection(role, provider_id, model)
             .await
     }

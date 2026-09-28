@@ -1,6 +1,6 @@
 export type Id = string
 
-import type { Thread, ThreadTurnHistory } from "@/events/thread-events.generated"
+import type { Thread, ThreadSnapshot, ThreadTurnHistory, Turn } from "@/events/thread-events.generated"
 
 export interface TokenUsage {
   promptTokens: number
@@ -11,47 +11,28 @@ export interface TokenUsage {
   totalTokens: number
 }
 
-export type AgentRuntimeState =
-  | { kind: "idle"; data: null }
-  | { kind: "queued"; data: { turnId: Id } }
-  | { kind: "running"; data: { turnId: Id } }
-  | { kind: "waitingTool"; data: { turnId: Id } }
-  | { kind: "waitingInteraction"; data: { turnId: Id; interactionId: string } }
-  | { kind: "cancelling"; data: { turnId: Id } }
-  | { kind: "closing"; data: null }
-  | { kind: "closed"; data: null }
-  | {
-    kind: "faulted"
-    data: {
-      error: { code: string; message: string; retryable: boolean }
-      turnId?: Id | null
-      classification: "recoverableRuntime" | "recoverableProtocol" | "aggregateCorruption" | "legacyUnknown"
-    }
-  }
-
-export interface AgentRuntimeSnapshot {
-  identity: { id: Id; parentId?: Id | null; role: string; depth: number }
-  state: AgentRuntimeState
-  pendingInputs: number
-  progress?: Record<string, unknown> | null
-  lastTurn?: Record<string, unknown> | null
-  revision: number
-  eventSequence: number
-  updatedAt: number
-}
-
 export interface AgentSummary {
   id: Id
   parent_id?: Id | null
   task_id?: Id | null
   project_id?: Id | null
   role?: string | null
+  review_run_id?: Id | null
+  profile_id?: string | null
   name: string
   resource: {
     state: "provisioning" | "ready" | "deleting" | "failed" | "deleted"
     error?: string | null
   }
-  runtime?: AgentRuntimeSnapshot | null
+  /**
+   * PL canonical Thread 快照的产品投影；资源创建或销毁窗口中可以暂时缺席。
+   *
+   * 这是 `mai_protocol::AgentSummary::runtime` 的真实形状（`ThreadSnapshot`），
+   * 不是 framework 生命周期投影。
+   */
+  runtime?: ThreadSnapshot
+  /** 由 PL typed effect 历史投影出的最近一条终态 Turn。 */
+  last_turn?: Turn
   container_id?: string | null
   docker_image?: string
   provider_id: string
@@ -60,7 +41,7 @@ export interface AgentSummary {
   reasoning_effort?: string | null
   created_at: string
   updated_at: string
-  token_usage: TokenUsage
+  usage: TokenUsage
 }
 
 export interface AgentDetail extends AgentSummary {
@@ -109,7 +90,7 @@ export interface ReviewRunSummary {
   review_event?: ReviewDecision | null
   reviewer_agent_id?: string | null
   turn_id?: string | null
-  token_usage?: TokenUsage
+  usage: TokenUsage
   history_status: ReviewHistoryStatus
   history_archive_id?: string | null
   history_archived_at?: string | null

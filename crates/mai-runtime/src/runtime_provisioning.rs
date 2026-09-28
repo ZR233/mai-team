@@ -1,5 +1,33 @@
 use super::*;
 
+use pl_protocol::AgentWorkspaceAssignmentSnapshot;
+
+/// 创建产品 Agent 记录时一并冻结的协作身份。
+///
+/// 普通创建路径使用角色的产品 Profile；协作 `spawn_agent` 用它覆盖角色 Profile，
+/// 并冻结 child 的工作区边界，使后续恢复不再依赖当时的配置。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentCreationIdentity {
+    /// child 冻结的产品 Profile id。
+    pub(crate) profile_id: Option<String>,
+    /// child 冻结的工作区边界收据。
+    pub(crate) workspace: Option<AgentWorkspaceAssignmentSnapshot>,
+}
+
+/// 一次完整的产品 Agent 创建请求。
+///
+/// 普通创建路径的 `identity` 为空；协作 `spawn_agent` 把 child 冻结的 Profile 与工作区边界一并
+/// 交给创建事务，避免创建后再补写产品事实。
+pub(crate) struct AgentCreationRequest {
+    pub(crate) agent_id: AgentId,
+    pub(crate) request: CreateAgentRequest,
+    pub(crate) container_source: agents::ContainerSource,
+    pub(crate) task_id: Option<TaskId>,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) role: Option<AgentRole>,
+    pub(crate) identity: AgentCreationIdentity,
+}
+
 impl AgentRuntime {
     pub async fn create_agent(
         self: &Arc<Self>,
@@ -40,8 +68,35 @@ impl AgentRuntime {
         self: &Arc<Self>,
         mut resource: runtime_agent_creation::PreparedAgentResource,
     ) -> Result<AgentSummary> {
-        match self.register_prepared_framework_agent(&mut resource).await {
-            Ok(()) => {
+        let registered = self.register_prepared_thread(&mut resource).await;
+        self.finish_agent_registration(resource, registered).await
+    }
+
+    /// 注册一个已经准备好产品资源的协作 child，并用调用方冻结的上下文继承装配新 Thread。
+    ///
+    /// 与普通创建唯一的区别是 Thread 的初始 context：child 先写入自己的 Profile 指令，再追加
+    /// 由 [`pl_core::context::ContextSnapshot::inherit`] 选出的调用方记录。注册失败时整棵创建
+    /// 被回滚，不会留下半成品 child。
+    pub(super) async fn register_prepared_child_agent(
+        self: &Arc<Self>,
+        mut resource: runtime_agent_creation::PreparedAgentResource,
+        caller: &pl_core::tool::opaque::CallContext,
+        inheritance: pl_core::context::ContextInheritance,
+    ) -> Result<AgentSummary> {
+        let registered = self
+            .register_prepared_child_thread(&mut resource, caller, inheritance)
+            .await;
+        self.finish_agent_registration(resource, registered).await
+    }
+
+    /// 统一收尾：注册成功后提交创建租约并公布事件，失败则回滚全部产品资源。
+    async fn finish_agent_registration(
+        self: &Arc<Self>,
+        resource: runtime_agent_creation::PreparedAgentResource,
+        registered: Result<thread_kernel::ResidentThread>,
+    ) -> Result<AgentSummary> {
+        match registered {
+            Ok(_) => {
                 let summary = resource.commit();
                 self.events
                     .publish(MaiProductEventKind::AgentCreated {
@@ -53,7 +108,7 @@ impl AgentRuntime {
             Err(error) => match resource.rollback().await {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(RuntimeError::InvalidInput(format!(
-                    "agent framework registration failed: {error}; creation rollback failed: {rollback_error}"
+                    "Thread registration failed: {error}; creation rollback failed: {rollback_error}"
                 ))),
             },
         }
@@ -68,6 +123,45 @@ impl AgentRuntime {
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
     ) -> Result<runtime_agent_creation::PreparedAgentResource> {
+        self.create_agent_resource(AgentCreationRequest {
+            agent_id,
+            request,
+            container_source,
+            task_id,
+            project_id,
+            role,
+            identity: AgentCreationIdentity::default(),
+        })
+        .await
+    }
+
+    /// 创建产品 Agent 记录与容器资源，并把冻结的 Profile 身份与工作区边界写入产品事实。
+    ///
+    /// 身份写入与容器准备同属一次创建事务：任一步失败都会走已有的创建回滚，不留下只写了一半
+    /// 产品事实的 Agent。
+    pub(super) async fn create_agent_resource(
+        self: &Arc<Self>,
+        creation: AgentCreationRequest,
+    ) -> Result<runtime_agent_creation::PreparedAgentResource> {
+        let AgentCreationRequest {
+            agent_id,
+            request,
+            container_source,
+            task_id,
+            project_id,
+            role,
+            identity,
+        } = creation;
+        // Review Thread 身份在创建前就必须进入产品事实：装配发生在
+        // review context 附加之前，后续恢复也不会再附加 context。
+        let review_run_id = container_source.review_run_id();
+        let profile_id = identity.profile_id.unwrap_or_else(|| {
+            if review_run_id.is_some() {
+                "project-reviewer".to_string()
+            } else {
+                role.unwrap_or_default().to_string()
+            }
+        });
         let created = agents::create_agent_record(
             self.as_ref(),
             request,
@@ -76,13 +170,18 @@ impl AgentRuntime {
                 task_id,
                 project_id,
                 role,
+                review_run_id,
+                profile_id,
+                workspace: identity.workspace,
             },
         )
         .await?;
         let agent_id = created.summary.id;
         let agent = created.record;
-        let mut resource =
-            runtime_agent_creation::PreparedAgentResource::new(self, created.summary);
+        let mut resource = runtime_agent_creation::PreparedAgentResource::new(
+            self,
+            agent.summary.read().await.clone(),
+        );
         let provisioning: Result<AgentSummary> = async {
             let container_source = self
                 .agent_container_source_for_project(agent_id, project_id, container_source)
@@ -148,6 +247,7 @@ impl AgentRuntime {
         let repo_path = projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string();
         Ok(match source {
             agents::ContainerSource::ProjectReviewWorkspace {
+                run_id: _,
                 target,
                 revision,
                 repository_view,

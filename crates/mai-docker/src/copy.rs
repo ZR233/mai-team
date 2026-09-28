@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use pl_core::shell_quote_word;
+use pl_tool::shell::shell_quote_word;
 use tokio::process::Command;
 
 use crate::args::{create_workspace_copy_container_args, validate_image};

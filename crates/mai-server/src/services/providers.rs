@@ -3,22 +3,21 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use mai_protocol::*;
-use mai_runtime::model_token_usage;
 #[cfg(test)]
 use mai_store::MaiStore;
-use pl_core::{
-    AgentSession, CompletionResponseSnapshot, ModelTurnClient, ModelTurnOptions, ModelTurnRequest,
-    ResolvedModelRoute, user_text_message,
+use pl_model::completion::{
+    CompletionFailure, CompletionResponseOutputSnapshot, CompletionResponseSnapshot, Message,
+    MessageContent, MessageRole, ModelContextItem,
 };
-use pl_model::ModelTransportProfile;
-use pl_protocol::PureError;
-use tokio_util::sync::CancellationToken;
+use pl_model::config::ResolvedModelRoute;
+use pl_model::model::ModelTransportProfile;
+use pl_model::runtime::{ModelTurnClient, ModelTurnOptions, ModelTurnRequest};
 
 fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn sanitize_provider_test_error(err: &PureError, api_key: &str) -> String {
+fn sanitize_provider_test_error(err: &CompletionFailure, api_key: &str) -> String {
     mai_protocol::preview(&redact_secret(&err.to_string(), api_key), 1_500)
 }
 
@@ -152,7 +151,7 @@ async fn run_provider_test(
                     transport: provider
                         .as_ref()
                         .and_then(|provider| provider.models.first())
-                        .map(|model| model.transport.clone())
+                        .map(|model| model.binding.transport.clone())
                         .unwrap_or_else(ModelTransportProfile::default),
                     model: model.unwrap_or_default(),
                     base_url: provider
@@ -172,27 +171,47 @@ async fn run_provider_test(
     let provider_name = selection.endpoint.name.clone();
     let base_url = selection.endpoint.base_url.clone();
     let api_key = selection.endpoint.bearer_token.clone().unwrap_or_default();
-    let transport = selection.model.transport.clone();
+    let transport = selection.model.binding.transport.clone();
     let model = selection.model.slug.clone();
     let tester = ProviderTester::new();
-    let response = tester.run_test(&selection, request.deep).await;
+    let response = tester
+        .run_test(
+            &selection,
+            if request.deep {
+                ProviderTestDepth::Deep
+            } else {
+                ProviderTestDepth::Single
+            },
+        )
+        .await;
     let latency_ms = elapsed_millis(started);
     match response {
-        Ok(response) => ProviderTestResult {
-            status: StatusCode::OK,
-            response: ProviderTestResponse {
-                ok: true,
-                provider_id,
-                provider_name,
-                transport,
-                model,
-                base_url,
-                latency_ms,
-                output_preview: completion_snapshot_preview(&response),
-                usage: Some(model_token_usage(response.usage())),
-                error: None,
-            },
-        },
+        Ok(response) => {
+            let usage = response.accounting().usage.totals();
+            ProviderTestResult {
+                status: StatusCode::OK,
+                response: ProviderTestResponse {
+                    ok: true,
+                    provider_id,
+                    provider_name,
+                    transport,
+                    model,
+                    base_url,
+                    latency_ms,
+                    output_preview: completion_snapshot_preview(&response),
+                    usage: Some(TokenUsageSnapshot {
+                        prompt_tokens: usage.prompt_tokens,
+                        cached_prompt_tokens: usage.cached_prompt_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        total_tokens: usage.total_tokens,
+                        ..TokenUsageSnapshot::default()
+                    }),
+                    error: None,
+                },
+            }
+        }
         Err(err) => ProviderTestResult {
             status: StatusCode::OK,
             response: ProviderTestResponse {
@@ -213,6 +232,11 @@ async fn run_provider_test(
 
 pub(crate) struct ProviderTester;
 
+pub(crate) enum ProviderTestDepth {
+    Single,
+    Deep,
+}
+
 impl ProviderTester {
     pub(crate) fn new() -> Self {
         Self
@@ -221,29 +245,28 @@ impl ProviderTester {
     pub(crate) async fn run_test(
         &self,
         selection: &ResolvedModelRoute,
-        deep: bool,
-    ) -> std::result::Result<CompletionResponseSnapshot, PureError> {
-        if deep {
-            self.run_deep_test(selection).await
-        } else {
-            self.run_single_test(selection).await
+        depth: ProviderTestDepth,
+    ) -> std::result::Result<CompletionResponseSnapshot, CompletionFailure> {
+        match depth {
+            ProviderTestDepth::Single => self.run_single_test(selection).await,
+            ProviderTestDepth::Deep => self.run_deep_test(selection).await,
         }
     }
 
     async fn run_single_test(
         &self,
         selection: &ResolvedModelRoute,
-    ) -> std::result::Result<CompletionResponseSnapshot, PureError> {
-        let session = AgentSession::from_messages(vec![user_text_message("ping")]);
+    ) -> std::result::Result<CompletionResponseSnapshot, CompletionFailure> {
         let client = ModelTurnClient::from_route(selection)?;
+        let input = vec![provider_test_input(MessageRole::User, "ping")];
         client
             .complete(
-                &session,
+                &input,
                 provider_test_request(
                     selection,
                     "You are a provider connectivity test. Reply with exactly: ok",
                 ),
-                ModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+                ModelTurnOptions::default(),
             )
             .await
     }
@@ -251,28 +274,33 @@ impl ProviderTester {
     async fn run_deep_test(
         &self,
         selection: &ResolvedModelRoute,
-    ) -> std::result::Result<CompletionResponseSnapshot, PureError> {
+    ) -> std::result::Result<CompletionResponseSnapshot, CompletionFailure> {
         let client = ModelTurnClient::from_route(selection)?;
-        let mut session = AgentSession::from_messages(vec![user_text_message(
+        let mut input = vec![provider_test_input(
+            MessageRole::User,
             "Provider deep connectivity test, step 1. Reply exactly: ok",
-        )]);
+        )];
         let instructions = "You are a provider connectivity test. Reply with exactly: ok";
         let first = client
             .complete(
-                &session,
+                &input,
                 provider_test_request(selection, instructions),
-                ModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+                ModelTurnOptions::default(),
             )
             .await?;
-        session.push_assistant_response(completion_snapshot_text(&first), None);
-        session.push_user_prompt(
-            "Provider deep connectivity test, step 2. Reply exactly: ok".to_string(),
-        );
+        input.push(provider_test_input(
+            MessageRole::Assistant,
+            completion_snapshot_text(&first),
+        ));
+        input.push(provider_test_input(
+            MessageRole::User,
+            "Provider deep connectivity test, step 2. Reply exactly: ok",
+        ));
         client
             .complete(
-                &session,
+                &input,
                 provider_test_request(selection, instructions),
-                ModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+                ModelTurnOptions::default(),
             )
             .await
     }
@@ -282,11 +310,24 @@ fn provider_test_request(selection: &ResolvedModelRoute, instructions: &str) -> 
     ModelTurnRequest::from_route(selection).with_instructions(instructions)
 }
 
+/// 构造 provider 连通性测试所需的最小可见文本上下文。
+fn provider_test_input(role: MessageRole, text: impl Into<String>) -> ModelContextItem {
+    ModelContextItem::from(Message {
+        role,
+        content: MessageContent::text(text),
+        presentation: Default::default(),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_result: None,
+        metadata: Default::default(),
+    })
+}
+
 fn completion_snapshot_text(response: &CompletionResponseSnapshot) -> String {
     response
         .output()
         .iter()
-        .filter_map(pl_core::CompletionResponseOutputSnapshot::as_message)
+        .filter_map(CompletionResponseOutputSnapshot::as_message)
         .collect::<Vec<_>>()
         .join("")
 }
@@ -312,7 +353,7 @@ pub(crate) async fn provider_test_store(
     let provider_id = provider.id.clone();
     let selected_model = match &provider.source {
         ProviderConfigSource::Preset { preset_id, .. } => {
-            let preset = pl_core::builtin_provider_catalog()
+            let preset = pl_model::config::builtin_provider_catalog()
                 .presets
                 .into_iter()
                 .find(|preset| preset.id.as_str() == preset_id)
@@ -334,9 +375,9 @@ pub(crate) async fn provider_test_store(
     };
     let effort = selected_model
         .default_effort()
-        .map(pl_core::ReasoningEffort::new);
-    let route = pl_core::ModelRouteConfig {
-        provider: pl_core::ProviderId::new(&provider_id).expect("provider id"),
+        .map(pl_model::config::ReasoningEffort::new);
+    let route = pl_model::config::ModelRouteConfig {
+        provider: pl_model::config::ProviderId::new(&provider_id).expect("provider id"),
         model: selected_model.slug,
         effort,
     };
@@ -368,6 +409,7 @@ pub(crate) async fn provider_test_store(
         mai_runtime::RuntimeConfig {
             repo_root: dir.path().to_path_buf(),
             projects_root: dir.path().join("projects"),
+            sessions_root: dir.path().join("sessions"),
             cache_root: dir.path().join("cache"),
             artifact_files_root: dir.path().join("artifacts/files"),
             sidecar_image: "unused-sidecar".to_string(),
@@ -384,7 +426,7 @@ pub(crate) async fn provider_test_store(
 
 #[cfg(test)]
 pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> ProviderConfig {
-    let mut model = pl_core::builtin_provider_catalog()
+    let mut model = pl_model::config::builtin_provider_catalog()
         .presets
         .into_iter()
         .find(|preset| preset.id.as_str() == "openai")
@@ -395,9 +437,9 @@ pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> Provider
         .into_iter()
         .find(|model| model.slug == "gpt-5.5")
         .expect("gpt-5.5 model");
-    model.transport = pl_model::ModelTransportProfile::responses_http();
-    let mut config = pl_core::ProviderConfig::from_explicit_models(
-        pl_model::ProviderEndpoint::openai(Some(base_url.to_string())),
+    model.binding.transport = ModelTransportProfile::responses_http();
+    let mut config = pl_model::config::ProviderConfig::from_explicit_models(
+        pl_model::provider::ProviderEndpoint::openai(Some(base_url.to_string())),
         vec![model],
     );
     config.bearer_token = api_key.map(str::to_string);
@@ -411,9 +453,8 @@ pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> Provider
 mod tests {
     use super::*;
     use mai_protocol::{
-        MaiProductEventEnvelope, MaiProductEventKind, ProviderTestRequest, TokenUsage,
+        MaiProductEventEnvelope, MaiProductEventKind, ProviderTestRequest, TokenUsageSnapshot,
     };
-    use pl_model::ModelTransportProfile;
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
@@ -482,13 +523,14 @@ mod tests {
         assert_eq!(response.output_preview, "ok");
         assert_eq!(
             response.usage.expect("usage"),
-            TokenUsage {
+            TokenUsageSnapshot {
                 prompt_tokens: 4,
                 cached_prompt_tokens: 3,
                 cache_write_tokens: 0,
                 completion_tokens: 2,
                 reasoning_tokens: 2,
                 total_tokens: 6,
+                ..TokenUsageSnapshot::default()
             }
         );
         assert_eq!(response.error, None);
@@ -659,8 +701,7 @@ mod tests {
         assert!(!response.ok);
         assert_eq!(response.base_url, base_url);
         let error = response.error.expect("error");
-        assert!(error.contains("401 Unauthorized"));
-        assert!(error.contains("[redacted]"));
+        assert!(error.contains("HTTP 401"), "error: {error}");
         assert!(
             !error.contains("secret-token"),
             "provider test leaked api key: {error}"
@@ -705,7 +746,7 @@ mod tests {
         let stored_provider = config
             .models
             .providers
-            .get(&pl_core::ProviderId::new("openai").expect("provider id"))
+            .get(&pl_model::config::ProviderId::new("openai").expect("provider id"))
             .expect("stored provider");
         assert_eq!(stored_provider.bearer_token.as_deref(), Some("secret"));
         assert_eq!(

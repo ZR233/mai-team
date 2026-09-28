@@ -127,7 +127,7 @@ impl GithubGetCache {
         path: &str,
     ) -> Result<Value> {
         let key =
-            pl_core::canonical_content_hash(format!("{api_base_url}\0{path}\0{token}").as_bytes());
+            pl_core::context::content_hash(format!("{api_base_url}\0{path}\0{token}").as_bytes());
         let cached = self.state.write().await.get(&key);
         let (not_modified, etag, value) =
             retry_github_request("read cached project GitHub API", || {

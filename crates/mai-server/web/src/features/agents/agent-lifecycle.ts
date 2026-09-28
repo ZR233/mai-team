@@ -2,7 +2,7 @@ import type { AgentSummary } from "@/api/product-types"
 
 export function agentCanRunThread(agent: AgentSummary): boolean {
   if (agent.resource.state !== "ready" || !agent.runtime) return false
-  switch (agent.runtime.state.kind) {
+  switch (agent.runtime.thread.status) {
     case "idle":
     case "queued":
     case "running":
@@ -20,17 +20,17 @@ export function agentCanRunThread(agent: AgentSummary): boolean {
 export function agentPresentationStatus(agent: AgentSummary, turnStatus?: string | null): string {
   if (agent.resource.state !== "ready") return agent.resource.state
   if (!agent.runtime) return "unavailable"
-  switch (agent.runtime.state.kind) {
+  switch (agent.runtime.thread.status) {
     case "idle":
     case "queued":
     case "running":
     case "waitingTool":
     case "waitingInteraction":
     case "cancelling":
-      return turnStatus || agent.runtime.state.kind
+      return turnStatus || agent.runtime.thread.status
     case "closing":
     case "closed":
     case "faulted":
-      return agent.runtime.state.kind
+      return agent.runtime.thread.status
   }
 }

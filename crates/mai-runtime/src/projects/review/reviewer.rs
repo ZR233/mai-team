@@ -78,6 +78,7 @@ pub(crate) trait ProjectReviewerAgentOps: ProjectReviewTargetOps + Send + Sync {
     fn ensure_project_reviewer_container(
         &self,
         agent_id: AgentId,
+        run_id: Uuid,
         target: ResolvedProjectReviewTarget,
         project_revision: ProjectRepositoryRevision,
         repository_view: crate::projects::review::context::ProjectRepositoryView,
@@ -196,6 +197,7 @@ async fn prepare_project_reviewer_inner(
                 system_prompt: Some(super::project_reviewer_system_prompt(&context)),
             },
             ContainerSource::ProjectReviewWorkspace {
+                run_id,
                 target: ProjectRepositoryReviewTarget {
                     pr: target.pr,
                     head_sha: target.head_sha.clone(),
@@ -253,10 +255,10 @@ async fn prepare_project_reviewer_inner(
 
 fn project_reviewer_is_tombstone(reviewer: &AgentSummary) -> bool {
     reviewer.resource.state == AgentResourceState::Deleted
-        || reviewer
-            .runtime
-            .as_ref()
-            .is_some_and(|snapshot| matches!(snapshot.state, pl_protocol::AgentState::Closed(_)))
+        || reviewer.runtime.as_ref().is_some_and(|snapshot| {
+            snapshot.thread.archived
+                || matches!(snapshot.thread.status, pl_protocol::ThreadStatus::Closed)
+        })
 }
 
 pub(crate) async fn reviewer_belongs_to_job(
@@ -332,6 +334,7 @@ pub(crate) async fn resume_project_reviewer(
     ops.ensure_project_reviewer_thread(reviewer_id).await?;
     ops.ensure_project_reviewer_container(
         reviewer_id,
+        job_id,
         target.clone(),
         project_revision.clone(),
         context.repository_view.clone(),
@@ -422,10 +425,8 @@ mod tests {
 
     use mai_protocol::{
         AgentModelPreference, AgentResourceSnapshot, AgentResourceState, ProjectCloneStatus,
-        ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage, now,
-    };
-    use pl_protocol::{
-        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, ClosedAgentState, ThreadId,
+        ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus, ProjectSummary,
+        RuntimeUsageSnapshot, now,
     };
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
@@ -497,7 +498,7 @@ mod tests {
 
         async fn reviewer_model(&self) -> Result<AgentModelPreference> {
             Ok(AgentModelPreference {
-                provider: pl_core::ProviderId::new("provider").unwrap(),
+                provider: pl_model::config::ProviderId::new("provider").unwrap(),
                 model: "model".to_string(),
                 effort: None,
             })
@@ -614,6 +615,7 @@ mod tests {
         async fn ensure_project_reviewer_container(
             &self,
             _agent_id: mai_protocol::AgentId,
+            _run_id: Uuid,
             _target: ResolvedProjectReviewTarget,
             _project_revision: ProjectRepositoryRevision,
             _repository_view: crate::projects::review::context::ProjectRepositoryView,
@@ -722,8 +724,9 @@ mod tests {
         let mut ops = fake_reviewer_ops(PreparationFailure::Create);
         ops.reviewer_system_prompt = Some("stale reviewer".to_string());
         ops.reviewer.resource.state = AgentResourceState::Deleted;
-        ops.reviewer.runtime.as_mut().expect("runtime").state =
-            AgentState::Closed(ClosedAgentState::new());
+        let mut runtime = pl_protocol::ThreadSnapshot::empty(ops.reviewer.id.to_string());
+        runtime.thread.archived = true;
+        ops.reviewer.runtime = Some(runtime);
 
         let error = prepare_project_reviewer(
             &ops,
@@ -954,26 +957,16 @@ mod tests {
             task_id: None,
             project_id: Some(project_id),
             role: Some(role),
+            profile_id: None,
+            workspace: None,
+            review_run_id: None,
             name: role.to_string(),
             resource: AgentResourceSnapshot {
                 state: AgentResourceState::Ready,
                 error: None,
             },
-            runtime: Some(AgentSnapshot {
-                identity: AgentIdentity {
-                    id: ThreadId::new(id.to_string()).expect("thread id"),
-                    parent_id: None,
-                    role: AgentRoleId::new(role.to_string()).expect("role"),
-                    depth: 0,
-                },
-                state: AgentState::idle(),
-                pending_inputs: 0,
-                progress: None,
-                last_turn: None,
-                revision: 1,
-                event_sequence: 1,
-                updated_at: timestamp.timestamp_millis(),
-            }),
+            runtime: None,
+            last_turn: None,
             container_id: None,
             docker_image: "reviewer:latest".to_string(),
             provider_id: "provider".to_string(),
@@ -982,7 +975,7 @@ mod tests {
             reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         }
     }
 

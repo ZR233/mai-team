@@ -3,14 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mai_protocol::{SkillMetadata, SkillScope, SkillsConfigRequest, SkillsListResponse};
-use pl_core::skill::{
+use pl_tool::skill::{
     FileSystemSkillProvider, FrozenSkillCatalog, SkillDirectorySource, SkillProviderRequest,
     SkillRegistry, SkillResourceBase, SkillSourceKind,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::config::MaiSkillsConfig;
-use crate::skills::review_mode::{MaiReviewModeProvider, REVIEW_MODE_ID};
 use crate::{Result, RuntimeError};
 
 /// mai 产品层声明 Skill 来源，PL 负责发现、校验、冻结、加载与资源读取。
@@ -140,26 +139,19 @@ impl SkillCatalogService {
 
     async fn discover_with_disabled(
         &self,
-        mut disabled: Vec<String>,
+        disabled: Vec<String>,
         cancellation: CancellationToken,
     ) -> Result<Arc<FrozenSkillCatalog>> {
-        // Review Mode 是产品会话不变量，不是用户可禁用的普通 Skill。
-        disabled.retain(|name| !name.eq_ignore_ascii_case(REVIEW_MODE_ID));
         let provider = FileSystemSkillProvider::from_directories(
             "mai-filesystem-skills",
             self.sources.clone(),
         )
         .map_err(RuntimeError::Model)?;
         let registry = SkillRegistry::new();
-        let _review_mode_registration = registry
-            .register(Arc::new(
-                MaiReviewModeProvider::new().map_err(RuntimeError::Model)?,
-            ))
-            .map_err(RuntimeError::Model)?;
         let _filesystem_registration = registry
             .register(Arc::new(provider))
             .map_err(RuntimeError::Model)?;
-        let config = pl_core::SkillsConfig {
+        let config = pl_tool::skill::SkillsConfig {
             auto_learn: false,
             disabled,
             ..Default::default()
@@ -181,7 +173,7 @@ pub fn normalize_config(config: &SkillsConfigRequest) -> Result<SkillsConfigRequ
     let mut disabled = BTreeSet::new();
     for name in &config.disabled {
         let name = name.trim();
-        pl_core::skill::validate_skill_name(name).map_err(RuntimeError::Model)?;
+        pl_tool::skill::validate_skill_name(name).map_err(RuntimeError::Model)?;
         disabled.insert(name.to_string());
     }
     Ok(SkillsConfigRequest {
@@ -227,7 +219,7 @@ fn product_scope(scope: SkillSourceKind) -> SkillScope {
 
 fn skill_document_path(base: &SkillResourceBase) -> PathBuf {
     match base {
-        SkillResourceBase::Directory { path } => path.join(pl_core::skill::SKILL_FILE_NAME),
+        SkillResourceBase::Directory { path } => path.join(pl_tool::skill::SKILL_FILE_NAME),
         SkillResourceBase::Url { .. } | SkillResourceBase::Opaque { .. } => PathBuf::new(),
     }
 }
@@ -267,11 +259,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_mode_is_preloaded_only_and_cannot_be_disabled() {
+    async fn catalog_excludes_review_mode_product_instruction() {
         let root = tempfile::tempdir().unwrap();
-        let service = SkillCatalogService::with_roots(root.path(), Vec::new());
+        let project = root.path().join("project");
+        write_skill(&project, "review", "project");
+        let service =
+            SkillCatalogService::with_roots(root.path(), vec![(project, SkillScope::Project)]);
         let request = SkillsConfigRequest {
-            disabled: vec![REVIEW_MODE_ID.to_string()],
+            disabled: Vec::new(),
         };
 
         let catalog = service
@@ -282,27 +277,20 @@ mod tests {
             )
             .await
             .unwrap();
-        let definition = catalog
-            .load(
-                REVIEW_MODE_ID,
-                pl_core::skill::SkillLoadInvocation::Mode,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
 
-        assert!(catalog.snapshot().skills.is_empty());
-        assert_eq!(catalog.snapshot().modes.len(), 1);
-        assert_eq!(catalog.snapshot().modes[0].name, REVIEW_MODE_ID);
-        assert_eq!(
-            definition.content,
-            super::super::review_mode::REVIEW_MODE_CONTENT
-        );
+        // Review Mode 是产品固定指令，只包含文件系统 Skill 目录。
+        assert_eq!(catalog.snapshot().skills.len(), 1);
+        assert_eq!(catalog.snapshot().skills[0].name, "review");
+        assert!(!catalog.snapshot().skills.iter().any(|skill| {
+            skill
+                .name
+                .eq_ignore_ascii_case(crate::skills::REVIEW_MODE_ID)
+        }));
         assert!(
             catalog
                 .load(
-                    REVIEW_MODE_ID,
-                    pl_core::skill::SkillLoadInvocation::Model,
+                    crate::skills::REVIEW_MODE_ID,
+                    pl_tool::skill::SkillLoadInvocation::Model,
                     CancellationToken::new(),
                 )
                 .await
@@ -314,7 +302,7 @@ mod tests {
         let directory = root.join(name);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
-            directory.join(pl_core::skill::SKILL_FILE_NAME),
+            directory.join(pl_tool::skill::SKILL_FILE_NAME),
             format!("---\nname: {name}\ndescription: {description}\n---\nbody\n"),
         )
         .unwrap();

@@ -2,8 +2,8 @@ use std::future::Future;
 
 use mai_protocol::{
     AgentId, ProjectId, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunDetail,
-    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse, ThreadTurnHistory,
-    TokenUsage, TurnId, now,
+    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse,
+    RuntimeUsageSnapshot, ThreadTurnHistory, TurnId, now,
 };
 use mai_store::MaiStore;
 use uuid::Uuid;
@@ -12,7 +12,8 @@ use crate::{Result, RuntimeError};
 
 /// 从 reviewer 唯一拥有的 canonical Thread 读取 Run 终态快照。
 ///
-/// 实现必须读取已持久化的 Thread 文档，不能依赖异步产品投影或内存摘要。
+/// 历史来自 typed SessionHistory 的已提交 effect；用量来自同一 Thread 的 canonical 累计
+/// [`pl_core::thread::UsageSummary`]，不从旧 timeline CAS 或仍驻留的 attempts 重新聚合。
 pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
     fn snapshot(
         &self,
@@ -23,8 +24,55 @@ pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReviewRunSnapshot {
-    pub(crate) token_usage: TokenUsage,
+    pub(crate) usage: RuntimeUsageSnapshot,
     pub(crate) history: Option<ThreadTurnHistory>,
+}
+
+/// 把 PL core 的 canonical 累计用量投影成 review Run 摘要使用的产品用量快照。
+///
+/// 每个字段都是 Thread 累计摘要的绝对总量；review 不按 Turn 或 timeline 事件重新累加。
+/// 这里的映射与 `runtime_agent_api::canonical_usage` 相同；两处应合并为一个共享投影，避免核对
+/// 口径时出现漂移。
+pub(crate) fn runtime_usage_snapshot(
+    usage: &pl_core::thread::UsageSummary,
+    updated_at: i64,
+) -> RuntimeUsageSnapshot {
+    RuntimeUsageSnapshot {
+        has_incomplete_usage: usage.has_incomplete_usage,
+        model: usage.model.clone(),
+        context_window: usage.context_window,
+        latest_context_tokens: usage.latest_context_tokens,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        // 缓存未命中是有效缓存样本里未被命中的输入 token。
+        cache_miss_tokens: usage
+            .cache_input_tokens
+            .saturating_sub(usage.cache_read_tokens),
+        reasoning_tokens: usage.reasoning_tokens,
+        inference_count: usage.inference_count,
+        total_tokens: usage.total_tokens,
+        estimated_costs: usage
+            .estimated_costs
+            .iter()
+            .map(runtime_cost_amount)
+            .collect(),
+        estimated_cache_savings: usage
+            .estimated_cache_savings
+            .iter()
+            .map(runtime_cost_amount)
+            .collect(),
+        has_unpriced_usage: usage.has_unpriced_usage,
+        updated_at,
+    }
+}
+
+fn runtime_cost_amount(cost: &pl_core::thread::UsageCost) -> pl_protocol::RuntimeCostAmount {
+    pl_protocol::RuntimeCostAmount {
+        currency: cost.currency.clone(),
+        amount: cost.amount,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +137,7 @@ pub(crate) async fn record_project_review_startup_failure(
             summary: None,
             error: Some(error),
             failure: None,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
             history_status: Default::default(),
             history_archive_id: None,
             history_archived_at: None,
@@ -273,7 +321,7 @@ async fn finish_project_review_run_at(
             summary: request.summary_text,
             error: request.error,
             failure: request.failure,
-            token_usage: snapshot.token_usage,
+            usage: snapshot.usage,
             history_status: existing.summary.history_status,
             history_archive_id: existing.summary.history_archive_id,
             history_archived_at: existing.summary.history_archived_at,
@@ -556,6 +604,7 @@ mod tests {
             .summary;
         let history = ThreadTurnHistory {
             turn: Turn {
+                input_id: None,
                 id: turn_id,
                 thread_id: reviewer_agent_id.to_string(),
                 revision: 0,
@@ -593,13 +642,14 @@ mod tests {
         assert!(job.lease_owner.is_some());
         let source = FixedSnapshotSource {
             snapshot: ReviewRunSnapshot {
-                token_usage: TokenUsage {
+                usage: RuntimeUsageSnapshot {
                     prompt_tokens: 2,
                     cached_prompt_tokens: 1,
-                    cache_write_tokens: 0,
                     completion_tokens: 3,
                     reasoning_tokens: 4,
                     total_tokens: 10,
+                    updated_at: 2,
+                    ..RuntimeUsageSnapshot::default()
                 },
                 history: Some(history.clone()),
             },
@@ -629,7 +679,7 @@ mod tests {
             Some(ProjectReviewDecision::Approve),
             archived.summary.review_event
         );
-        assert_eq!(source.snapshot.token_usage, archived.summary.token_usage);
+        assert_eq!(source.snapshot.usage, archived.summary.usage);
         let completed_job = store
             .load_project_review_job(job.project_id, job.id)
             .await
@@ -657,7 +707,7 @@ mod tests {
             .expect("save non-active unfinished run");
         let source = FixedSnapshotSource {
             snapshot: ReviewRunSnapshot {
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history: Some(history),
             },
         };
@@ -777,6 +827,7 @@ mod tests {
         let recovered_at = started_at + TimeDelta::minutes(11);
         let history = ThreadTurnHistory {
             turn: Turn {
+                input_id: None,
                 id: turn_id,
                 thread_id: reviewer_agent_id.to_string(),
                 revision: 0,
@@ -792,7 +843,7 @@ mod tests {
         };
         let source = FixedSnapshotSource {
             snapshot: ReviewRunSnapshot {
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
                 history: Some(history.clone()),
             },
         };
@@ -886,6 +937,56 @@ mod tests {
                 .await
                 .expect("cleanup claim")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_usage_projects_canonical_thread_totals() {
+        let usage = pl_core::thread::UsageSummary {
+            has_incomplete_usage: true,
+            model: "test-model".to_string(),
+            context_window: Some(200_000),
+            inference_count: 3,
+            prompt_tokens: 101,
+            completion_tokens: 31,
+            cached_prompt_tokens: 23,
+            cache_write_tokens: 7,
+            reasoning_tokens: 11,
+            total_tokens: 150,
+            cache_input_tokens: 100,
+            cache_read_tokens: 20,
+            latest_context_tokens: 88,
+            has_unpriced_usage: true,
+            estimated_costs: vec![pl_core::thread::UsageCost {
+                currency: "USD".to_string(),
+                amount: 1.5,
+            }],
+            ..pl_core::thread::UsageSummary::default()
+        };
+
+        assert_eq!(
+            RuntimeUsageSnapshot {
+                has_incomplete_usage: true,
+                model: "test-model".to_string(),
+                context_window: Some(200_000),
+                latest_context_tokens: 88,
+                prompt_tokens: 101,
+                completion_tokens: 31,
+                cached_prompt_tokens: 23,
+                cache_write_tokens: 7,
+                cache_miss_tokens: 80,
+                reasoning_tokens: 11,
+                inference_count: 3,
+                total_tokens: 150,
+                estimated_costs: vec![pl_protocol::RuntimeCostAmount {
+                    currency: "USD".to_string(),
+                    amount: 1.5,
+                }],
+                estimated_cache_savings: Vec::new(),
+                has_unpriced_usage: true,
+                updated_at: 42,
+            },
+            runtime_usage_snapshot(&usage, 42)
         );
     }
 }

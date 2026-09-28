@@ -390,7 +390,7 @@ impl AgentRuntime {
                 let content = std::fs::read(host_path)?;
                 Ok(ReviewConstraintSource {
                     path: format!("{}/{}", repository_view.container_path, source.file_name),
-                    content_hash: pl_core::canonical_content_hash(&content),
+                    content_hash: pl_core::context::content_hash(&content),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -411,7 +411,7 @@ impl AgentRuntime {
                 .map(|file| file.chars().take(MAX_MANIFEST_CHANGED_FILE_CHARS).collect())
                 .collect(),
             changed_files_total: all_changed_files.len(),
-            changed_files_hash: pl_core::canonical_content_hash(changed_files_output.as_bytes()),
+            changed_files_hash: pl_core::context::content_hash(changed_files_output.as_bytes()),
             constraint_sources,
             skill_sources,
             github,
@@ -469,7 +469,7 @@ fn summarize_reviews(
             return ReviewCollectionSummary::default();
         }
     };
-    let content_hash = pl_core::canonical_content_hash(value.to_string().as_bytes());
+    let content_hash = pl_core::context::content_hash(value.to_string().as_bytes());
     let Some(items) = value.as_array() else {
         tracing::warn!(project_id = %project_id, pr, "review manifest received a non-array GitHub reviews response");
         return ReviewCollectionSummary::default();
@@ -525,7 +525,7 @@ fn summarize_checks(
             return CheckCollectionSummary::default();
         }
     };
-    let content_hash = pl_core::canonical_content_hash(value.to_string().as_bytes());
+    let content_hash = pl_core::context::content_hash(value.to_string().as_bytes());
     let Some(items) = value
         .get("check_runs")
         .and_then(serde_json::Value::as_array)

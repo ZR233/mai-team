@@ -7,7 +7,7 @@ use crate::config::MaiSkillsConfig;
 use crate::skills::SkillCatalogService;
 use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
 use mai_store::MaiStore;
-use pl_core::shell_quote_word;
+use pl_tool::shell::shell_quote_word;
 use tokio::sync::RwLock;
 
 use crate::projects::mcp::PROJECT_WORKSPACE_PATH;

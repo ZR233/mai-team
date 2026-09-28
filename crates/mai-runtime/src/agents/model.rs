@@ -1,4 +1,4 @@
-use pl_model::{
+use pl_model::model::{
     MissingCandidatePolicy, ModelInfo, ModelParameterCandidateError, ModelParameterCandidateRequest,
 };
 

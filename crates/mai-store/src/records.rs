@@ -27,6 +27,12 @@ pub(crate) struct AgentRecordRow {
     pub(crate) task_id: Option<String>,
     pub(crate) project_id: Option<String>,
     pub(crate) role: Option<String>,
+    /// 创建时冻结的 PL Agent Profile 标识；没有 Profile 的 Agent 为 NULL。
+    pub(crate) profile_id: Option<String>,
+    /// 创建时冻结的 PL workspace assignment JSON；没有 receipt 的 Agent 为 NULL。
+    pub(crate) workspace_json: Option<String>,
+    /// Review Thread 归属的 Review Run；普通项目 Agent 为 NULL，不存在回退值。
+    pub(crate) review_run_id: Option<String>,
     pub(crate) name: String,
     pub(crate) resource_state: String,
     pub(crate) resource_error: Option<String>,
@@ -39,6 +45,16 @@ pub(crate) struct AgentRecordRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) system_prompt: Option<String>,
+}
+
+/// 已删除产品 Agent 的会话清理时间表；PL 历史内容仍由 pl-core 独占。
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "retired_agent_sessions"]
+pub(crate) struct RetiredAgentSessionRecord {
+    #[key]
+    pub(crate) agent_id: String,
+    #[index]
+    pub(crate) retired_at: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -134,11 +150,7 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) failure_json: Option<String>,
-    pub(crate) input_tokens: i64,
-    pub(crate) cached_input_tokens: i64,
-    pub(crate) output_tokens: i64,
-    pub(crate) reasoning_output_tokens: i64,
-    pub(crate) total_tokens: i64,
+    pub(crate) usage_json: String,
     pub(crate) history_json: Option<String>,
     pub(crate) history_status: String,
     pub(crate) history_archive_id: Option<String>,
@@ -162,11 +174,7 @@ pub(crate) struct ProjectReviewRunSummaryRecord {
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) failure_json: Option<String>,
-    pub(crate) input_tokens: i64,
-    pub(crate) cached_input_tokens: i64,
-    pub(crate) output_tokens: i64,
-    pub(crate) reasoning_output_tokens: i64,
-    pub(crate) total_tokens: i64,
+    pub(crate) usage_json: String,
     pub(crate) history_status: String,
     pub(crate) history_archive_id: Option<String>,
     pub(crate) history_archived_at: Option<String>,
@@ -190,11 +198,7 @@ impl From<ProjectReviewRunRecord> for ProjectReviewRunSummaryRecord {
             summary: record.summary,
             error: record.error,
             failure_json: record.failure_json,
-            input_tokens: record.input_tokens,
-            cached_input_tokens: record.cached_input_tokens,
-            output_tokens: record.output_tokens,
-            reasoning_output_tokens: record.reasoning_output_tokens,
-            total_tokens: record.total_tokens,
+            usage_json: record.usage_json,
             history_status: record.history_status,
             history_archive_id: record.history_archive_id,
             history_archived_at: record.history_archived_at,
@@ -303,96 +307,6 @@ pub(crate) struct PlanHistoryRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_runtime_events"]
-pub(crate) struct ThreadRuntimeEventRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    pub(crate) sequence: i64,
-    pub(crate) created_at: i64,
-    pub(crate) event_json: String,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_runtime_traces"]
-pub(crate) struct ThreadRuntimeTraceRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    pub(crate) sequence: i64,
-    pub(crate) trace_json: String,
-}
-
-/// Thread 的 durable 阶段提交历史（`report_progress` 追加的子代理报告）。
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_submissions"]
-pub(crate) struct ThreadSubmissionRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    pub(crate) ordinal: i64,
-    pub(crate) created_at: i64,
-    pub(crate) submission_json: String,
-}
-
-/// PL ThreadActor 的 canonical durable document。
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_runtime_documents"]
-pub(crate) struct ThreadRuntimeDocumentRecord {
-    #[key]
-    pub(crate) thread_id: String,
-    pub(crate) revision: i64,
-    pub(crate) document_json: String,
-    pub(crate) snapshot_json: Option<String>,
-    pub(crate) updated_at: i64,
-}
-
-/// Thread 中可分页查询的 durable Turn。
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_turns"]
-pub(crate) struct ThreadTurnRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    pub(crate) ordinal: i64,
-    pub(crate) turn_json: String,
-    pub(crate) model_json: Option<String>,
-    pub(crate) context_disposition: String,
-}
-
-/// Thread timeline 的 typed Item 索引。
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_items"]
-pub(crate) struct ThreadItemRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    #[index]
-    pub(crate) turn_id: String,
-    pub(crate) ordinal: i64,
-    pub(crate) revision: i64,
-    pub(crate) item_json: String,
-}
-
-/// commit 后可审计的 Thread notification journal。
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "thread_notifications"]
-pub(crate) struct ThreadNotificationRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) thread_id: String,
-    pub(crate) revision: i64,
-    pub(crate) emitted_at: i64,
-    pub(crate) notification_json: String,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
 #[table = "product_events"]
 pub(crate) struct MaiProductEventRecord {
     #[key]
@@ -459,12 +373,20 @@ impl AgentRecordRow {
                 .map(parse_project_id)
                 .transpose()?,
             role: self.role.as_deref().map(parse_store_enum).transpose()?,
+            profile_id: self.profile_id,
+            workspace: self
+                .workspace_json
+                .as_deref()
+                .map(serde_json::from_str::<pl_protocol::AgentWorkspaceAssignmentSnapshot>)
+                .transpose()?,
+            review_run_id: self.review_run_id.as_deref().map(parse_uuid).transpose()?,
             name: self.name,
             resource: mai_protocol::AgentResourceSnapshot {
                 state: parse_store_enum(&self.resource_state)?,
                 error: self.resource_error,
             },
             runtime: None,
+            last_turn: None,
             container_id: self.container_id,
             docker_image: self.docker_image,
             provider_id: self.provider_id,
@@ -473,7 +395,7 @@ impl AgentRecordRow {
             reasoning_effort: self.reasoning_effort,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         })
     }
 }
@@ -650,14 +572,7 @@ impl ProjectReviewRunSummaryRecord {
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()?,
-            token_usage: TokenUsage {
-                prompt_tokens: i64_to_u64(self.input_tokens),
-                cached_prompt_tokens: i64_to_u64(self.cached_input_tokens),
-                cache_write_tokens: 0,
-                completion_tokens: i64_to_u64(self.output_tokens),
-                reasoning_tokens: i64_to_u64(self.reasoning_output_tokens),
-                total_tokens: i64_to_u64(self.total_tokens),
-            },
+            usage: serde_json::from_str(&self.usage_json)?,
             history_status: parse_store_enum(&self.history_status)?,
             history_archive_id: self.history_archive_id,
             history_archived_at: self

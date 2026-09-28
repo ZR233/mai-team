@@ -1,12 +1,13 @@
 /**
  * 时间轴渲染循环：按投影层产出的 TimelineEntry 穷尽分发。
  *
- * ThreadTimeline 是 chat 工作台的入口（接收 ThreadSnapshot）；
+ * ThreadTimeline 是 chat 工作台的入口：Thread 级状态来自权威 ThreadSnapshot，
+ * 历史 Turn/items 来自 `/threads/{id}/turns` 的 typed page，二者在这里汇合；
  * TimelineEntriesView 是共享的条目列表渲染，供 chat 与 review 活动列表
  * 复用同一分组行为。
  */
 
-import { Bot, ListChecks, LoaderCircle, Sparkles, User } from "lucide-react"
+import { Bot, LoaderCircle, Sparkles, User } from "lucide-react"
 import { useMemo } from "react"
 
 import { Markdown } from "@/components/markdown"
@@ -19,9 +20,8 @@ import { buildTimelineEntries, type TimelineEntry } from "./timeline-entries"
 import { ToolActivityRow, ToolActivityGroupView } from "./tool-activity-view"
 import { buildToolActivity } from "./tool-activity"
 
-export function ThreadTimeline({ snapshot }: { snapshot: ThreadSnapshot | null }) {
-  if (!snapshot) return <p className="py-12 text-center text-sm text-muted-foreground">No Thread activity yet.</p>
-  return <TimelineEntriesView items={snapshot.items} activeTurn={snapshot.activeTurn} progress={snapshot.runtime?.progress} />
+export function ThreadTimeline({ snapshot, items }: { snapshot: ThreadSnapshot | null; items: ThreadItem[] }) {
+  return <TimelineEntriesView items={items} activeTurn={snapshot?.activeTurn} progress={snapshot?.runtime?.progress} />
 }
 
 export function TimelineEntriesView({ items, activeTurn, progress }: { items: ThreadItem[]; activeTurn?: Turn; progress?: string }) {
@@ -56,8 +56,6 @@ function ThreadItemCard({ item }: { item: ThreadItem }) {
         : <CommentaryText text={state.data.text} status={state.data.lifecycle.kind} />
     case "thinking":
       return null
-    case "plan":
-      return <TimelineActivityRail role="group" aria-label="Plan"><article className="flex min-w-0 gap-2 px-1.5 py-1.5"><ListChecks className="mt-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><div className="flex min-w-0 flex-1 flex-col gap-1"><span className="text-xs font-medium text-muted-foreground">Plan</span><Markdown variant="auxiliary">{state.data.content}</Markdown></div></article></TimelineActivityRail>
     case "tool":
       return <ToolActivityRow activity={buildToolActivity({ ...item, state })} />
     case "skill":
@@ -65,6 +63,7 @@ function ThreadItemCard({ item }: { item: ThreadItem }) {
     case "agent":
     case "turn":
     case "inference":
+    case "raw":
     case "file":
     case "contextCompaction":
       return null

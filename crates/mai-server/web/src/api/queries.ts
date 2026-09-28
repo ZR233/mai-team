@@ -1,6 +1,7 @@
-import { queryOptions } from "@tanstack/react-query"
+import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
 
 import { api } from "@/api/client"
+import type { ThreadTurnPage } from "@/events/thread-events.generated"
 import type {
   AgentDetail,
   AgentSummary,
@@ -22,6 +23,7 @@ import type {
 export const queryKeys = {
   agents: ["agents"] as const,
   agent: (id: string) => ["agents", id] as const,
+  threadTurns: (threadId: string) => ["threads", threadId, "turns"] as const,
   environments: ["environments"] as const,
   environment: (id: string) => ["environments", id] as const,
   projects: ["projects"] as const,
@@ -63,6 +65,21 @@ export const agentQuery = (id: string) => queryOptions({
   queryKey: queryKeys.agent(id),
   queryFn: () => api<AgentDetail>(`/agents/${id}`),
   enabled: Boolean(id),
+})
+
+/**
+ * 用产品 `/threads/{id}/turns` 分页读取一个 Thread 的历史 Turn/items。
+ *
+ * 每页按 Turn 终态从新到旧返回，`nextCursor` 是本页最旧 Turn 的排他上界；把它原样
+ * 传回即可继续读取更早的一页。Thread 首帧不再携带历史 items，调用方负责按时间线顺序
+ * 归并 `pages[].turns[].items`。
+ */
+export const threadTurnsQuery = (threadId: string) => infiniteQueryOptions({
+  queryKey: queryKeys.threadTurns(threadId),
+  queryFn: ({ pageParam }) => api<ThreadTurnPage>(`/threads/${encodeURIComponent(threadId)}/turns${query({ cursor: pageParam })}`),
+  initialPageParam: undefined as string | undefined,
+  getNextPageParam: (lastPage) => lastPage.nextCursor,
+  enabled: Boolean(threadId),
 })
 
 export const environmentsQuery = () => queryOptions({

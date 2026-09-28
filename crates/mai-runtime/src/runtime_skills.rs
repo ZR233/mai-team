@@ -70,29 +70,32 @@ impl AgentRuntime {
         .await
     }
 
-    pub(super) fn skill_catalog_with_project_roots(
-        &self,
-        project_id: ProjectId,
-    ) -> SkillCatalogService {
-        self.deps
-            .skills
-            .clone_with_extra_roots(self.project_skill_roots(project_id))
-    }
-
     pub(super) async fn skill_catalog_for_agent(
         &self,
         agent: &AgentRecord,
     ) -> Result<SkillCatalogService> {
-        if let Some(context) = agent.review_context.read().await.as_ref() {
-            return Ok(self
-                .deps
-                .skills
-                .clone_with_extra_roots(projects::skills::roots(&context.skills_cache_dir)));
-        }
-        let project_id = agent.summary.read().await.project_id;
-        Ok(project_id
-            .map(|project_id| self.skill_catalog_with_project_roots(project_id))
-            .unwrap_or_else(|| self.deps.skills.clone()))
+        // Review 身份来自创建时写入的 `AgentSummary::review_run_id`；Review Context 在 Thread
+        // 装配之后才附加，因此首帧装配也要按该身份选择 Review 技能目录。
+        let review_context_skills_cache_dir = agent
+            .review_context
+            .read()
+            .await
+            .as_ref()
+            .map(|context| context.skills_cache_dir.clone());
+        let (summary_review_run_id, project_id) = {
+            let summary = agent.summary.read().await;
+            (summary.review_run_id, summary.project_id)
+        };
+        let catalog = match agent_skill_extra_roots(
+            &self.cache_root,
+            review_context_skills_cache_dir.as_deref(),
+            summary_review_run_id,
+            project_id,
+        ) {
+            Some(roots) => self.deps.skills.clone_with_extra_roots(roots),
+            None => self.deps.skills.clone(),
+        };
+        Ok(catalog)
     }
 
     pub(super) async fn project_skill_read_guard(
@@ -102,7 +105,13 @@ impl AgentRuntime {
         if agent.review_context.read().await.is_some() {
             return None;
         }
-        let project_id = agent.summary.read().await.project_id?;
+        let summary = agent.summary.read().await;
+        // Review Thread 的技能目录按 Review Run 隔离，不参与项目 sidecar 技能缓存的刷新锁。
+        if summary.review_run_id.is_some() {
+            return None;
+        }
+        let project_id = summary.project_id?;
+        drop(summary);
         let lock = self.project_skill_lock(project_id).await;
         Some(lock.read_owned().await)
     }
@@ -204,29 +213,8 @@ impl AgentRuntime {
             .await
     }
 
-    pub(super) async fn project_review_workspace_instructions_for_agent(
-        &self,
-        agent: &AgentRecord,
-    ) -> Result<Option<String>> {
-        let summary = agent.summary.read().await;
-        if summary.role != Some(AgentRole::Reviewer) {
-            return Ok(None);
-        }
-        drop(summary);
-        Ok(agent
-            .review_context
-            .read()
-            .await
-            .as_ref()
-            .map(|context| context.workspace_instructions.clone()))
-    }
-
     pub(super) fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
         projects::skills::cache_dir(&self.cache_root, project_id)
-    }
-
-    pub(super) fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
-        projects::skills::roots_for_project(&self.cache_root, project_id)
     }
 
     pub(super) fn apply_project_skill_source_paths(
@@ -419,5 +407,90 @@ impl AgentRuntime {
             source.host_path = Some(target);
         }
         Ok(sources)
+    }
+}
+
+/// Review Run 的隔离技能目录。
+///
+/// 与 `prepare_project_review_context` 在 host cache 中生成的 `skills` 目录一致：Review Thread
+/// 在 Review Context 附加前就要冻结同一目录，不能退回项目 sidecar 技能缓存。
+fn review_run_skill_roots(cache_root: &Path, run_id: Uuid) -> Vec<(PathBuf, SkillScope)> {
+    let skills_cache_dir = cache_root
+        .join(projects::review::context::PROJECT_REVIEW_CONTEXT_CACHE_DIR)
+        .join(run_id.to_string())
+        .join("skills");
+    projects::skills::roots(&skills_cache_dir)
+}
+
+/// 按 Agent 的产品身份选择本 Thread 冻结的额外 Skill 目录。
+///
+/// 顺序：已附加 Review Context 的 run 技能目录、创建时写入的 `review_run_id`（首帧装配）、
+/// 普通项目 sidecar 技能缓存、仅系统目录；`None` 表示没有额外目录。
+fn agent_skill_extra_roots(
+    cache_root: &Path,
+    review_context_skills_cache_dir: Option<&Path>,
+    summary_review_run_id: Option<Uuid>,
+    project_id: Option<ProjectId>,
+) -> Option<Vec<(PathBuf, SkillScope)>> {
+    if let Some(skills_cache_dir) = review_context_skills_cache_dir {
+        return Some(projects::skills::roots(skills_cache_dir));
+    }
+    if let Some(run_id) = summary_review_run_id {
+        return Some(review_run_skill_roots(cache_root, run_id));
+    }
+    project_id.map(|project_id| projects::skills::roots_for_project(cache_root, project_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::projects::review::context::PROJECT_REVIEW_CONTEXT_CACHE_DIR;
+    use mai_protocol::SkillScope;
+    use pretty_assertions::assert_eq;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn review_run_id_selects_isolated_review_skill_root() {
+        let cache_root = Path::new("/cache");
+        let run_id = Uuid::from_u128(1);
+        let project_id = Uuid::from_u128(2);
+
+        assert_eq!(
+            agent_skill_extra_roots(cache_root, None, Some(run_id), Some(project_id)),
+            Some(vec![(
+                cache_root
+                    .join(PROJECT_REVIEW_CONTEXT_CACHE_DIR)
+                    .join(run_id.to_string())
+                    .join("skills")
+                    .join("agents"),
+                SkillScope::Project,
+            )]),
+        );
+        assert_eq!(
+            agent_skill_extra_roots(cache_root, None, None, Some(project_id)),
+            Some(crate::projects::skills::roots_for_project(
+                cache_root, project_id,
+            )),
+        );
+        assert_eq!(agent_skill_extra_roots(cache_root, None, None, None), None);
+    }
+
+    #[test]
+    fn attached_review_context_skill_root_wins_over_summary_identity() {
+        let cache_root = Path::new("/cache");
+        let context_skills_cache_dir = Path::new("/cache/project-review-contexts/ctx/skills");
+
+        assert_eq!(
+            agent_skill_extra_roots(
+                cache_root,
+                Some(context_skills_cache_dir),
+                Some(Uuid::from_u128(9)),
+                None,
+            ),
+            Some(crate::projects::skills::roots(context_skills_cache_dir)),
+        );
     }
 }

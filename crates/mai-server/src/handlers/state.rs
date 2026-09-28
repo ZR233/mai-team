@@ -42,6 +42,8 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             GithubUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Docker(_)
             | Model(_)
+            | Thread(_)
+            | SessionStore(_)
             | Store(_)
             | ProjectReviewRunFinalization { .. }
             | Io(_)

@@ -153,7 +153,7 @@ function ReviewRecordContent({ projectId, item, detail, detailLoading, detailErr
   </div>
 }
 
-function Attempts({ projectId, attempts, usageByAttemptId }: { projectId: string; attempts: ReviewRunSummary[]; usageByAttemptId: Record<string, NonNullable<ReviewRunSummary["token_usage"]>> }) {
+function Attempts({ projectId, attempts, usageByAttemptId }: { projectId: string; attempts: ReviewRunSummary[]; usageByAttemptId: Record<string, NonNullable<ReviewRunSummary["usage"]>> }) {
   const [selected, setSelected] = useState<ReviewRunSummary | null>(() => latestReviewAttempt(attempts))
   const selectedAttempt = attempts.find((attempt) => attempt.id === selected?.id) ?? latestReviewAttempt(attempts)
   return (

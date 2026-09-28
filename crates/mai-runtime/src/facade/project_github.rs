@@ -7,16 +7,46 @@ use mai_protocol::{
     ProjectReviewFailureCategory, ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt,
     ProjectSummary, now,
 };
-use pl_core::shell_quote_word;
+use pl_tool::shell::shell_quote_word;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
+use crate::turn::product_tools::GithubApiExecution;
 use crate::{AgentRuntime, Result, RuntimeError, github, projects, redact_secret, turn};
-use pl_core::ToolResult;
 
 const INVALID_INLINE_POSITION_CODE: &str = "invalid_inline_position";
+const GITHUB_MODEL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+fn github_receipt_execution(
+    receipt: &ProjectReviewSubmissionReceipt,
+) -> Result<GithubApiExecution> {
+    let full_output = serde_json::to_string(receipt).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "failed to serialize GitHub review receipt: {error}"
+        ))
+    })?;
+    Ok(GithubApiExecution {
+        model_output: model_visible_github_output(&full_output),
+        full_output,
+    })
+}
+
+fn model_visible_github_output(output: &str) -> String {
+    if output.len() <= GITHUB_MODEL_OUTPUT_MAX_BYTES {
+        return output.to_owned();
+    }
+    let boundary = output
+        .char_indices()
+        .take_while(|(index, _)| *index < GITHUB_MODEL_OUTPUT_MAX_BYTES)
+        .last()
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    format!(
+        "{}\n[响应已截断；完整内容已保存为工具输出附件]",
+        &output[..boundary]
+    )
+}
 
 impl AgentRuntime {
     pub(crate) async fn project_git_token(&self, project_id: ProjectId) -> Result<Option<String>> {
@@ -54,7 +84,7 @@ impl AgentRuntime {
         &self,
         agent: &AgentRecord,
         request: &turn::product_tools::GithubApiRequest,
-    ) -> Result<ToolResult> {
+    ) -> Result<GithubApiExecution> {
         let method = github::normalize_github_api_method(request.method.as_str())?;
         let path = github::normalize_github_api_get_path(&request.path)?;
         let token = self
@@ -174,13 +204,7 @@ impl AgentRuntime {
                     ))
                 })?;
             if let Some(receipt) = existing.submission_receipt.clone() {
-                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
-                    |error| {
-                        RuntimeError::InvalidInput(format!(
-                            "failed to serialize GitHub review receipt: {error}"
-                        ))
-                    },
-                )?)?);
+                return github_receipt_execution(&receipt);
             }
             let had_intent = existing.submission_intent.is_some();
             let body_only_fallback_allowed = review_body_only_fallback_is_allowed(
@@ -194,26 +218,14 @@ impl AgentRuntime {
                 .record_project_review_submission_intent(intent.clone())
                 .await?;
             if let Some(receipt) = job.submission_receipt {
-                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
-                    |error| {
-                        RuntimeError::InvalidInput(format!(
-                            "failed to serialize GitHub review receipt: {error}"
-                        ))
-                    },
-                )?)?);
+                return github_receipt_execution(&receipt);
             }
             if had_intent
                 && let Some(receipt) = self
                     .reconcile_project_review_submission(&token, &project_summary, &intent)
                     .await?
             {
-                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
-                    |error| {
-                        RuntimeError::InvalidInput(format!(
-                            "failed to serialize GitHub review receipt: {error}"
-                        ))
-                    },
-                )?)?);
+                return github_receipt_execution(&receipt);
             }
             if had_intent && !body_only_fallback_allowed {
                 self.deps
@@ -245,10 +257,12 @@ impl AgentRuntime {
                     &path,
                 )
                 .await?;
-            return Ok(ToolResult::json(select_github_fields(
-                value,
-                &request.fields,
-            ))?);
+            let full_output = serde_json::to_string(&select_github_fields(value, &request.fields))
+                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+            return Ok(GithubApiExecution {
+                model_output: model_visible_github_output(&full_output),
+                full_output,
+            });
         }
         let command = if let Some(body) = &body {
             let body = serde_json::to_string(body).map_err(|err| {
@@ -321,7 +335,10 @@ impl AgentRuntime {
                 .record_project_review_submission_receipt(intent.job_id, receipt)
                 .await?;
         }
-        Ok(ToolResult::success(output.stdout))
+        Ok(GithubApiExecution {
+            model_output: model_visible_github_output(&output.stdout),
+            full_output: output.stdout,
+        })
     }
 
     pub(crate) async fn reconcile_project_review_submission(
@@ -535,7 +552,7 @@ fn review_submission_intent(
         job_id,
         head_sha: head_sha.to_string(),
         event,
-        body_hash: pl_core::canonical_content_hash(review_body.as_bytes()),
+        body_hash: pl_core::context::content_hash(review_body.as_bytes()),
         comment_count,
         created_at: now(),
     })

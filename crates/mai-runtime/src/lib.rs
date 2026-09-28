@@ -7,17 +7,16 @@ use mai_docker::{
 };
 use mai_protocol::*;
 use mai_store::{AgentLogFilter, MaiStore, ToolTraceFilter};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
-use tokio::sync::{Mutex, OnceCell, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-mod agent_host;
 mod agents;
 mod config;
 mod deps;
@@ -29,10 +28,12 @@ mod mcp;
 mod model_projection;
 mod projects;
 mod runtime_agent_api;
+mod runtime_agent_collaboration;
 mod runtime_agent_creation;
 mod runtime_agent_recovery;
 mod runtime_agent_traits;
 mod runtime_bootstrap;
+mod runtime_child_reports;
 mod runtime_config;
 mod runtime_environment;
 mod runtime_product_api;
@@ -46,9 +47,14 @@ mod runtime_task_traits;
 mod runtime_thread_events;
 mod runtime_tool_settings;
 mod runtime_workspace;
+mod session_history;
 mod skills;
 mod state;
 mod tasks;
+mod thread_host;
+mod thread_kernel;
+mod thread_projection;
+mod thread_resources;
 mod thread_subscriptions;
 mod tools;
 mod turn;
@@ -67,9 +73,7 @@ use instructions::CONTAINER_SKILLS_ROOT;
 pub use model_projection::{
     completion_response_to_model_response, completion_response_usage, model_token_usage,
 };
-use pl_core::{
-    GIT_TOKEN_ENV, git_shell_credential_prelude, git_shell_retry_function, shell_quote_word,
-};
+use pl_tool::shell::shell_quote_word;
 use projects::instructions::ProjectInstructionSourceFile;
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
@@ -90,17 +94,6 @@ const PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
 const RELAY_ENABLED_BUT_NOT_CONNECTED: &str = "relay is enabled but not connected";
 const RELAY_NOT_CONNECTED: &str = "relay is not connected";
 const SQLITE_DATABASE_LOCKED: &str = "database is locked";
-const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
-const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
-const COMPACT_PROMPT: &str = r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will continue this agent session.
-
-Include:
-- Current progress and key decisions made
-- Important context, constraints, or user preferences
-- What remains to be done as clear next steps
-- Any critical data, examples, file paths, command outputs, or references needed to continue
-
-Be concise, structured, and focused on helping the next model seamlessly continue the work."#;
 #[derive(Debug, Clone)]
 pub struct ProjectReviewQueueRequest {
     pub project_id: ProjectId,
@@ -175,6 +168,10 @@ pub enum RuntimeError {
     Model(#[from] pl_protocol::PureError),
     #[error("store error: {0}")]
     Store(#[from] mai_store::StoreError),
+    #[error("Thread error: {0}")]
+    Thread(#[from] pl_core::thread::ThreadError),
+    #[error("session storage error: {0}")]
+    SessionStore(#[from] pl_core::persistence::SessionStoreError),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("io error: {0}")]
@@ -200,6 +197,7 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 pub struct RuntimeConfig {
     pub repo_root: PathBuf,
     pub projects_root: PathBuf,
+    pub sessions_root: PathBuf,
     pub cache_root: PathBuf,
     pub artifact_files_root: PathBuf,
     pub sidecar_image: String,
@@ -210,11 +208,14 @@ pub struct RuntimeConfig {
 }
 
 pub struct AgentRuntime {
+    self_ref: OnceLock<Weak<AgentRuntime>>,
     deps: RuntimeDeps,
     state: RuntimeState,
     events: RuntimeEvents,
     mai_config: Arc<RwLock<MaiConfig>>,
-    agent_framework: OnceCell<pl_core::AgentRuntime<agent_host::MaiAgentHost>>,
+    thread_kernel: thread_kernel::ThreadKernel,
+    session_history: session_history::SessionHistory,
+    child_report_progress: Mutex<HashMap<AgentId, u64>>,
     review_discovery_scheduler: projects::review::discovery::ProjectReviewDiscoveryScheduler,
     review_ci_watch_scheduler: projects::review::ci_watch::ProjectReviewCiWatchScheduler,
     cache_root: PathBuf,
@@ -224,7 +225,6 @@ pub struct AgentRuntime {
     github_get_cache: github::GithubGetCache,
     pull_request_state_refreshes: github::PullRequestStateRefreshCoordinator,
     workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
-    tool_sets: turn::tool_sets::AgentToolSets,
 }
 
 struct ResolvedAgentModel {
@@ -232,53 +232,29 @@ struct ResolvedAgentModel {
     effective: ResolvedAgentModelPreference,
 }
 
-fn initial_thread_context(summary: &AgentSummary) -> pl_core::ThreadContextState {
-    let mut context = pl_core::ThreadContextState::empty();
-    context.metadata = pl_core::ThreadContextMetadata {
-        project_id: summary.project_id.map(|project_id| project_id.to_string()),
-        title: Some(summary.name.clone()),
-    };
-    context
-}
-
-fn framework_depth(agent_id: AgentId, agents: &HashMap<AgentId, AgentSummary>) -> u32 {
-    let mut current = agent_id;
-    let mut depth = 0_u32;
-    let mut remaining = agents.len();
-    while remaining > 0 {
-        let Some(parent_id) = agents.get(&current).and_then(|agent| agent.parent_id) else {
-            break;
-        };
-        current = parent_id;
-        depth = depth.saturating_add(1);
-        remaining -= 1;
-    }
-    depth
-}
-
 fn resolved_agent_model(
-    selection: pl_core::ResolvedModelRoute,
+    selection: pl_model::config::ResolvedModelRoute,
     reasoning_effort: Option<String>,
 ) -> ResolvedAgentModel {
     let effective = resolved_agent_model_preference(selection.clone(), reasoning_effort.clone());
     ResolvedAgentModel {
-        preference: pl_core::ModelRouteConfig {
+        preference: pl_model::config::ModelRouteConfig {
             provider: selection.provider_id.clone(),
             model: selection.model.slug.clone(),
-            effort: reasoning_effort.map(pl_core::ReasoningEffort::new),
+            effort: reasoning_effort.map(pl_model::config::ReasoningEffort::new),
         },
         effective,
     }
 }
 
 fn resolved_agent_model_preference(
-    selection: pl_core::ResolvedModelRoute,
+    selection: pl_model::config::ResolvedModelRoute,
     reasoning_effort: Option<String>,
 ) -> ResolvedAgentModelPreference {
     ResolvedAgentModelPreference {
         provider_id: selection.provider_id.to_string(),
         provider_name: selection.endpoint.name,
-        transport: selection.model.transport.clone(),
+        transport: selection.model.binding.transport.clone(),
         model: selection.model.slug,
         model_name: selection.model.display_name,
         reasoning_effort,
@@ -347,7 +323,10 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {
-    pl_core::tool::output_format::redaction::SecretRedaction::new([secret]).redact_str(value)
+    if secret.is_empty() {
+        return value.to_owned();
+    }
+    value.replace(secret, "[REDACTED]")
 }
 
 fn runtime_sidecar_image(image: String) -> String {

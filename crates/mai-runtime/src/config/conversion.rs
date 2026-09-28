@@ -4,7 +4,7 @@ use mai_protocol::{
     AgentConfigRequest, AgentRole, ProviderConfig as ApiProviderConfig, ProviderConfigSource,
     ProviderSummary, ProvidersConfigRequest, ProvidersResponse,
 };
-use pl_core::{
+use pl_model::config::{
     AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderConfig, ProviderId, ReasoningEffort,
     ResolvedModelRoute, builtin_provider_catalog,
 };
@@ -314,8 +314,9 @@ fn private_fields_mut(
 
 #[cfg(test)]
 mod tests {
-    use pl_core::{ModelCatalogId, ProviderModelCatalogConfig};
-    use pl_model::{ModelInfo, ModelTransportProfile, ProviderEndpoint};
+    use pl_model::config::{ModelCatalogId, ProviderModelCatalogConfig};
+    use pl_model::model::{ModelInfo, ModelTransportProfile};
+    use pl_model::provider::ProviderEndpoint;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -373,9 +374,10 @@ mod tests {
 
     #[test]
     fn custom_provider_round_trips_without_projection() {
-        let mut model = ModelInfo::fallback("custom-model");
-        model.used_fallback = false;
-        model.transport = ModelTransportProfile::responses_http();
+        let mut model = ModelInfo::compatible("custom-model");
+        model
+            .binding
+            .set_transport(ModelTransportProfile::responses_http());
         let mut endpoint = ProviderEndpoint::openai(Some("https://example.test/v1".to_string()));
         endpoint.name = "Custom".to_string();
         let mut provider = ProviderConfig::from_explicit_models(endpoint, vec![model]);

@@ -357,7 +357,9 @@ fn agent_workspace_should_exist(agent: &AgentSummary) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentResourceSnapshot, AgentResourceState, AgentRole, TokenUsage, now};
+    use mai_protocol::{
+        AgentResourceSnapshot, AgentResourceState, AgentRole, RuntimeUsageSnapshot, now,
+    };
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
 
@@ -545,12 +547,16 @@ mod tests {
             task_id: None,
             project_id: Some(project_id),
             role: Some(AgentRole::Executor),
+            profile_id: None,
+            workspace: None,
+            review_run_id: None,
             name: "agent".to_string(),
             resource: AgentResourceSnapshot {
                 state: AgentResourceState::Ready,
                 error: None,
             },
             runtime: None,
+            last_turn: None,
             container_id: None,
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "provider".to_string(),
@@ -559,7 +565,7 @@ mod tests {
             reasoning_effort: None,
             created_at: now,
             updated_at: now,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         }
     }
 }

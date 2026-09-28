@@ -2,7 +2,7 @@ pub(crate) mod definitions;
 mod names;
 
 #[cfg(test)]
-use pl_model::ToolSpec;
+use pl_protocol::ToolSpec;
 
 pub use names::*;
 

@@ -38,20 +38,34 @@ function completed(at = 18) {
   return { kind: "completed", data: { completedAt: at } } as const
 }
 
-function snapshot(items: ThreadItem[]): ThreadSnapshot {
-  return { schemaVersion: 7, revision: 1, thread: thread(), items, interactions: [] }
+function snapshot(): ThreadSnapshot {
+  return { schemaVersion: 14, revision: 1, thread: thread(), interactions: [] }
 }
 
 function thread(): Thread {
-  return { id: "thread-1", projectId: "", title: "thread", mode: "simple", rootThreadId: "thread-1", role: "root", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false }
+  return {
+    id: "thread-1",
+    projectId: "",
+    title: "thread",
+    mode: "mode.simple",
+    workspaceMode: "local",
+    workspacePath: "",
+    rootThreadId: "thread-1",
+    role: "root",
+    agentPath: "root",
+    status: "idle",
+    createdAt: 1,
+    updatedAt: 1,
+    archived: false,
+  }
 }
 
 describe("ThreadTimeline PL v2 原生时间线", () => {
   it("连续工具调用折叠为分组并可展开", async () => {
-    render(<ThreadTimeline snapshot={snapshot([
+    render(<ThreadTimeline snapshot={snapshot()} items={[
       toolCall("exec", succeeded(), JSON.stringify({ command: "cargo test" })),
       toolCall("read_file", succeeded(), JSON.stringify({ path: "README.md" })),
-    ])} />)
+    ]} />)
 
     expect(screen.getByText("Used 2 tools")).toBeVisible()
     expect(screen.getByText("18s")).toBeVisible()
@@ -61,10 +75,10 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
   })
 
   it("运行中的工具和思考使用各自 tagged state", () => {
-    render(<ThreadTimeline snapshot={snapshot([
+    render(<ThreadTimeline snapshot={snapshot()} items={[
       toolCall("exec", { kind: "running", data: { streamedOutput: "working" } }),
       item({ kind: "thinking", data: { content: ["still thinking"], lifecycle: { kind: "streaming", data: null } } }),
-    ])} />)
+    ]} />)
 
     expect(screen.getByText("Run command")).toBeVisible()
     expect(screen.getByText("running")).toBeVisible()
@@ -72,9 +86,9 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
   })
 
   it("完成的思考默认折叠，展开后显示内容", async () => {
-    render(<ThreadTimeline snapshot={snapshot([
+    render(<ThreadTimeline snapshot={snapshot()} items={[
       item({ kind: "thinking", data: { summary: ["Checking configuration"], content: ["details"], lifecycle: completed() } }),
-    ])} />)
+    ]} />)
 
     expect(screen.getByText("Checking configuration · 18s")).toBeVisible()
     await userEvent.click(screen.getByRole("button", { name: "Expand reasoning" }))
@@ -95,28 +109,28 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
     expect(within(response).getByText("原生 PL v2 Review 结果")).toBeVisible()
   })
 
-  it("渲染文字、计划与技能加载，并隐藏其余协议内部条目", () => {
-    render(<ThreadTimeline snapshot={snapshot([
+  it("渲染文字与技能加载，并隐藏其余协议内部条目", () => {
+    render(<ThreadTimeline snapshot={snapshot()} items={[
       item({ kind: "text", data: { channel: "user", text: "please review", lifecycle: completed() } }),
       item({ kind: "text", data: { channel: "commentary", text: "正在检查生命周期。", lifecycle: completed() } }),
-      item({ kind: "plan", data: { content: "- 核对清理边界", lifecycle: completed() } }),
       item({ kind: "skill", data: { activation: { name: "review", source: "system", providerId: "local", resourceBase: { kind: "directory", path: "/skills/review" }, turnId: "turn-1", cause: { kind: "tool", toolCallId: "call" }, activatedAt: 1 } } }),
+      item({ kind: "raw", data: { payloads: [{ format: "legacy", version: 1, content: "{}" }], notice: "unsupported codec", recordedAt: 1 } }),
       item({ kind: "file", data: { path: "secret.txt", completedAt: 1 } }),
       item({ kind: "contextCompaction", data: { beforeTokens: 10, afterTokens: 5, compactedAt: 1 } }),
-    ])} />)
+    ]} />)
 
     expect(screen.getByText("please review")).toBeVisible()
     expect(screen.getByText("正在检查生命周期。")).toBeVisible()
-    expect(screen.getByText("核对清理边界")).toBeVisible()
     expect(screen.getByRole("article", { name: "Skill loaded: review" })).toHaveTextContent("Triggered by tool · system")
     expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
+    expect(screen.queryByText("unsupported codec")).not.toBeInTheDocument()
   })
 
   it("代理过程输出与最终回复都保持主正文层级", () => {
-    render(<ThreadTimeline snapshot={snapshot([
+    render(<ThreadTimeline snapshot={snapshot()} items={[
       item({ kind: "text", data: { channel: "commentary", text: "正在检查生命周期。", lifecycle: completed() } }),
       item({ kind: "text", data: { channel: "final", text: "检查完成，没有发现阻塞问题。", lifecycle: completed() } }),
-    ])} />)
+    ]} />)
 
     const update = screen.getByRole("article", { name: "Mai Team update" })
     const response = screen.getByRole("article", { name: "Mai Team response" })
@@ -127,7 +141,7 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
   })
 
   it("仅在 canonical Turn running 状态显示尾部活动行", () => {
-    const active = snapshot([])
+    const active = snapshot()
     active.activeTurn = {
       id: "turn-1",
       threadId: "thread-1",
@@ -137,14 +151,16 @@ describe("ThreadTimeline PL v2 原生时间线", () => {
     }
     active.runtime = {
       threadId: "thread-1",
-      usage: { model: "test", latestContextTokens: 0, promptTokens: 0, completionTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, cacheMissTokens: 0, reasoningTokens: 0, inferenceCount: 0, totalTokens: 0, hasUnpricedUsage: false, updatedAt: 1 },
+      usage: { hasIncompleteUsage: false, model: "test", latestContextTokens: 0, promptTokens: 0, completionTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, inferenceCount: 0, totalTokens: 0, cacheUsage: { inputTokens: 0, cacheReadTokens: 0, hasIncompleteUsage: false }, hasUnpricedUsage: false, updatedAt: 1 },
+      turnCompletionTokens: 0,
+      turnDecodeMillis: 0,
       activeSkills: [], activeMcpServers: [], activeLspServers: [], progress: "正在执行测试", updatedAt: 1,
     }
 
-    const { rerender } = render(<ThreadTimeline snapshot={active} />)
+    const { rerender } = render(<ThreadTimeline snapshot={active} items={[]} />)
     expect(screen.getByText("Running tools")).toBeVisible()
     expect(screen.getByText(/正在执行测试/)).toBeVisible()
-    rerender(<ThreadTimeline snapshot={snapshot([])} />)
+    rerender(<ThreadTimeline snapshot={snapshot()} items={[]} />)
     expect(screen.queryByText("Running tools")).not.toBeInTheDocument()
   })
 })

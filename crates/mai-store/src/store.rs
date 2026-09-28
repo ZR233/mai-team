@@ -68,7 +68,7 @@ impl MaiStore {
             })?;
             if version.as_deref() != Some(SCHEMA_VERSION) {
                 return Err(StoreError::InvalidConfig(format!(
-                    "数据库 schema 为 {}，mai-server 仅支持 {SCHEMA_VERSION}；请先停止服务并运行 mai-migrate",
+                    "数据库 schema 为 {}，mai-server 仅支持 {SCHEMA_VERSION}；旧运行数据不再兼容，请先备份并创建新数据目录",
                     version.as_deref().unwrap_or("未标记")
                 )));
             }

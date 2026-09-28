@@ -3,13 +3,9 @@ use std::sync::Arc;
 
 use mai_docker::ExecCaptureOptions;
 use mai_protocol::{AgentId, ToolOutputArtifactInfo, now};
-use pl_core::{
+use pl_tool::container::{
     ContainerBackend, ContainerCopyFromRequest, ContainerCopyToRequest, ContainerExecOutput,
     ContainerExecRequest,
-    tool::output_format::capture::{
-        ToolOutputArtifactDescriptor, ToolOutputCapture, ToolOutputCaptureRequest,
-        ToolOutputStreamSizes,
-    },
 };
 use uuid::Uuid;
 
@@ -85,18 +81,15 @@ async fn execute_with_container_backend(
         let stdout_id = Uuid::new_v4().to_string();
         let stderr_id = Uuid::new_v4().to_string();
         let namespace = agent_id.to_string();
-        let capture = ToolOutputCapture::prepare(
-            ToolOutputCaptureRequest::new(
-                artifact_files_root,
-                &call_id,
-                &stdout_id,
-                &stderr_id,
-                &request.command,
-            )
-            .with_namespace(&namespace),
+        let capture = MaiToolOutputCapture::prepare(
+            artifact_files_root,
+            &namespace,
+            &call_id,
+            &stdout_id,
+            &stderr_id,
+            &request.command,
         )
-        .await
-        .map_err(runtime_invalid_input)?;
+        .await?;
         let output = docker
             .exec_shell_captured_with_cancel(
                 &container_id,
@@ -112,13 +105,14 @@ async fn execute_with_container_backend(
             )
             .await?;
         let artifacts = capture
-            .collect_artifacts(ToolOutputStreamSizes::new(
-                output.stdout_bytes,
-                output.stderr_bytes,
-            ))
-            .await
-            .map_err(runtime_invalid_input)?;
-        let artifacts = artifact_records_from_descriptors(agent_id, artifacts);
+            .collect_artifacts(
+                agent_id,
+                MaiToolOutputStreamSizes {
+                    stdout_bytes: output.stdout_bytes,
+                    stderr_bytes: output.stderr_bytes,
+                },
+            )
+            .await?;
         let output_artifacts = artifacts
             .iter()
             .map(serde_json::to_value)
@@ -190,23 +184,211 @@ async fn copy_to_container_backend(
     Ok(())
 }
 
-pub(super) fn artifact_records_from_descriptors(
-    agent_id: AgentId,
-    descriptors: Vec<ToolOutputArtifactDescriptor>,
-) -> Vec<ToolOutputArtifactInfo> {
-    let created_at = now();
-    descriptors
-        .into_iter()
-        .map(|descriptor| ToolOutputArtifactInfo {
-            id: descriptor.id().to_string(),
-            call_id: descriptor.call_id().to_string(),
-            agent_id,
-            name: descriptor.name().to_string(),
-            stream: descriptor.stream().as_str().to_string(),
-            size_bytes: descriptor.size_bytes(),
-            created_at,
+/// 单个输出流的累计原始字节数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MaiToolOutputStreamSizes {
+    pub(super) stdout_bytes: u64,
+    pub(super) stderr_bytes: u64,
+}
+
+/// Mai 侧容器命令输出的 artifact 捕获。
+///
+/// pl-core 原有的 `tool::output_format::capture` 已整体删除，Mai 仍需为统一命令 backend
+/// 与容器 exec 保留同一套 artifact 语义：stdout/stderr 各自一个宿主文件，路径布局保持
+/// `tool-output/<namespace>/<call>/<artifact>/<name>`，空流在收集时删除、不生成 artifact。
+/// 这里只实现 Mai 需要的这部分边界，不复制 PL 的通用命令/文件工具。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MaiToolOutputCapture {
+    call_id: String,
+    stdout: MaiToolOutputStreamCapture,
+    stderr: MaiToolOutputStreamCapture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaiToolOutputStreamCapture {
+    id: String,
+    name: String,
+    stream: MaiToolOutputStream,
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaiToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl MaiToolOutputStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+impl MaiToolOutputCapture {
+    /// 准备 stdout/stderr 的捕获文件路径并创建其父目录。
+    pub(super) async fn prepare(
+        artifact_files_root: &Path,
+        namespace: &str,
+        call_id: &str,
+        stdout_id: &str,
+        stderr_id: &str,
+        command: &str,
+    ) -> Result<Self> {
+        let stdout_name = tool_output_file_name(command, MaiToolOutputStream::Stdout);
+        let stderr_name = tool_output_file_name(command, MaiToolOutputStream::Stderr);
+        let stdout_path = tool_output_artifact_file_path(
+            artifact_files_root,
+            namespace,
+            call_id,
+            stdout_id,
+            &stdout_name,
+        );
+        let stderr_path = tool_output_artifact_file_path(
+            artifact_files_root,
+            namespace,
+            call_id,
+            stderr_id,
+            &stderr_name,
+        );
+        if let Some(parent) = stdout_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if let Some(parent) = stderr_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Ok(Self {
+            call_id: call_id.to_string(),
+            stdout: MaiToolOutputStreamCapture {
+                id: stdout_id.to_string(),
+                name: stdout_name,
+                stream: MaiToolOutputStream::Stdout,
+                path: stdout_path,
+            },
+            stderr: MaiToolOutputStreamCapture {
+                id: stderr_id.to_string(),
+                name: stderr_name,
+                stream: MaiToolOutputStream::Stderr,
+                path: stderr_path,
+            },
         })
-        .collect()
+    }
+
+    pub(super) fn stdout_path(&self) -> &Path {
+        &self.stdout.path
+    }
+
+    pub(super) fn stderr_path(&self) -> &Path {
+        &self.stderr.path
+    }
+
+    /// 依据每个流的实际写入字节数生成 artifact 记录，并清理空流文件。
+    pub(super) async fn collect_artifacts(
+        &self,
+        agent_id: AgentId,
+        sizes: MaiToolOutputStreamSizes,
+    ) -> Result<Vec<ToolOutputArtifactInfo>> {
+        let created_at = now();
+        let mut artifacts = Vec::new();
+        push_or_remove_artifact(
+            &mut artifacts,
+            agent_id,
+            &self.call_id,
+            &self.stdout,
+            sizes.stdout_bytes,
+            created_at,
+        )
+        .await;
+        push_or_remove_artifact(
+            &mut artifacts,
+            agent_id,
+            &self.call_id,
+            &self.stderr,
+            sizes.stderr_bytes,
+            created_at,
+        )
+        .await;
+        Ok(artifacts)
+    }
+}
+
+async fn push_or_remove_artifact(
+    artifacts: &mut Vec<ToolOutputArtifactInfo>,
+    agent_id: AgentId,
+    call_id: &str,
+    capture: &MaiToolOutputStreamCapture,
+    size_bytes: u64,
+    created_at: chrono::DateTime<chrono::Utc>,
+) {
+    if size_bytes > 0 {
+        artifacts.push(ToolOutputArtifactInfo {
+            id: capture.id.clone(),
+            call_id: call_id.to_string(),
+            agent_id,
+            name: capture.name.clone(),
+            stream: capture.stream.as_str().to_string(),
+            size_bytes,
+            created_at,
+        });
+    } else {
+        let _ = tokio::fs::remove_file(&capture.path).await;
+    }
+}
+
+/// 计算一个工具输出 artifact 的宿主文件路径。
+///
+/// 布局必须与宿主侧按 `(call_id, artifact_id, name)` 反查 artifact 的逻辑一致，
+/// 因此这里是 Mai 唯一的 artifact 路径来源。
+pub(crate) fn tool_output_artifact_file_path(
+    artifact_files_root: &Path,
+    namespace: &str,
+    call_id: &str,
+    artifact_id: &str,
+    name: &str,
+) -> std::path::PathBuf {
+    let mut dir = artifact_files_root.join("tool-output");
+    let namespace = safe_path_component(namespace);
+    if !namespace.is_empty() {
+        dir = dir.join(namespace);
+    }
+    dir.join(safe_path_component_or(call_id, "tool-call"))
+        .join(safe_path_component_or(artifact_id, "artifact"))
+        .join(safe_path_component_or(name, "output.txt"))
+}
+
+fn tool_output_file_name(command: &str, stream: MaiToolOutputStream) -> String {
+    let command = command
+        .split_whitespace()
+        .next()
+        .map(safe_path_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "command".to_string());
+    format!("{command}-{}.txt", stream.as_str())
+}
+
+fn safe_path_component(raw: &str) -> String {
+    let value = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    value.trim_matches('.').trim_matches('_').to_string()
+}
+
+fn safe_path_component_or(raw: &str, fallback: &str) -> String {
+    let safe = safe_path_component(raw);
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
 }
 
 fn runtime_invalid_input(error: impl std::fmt::Display) -> RuntimeError {

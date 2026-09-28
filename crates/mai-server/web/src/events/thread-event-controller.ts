@@ -1,11 +1,17 @@
 import type { ThreadSubscriptionUpdate } from "@/events/thread-events.generated"
-import { isItemDelta, type ThreadStore } from "@/events/thread-store"
+import type { ThreadStore } from "@/events/thread-store"
 
 const reconnectDelays = [500, 1_000, 2_000, 4_000, 8_000, 10_000] as const
 
+/**
+ * 一条 Thread 的 SSE 订阅控制器。
+ *
+ * 权威首帧（`snapshot` 事件）替换整个产品状态；其后每一帧（`notification` 事件）都是
+ * typed 通知，按新水位拼接到快照上。`lagged` 帧与任何投影错误都不进入 reducer，而是让
+ * 当前 generation 失效并重新订阅，回到权威首帧。
+ */
 export class ThreadEventController {
   private source: EventSource | null = null
-  private animationFrame: number | null = null
   private reconnectTimer: number | null = null
   private reconnectAttempt = 0
 
@@ -46,8 +52,6 @@ export class ThreadEventController {
   disconnect() {
     this.source?.close()
     this.source = null
-    if (this.animationFrame !== null) cancelAnimationFrame(this.animationFrame)
-    this.animationFrame = null
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
   }
@@ -69,30 +73,8 @@ export class ThreadEventController {
           this.resubscribe(generation, `Thread stream lagged by ${update.notification.notification.dropped}`)
           return
         }
-        if (isItemDelta(update.notification)) {
-          this.store.getState().bufferDelta(generation, update.notification)
-          this.scheduleFlush(generation)
-        } else {
-          this.flush(generation)
-          this.store.getState().apply(generation, update.notification)
-        }
+        this.store.getState().apply(generation, update.notification)
     }
-  }
-
-  private scheduleFlush(generation: number) {
-    if (this.animationFrame !== null) return
-    this.animationFrame = requestAnimationFrame(() => {
-      this.animationFrame = null
-      try {
-        this.flush(generation)
-      } catch (error) {
-        this.resubscribe(generation, error instanceof Error ? error.message : "Invalid Item delta")
-      }
-    })
-  }
-
-  private flush(generation: number) {
-    this.store.getState().flushDeltas(generation)
   }
 
   private resubscribe(generation: number, message: string) {

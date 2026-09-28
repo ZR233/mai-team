@@ -29,6 +29,12 @@ pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
         batch_size: usize,
     ) -> impl Future<Output = Result<usize>> + Send;
 
+    fn prune_retired_agent_sessions_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
     fn prune_product_events_before(
         &self,
         cutoff: DateTime<Utc>,
@@ -223,6 +229,17 @@ pub(crate) async fn cleanup_project_review_history(
     let retention = ops.retention_config().await;
     let batch_size = retention.cleanup_batch_size;
     let review_cutoff = now - TimeDelta::days(retention.review_history_days);
+    let mut removed_sessions = 0;
+    loop {
+        let removed = ops
+            .prune_retired_agent_sessions_before(review_cutoff, batch_size)
+            .await?;
+        removed_sessions += removed;
+        if removed < batch_size {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let mut removed_jobs = 0;
     loop {
         let removed = ops
@@ -282,7 +299,8 @@ pub(crate) async fn cleanup_project_review_history(
         }
         tokio::task::yield_now().await;
     }
-    if removed_jobs > 0
+    if removed_sessions > 0
+        || removed_jobs > 0
         || removed_orphan_runs > 0
         || removed_events > 0
         || removed_events_by_limit > 0
@@ -291,6 +309,7 @@ pub(crate) async fn cleanup_project_review_history(
         || removed_tool_outputs > 0
     {
         tracing::info!(
+            removed_sessions,
             removed_jobs,
             removed_orphan_runs,
             removed_events,
@@ -355,6 +374,14 @@ mod tests {
             } else {
                 batches.remove(0)
             })
+        }
+
+        async fn prune_retired_agent_sessions_before(
+            &self,
+            _cutoff: DateTime<Utc>,
+            _batch_size: usize,
+        ) -> Result<usize> {
+            Ok(0)
         }
 
         async fn prune_product_events_before(

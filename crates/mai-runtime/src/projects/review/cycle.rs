@@ -4,7 +4,6 @@ use std::time::Duration;
 use mai_protocol::{AgentId, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, TurnId};
 #[cfg(test)]
 use mai_protocol::{ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, now};
-use pl_core::AgentWaitResult;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -16,6 +15,7 @@ use super::runs::FinishReviewRun;
 use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
 #[cfg(test)]
 use super::target::ProjectReviewRequest;
+use crate::runtime_agent_api::ThreadWaitOutcome;
 use crate::{Result, RuntimeError};
 
 const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"review_event\":\"approve|request_changes|comment\"|null,\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
@@ -115,11 +115,11 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         message: String,
     ) -> impl Future<Output = Result<TurnId>> + Send;
 
-    fn wait_agent_until_complete_with_cancel(
+    fn wait_agent_turn(
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> impl Future<Output = Result<AgentWaitResult>> + Send;
+    ) -> impl Future<Output = Result<ThreadWaitOutcome>> + Send;
 
     fn reviewer_progress(
         &self,
@@ -177,7 +177,7 @@ pub(crate) async fn run_project_review_once(
         summary: None,
         error: None,
         failure: None,
-        token_usage: Default::default(),
+        usage: Default::default(),
         history_status: Default::default(),
         history_archive_id: None,
         history_archived_at: None,
@@ -267,7 +267,7 @@ pub(crate) async fn run_project_review_once(
             summary: None,
             error: None,
             failure: None,
-            token_usage: Default::default(),
+            usage: Default::default(),
             history_status: Default::default(),
             history_archive_id: None,
             history_archived_at: None,
@@ -290,13 +290,13 @@ pub(crate) async fn run_project_review_once(
         let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
         ops.update_project_review_run_turn(project_id, run_id, reviewer_id, turn_id)
             .await?;
-        let wait_result = ops
-            .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
+        let wait_outcome = ops
+            .wait_agent_turn(reviewer_id, &cancellation_token)
             .await?;
-        if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
+        if wait_outcome.last_turn_cancelled() && cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        if let Some(result) = super::project_review_cycle_result_for_wait_result(&wait_result) {
+        if let Some(result) = super::project_review_cycle_result_for_wait_outcome(&wait_outcome) {
             return Ok(result);
         }
         parse_reviewer_final_response(ops, reviewer_id, &cancellation_token).await
@@ -478,13 +478,13 @@ async fn parse_reviewer_final_response_with_timeout(
                 error = %first_err,
                 "project reviewer final JSON missing or invalid; requesting one repair turn"
             );
-            let wait_result = match tokio::time::timeout_at(
+            let wait_outcome = match tokio::time::timeout_at(
                 deadline,
-                ops.wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token),
+                ops.wait_agent_turn(reviewer_id, cancellation_token),
             )
             .await
             {
-                Ok(wait_result) => wait_result?,
+                Ok(wait_outcome) => wait_outcome?,
                 Err(_) => {
                     cancel_reviewer_turn_with_timeout(
                         ops,
@@ -498,10 +498,11 @@ async fn parse_reviewer_final_response_with_timeout(
                     ));
                 }
             };
-            if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
+            if wait_outcome.last_turn_cancelled() && cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
-            if let Some(result) = super::project_review_cycle_result_for_wait_result(&wait_result) {
+            if let Some(result) = super::project_review_cycle_result_for_wait_outcome(&wait_outcome)
+            {
                 return Ok(result);
             }
             let repaired_response =
@@ -572,13 +573,6 @@ pub(crate) fn retryable_review_timeout_result(
     }
 }
 
-pub(crate) fn last_turn_cancelled(wait_result: &AgentWaitResult) -> bool {
-    wait_result
-        .last_turn
-        .as_ref()
-        .is_some_and(|turn| matches!(turn.outcome, pl_protocol::TurnOutcome::Cancelled(_)))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -586,12 +580,9 @@ mod tests {
     use chrono::Utc;
     use mai_protocol::{
         AgentResourceSnapshot, AgentResourceState, AgentSummary, ProjectCloneStatus,
-        ProjectReviewDecision, ProjectStatus, TokenUsage,
+        ProjectReviewDecision, ProjectStatus, RuntimeUsageSnapshot,
     };
-    use pl_protocol::{
-        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, AgentTurnOutcome, ThreadId,
-        TurnCompletion, TurnOutcome,
-    };
+    use pl_protocol::{CompletedTurnState, Turn, TurnCompletion, TurnState};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
 
@@ -754,20 +745,20 @@ mod tests {
             Ok(Uuid::new_v4().to_string())
         }
 
-        async fn wait_agent_until_complete_with_cancel(
+        async fn wait_agent_turn(
             &self,
             _agent_id: AgentId,
             _cancellation_token: &CancellationToken,
-        ) -> Result<AgentWaitResult> {
+        ) -> Result<ThreadWaitOutcome> {
             if self.block_wait {
                 return std::future::pending().await;
             }
-            Ok(completed_wait_result())
+            Ok(completed_wait_outcome())
         }
 
         async fn reviewer_progress(&self, _reviewer_id: AgentId) -> Result<ReviewerProgress> {
             Ok(ReviewerProgress {
-                revision: self.reviewer.runtime.as_ref().expect("runtime").revision,
+                revision: 1,
                 inactivity_timeout: std::time::Duration::from_secs(600),
             })
         }
@@ -838,7 +829,7 @@ mod tests {
             reviewer_id,
             vec![r#"{"outcome":"review_submitted","review_event":"approve","pr":726,"summary":"done","error":null}"#.to_string()],
         );
-        ops.reviewer.runtime.as_mut().expect("runtime").last_turn = None;
+        ops.reviewer.runtime = None;
 
         let result =
             run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
@@ -1093,33 +1084,16 @@ mod tests {
             task_id: None,
             project_id: Some(project_id),
             role: Some(mai_protocol::AgentRole::Reviewer),
+            profile_id: None,
+            workspace: None,
+            review_run_id: None,
             name: "reviewer".to_string(),
             resource: AgentResourceSnapshot {
                 state: AgentResourceState::Ready,
                 error: None,
             },
-            runtime: Some(AgentSnapshot {
-                identity: AgentIdentity {
-                    id: ThreadId::new(reviewer_id.to_string()).expect("thread id"),
-                    parent_id: None,
-                    role: AgentRoleId::new("reviewer").expect("role"),
-                    depth: 0,
-                },
-                state: AgentState::idle(),
-                pending_inputs: 0,
-                progress: None,
-                last_turn: Some(AgentTurnOutcome {
-                    turn_id: pl_protocol::TurnId::new(Uuid::new_v4().to_string()).expect("turn id"),
-                    thread_id: ThreadId::new(reviewer_id.to_string()).expect("thread id"),
-                    outcome: TurnOutcome::completed(TurnCompletion::Normal),
-                    usage: TokenUsage::default(),
-                    started_at: None,
-                    finished_at: timestamp.timestamp_millis(),
-                }),
-                revision: 1,
-                event_sequence: 1,
-                updated_at: timestamp.timestamp_millis(),
-            }),
+            runtime: None,
+            last_turn: None,
             container_id: Some("container".to_string()),
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "mock".to_string(),
@@ -1128,37 +1102,25 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
-            token_usage: TokenUsage::default(),
+            usage: RuntimeUsageSnapshot::default(),
         }
     }
 
-    fn completed_wait_result() -> AgentWaitResult {
-        let agent_id = pl_core::ThreadId::new("reviewer").expect("agent id");
-        let turn = AgentTurnOutcome {
-            turn_id: pl_core::TurnId::new("turn").expect("turn id"),
-            thread_id: agent_id.clone(),
-            outcome: TurnOutcome::completed(TurnCompletion::Normal),
-            usage: pl_model::TokenUsage::default(),
-            started_at: None,
-            finished_at: 1,
-        };
-        AgentWaitResult {
-            snapshot: pl_core::AgentSnapshot {
-                identity: pl_core::AgentIdentity {
-                    id: agent_id,
-                    parent_id: None,
-                    role: pl_core::AgentRoleId::new("reviewer").expect("role"),
-                    depth: 0,
-                },
-                state: AgentState::idle(),
-                pending_inputs: 0,
-                progress: None,
-                last_turn: Some(turn.clone()),
+    fn completed_wait_outcome() -> ThreadWaitOutcome {
+        let thread_id = "reviewer";
+        ThreadWaitOutcome {
+            last_turn: Some(Turn {
+                input_id: None,
+                id: "turn".to_string(),
+                thread_id: thread_id.to_string(),
                 revision: 2,
-                event_sequence: 1,
+                state: TurnState::Completed(CompletedTurnState::new(
+                    None,
+                    1,
+                    TurnCompletion::Normal,
+                )),
                 updated_at: 1,
-            },
-            last_turn: Some(turn),
+            }),
         }
     }
 }

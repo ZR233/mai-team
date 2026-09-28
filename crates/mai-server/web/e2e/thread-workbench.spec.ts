@@ -1,7 +1,7 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
-  const updates = { "thread-a": snapshotUpdate("thread-a", "Alpha message"), "thread-b": snapshotUpdate("thread-b", "Beta message") }
+  const updates = { "thread-a": snapshotUpdate("thread-a"), "thread-b": snapshotUpdate("thread-b") }
   await installThreadStreamFixture(page, updates)
   await installApiFixture(page)
 })
@@ -72,6 +72,11 @@ test("Thread timeline 在全部视口可用", async ({ page }) => {
   await expect(page.getByRole("article", { name: "Mai Team response" })).toContainText("Alpha message")
   await expect(page.locator("strong").filter({ hasText: "future-model" })).toBeVisible()
 
+  // 历史来自 `/threads/{id}/turns`：首帧不含 items，更早的 Turn 通过 cursor 分页加载。
+  await page.getByRole("button", { name: "Load earlier history" }).click()
+  await expect(page.getByText("Earlier thread-a context")).toBeVisible()
+  await expect(page.getByRole("button", { name: "Load earlier history" })).toHaveCount(0)
+
   const skills = page.getByRole("button", { name: "2 skills loaded" })
   await expect(skills).toBeVisible()
   if ((page.viewportSize()?.width ?? 0) >= 1024) {
@@ -104,6 +109,8 @@ async function installApiFixture(page: Page) {
       roots: ["/skills"],
       errors: [],
     })
+    const turns = path.match(/^\/threads\/([^/]+)\/turns$/)
+    if (turns) return json(route, threadTurnPage(decodeURIComponent(turns[1]), new URL(request.url()).searchParams.get("cursor")))
     if (path.startsWith("/threads/") && path.endsWith("/messages") && request.method() === "POST") return json(route, { turn_id: "turn-next" })
     return route.continue()
   })
@@ -140,60 +147,82 @@ function json(route: Route, body: unknown) {
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) })
 }
 
-const usage = { promptTokens: 1200, cachedPromptTokens: 400, cacheWriteTokens: 0, completionTokens: 180, reasoningTokens: 80, totalTokens: 1380 }
-
 function environment(id: string, name: string, threadId: string) {
   const agent = {
     id: threadId,
     name: `${name} Agent`,
     role: "planner",
     resource: { state: "ready", error: null },
-    runtime: {
-      identity: { id: threadId, parentId: null, role: "planner", depth: 0 },
-      state: { kind: "idle", data: null },
-      pendingInputs: 0,
-      progress: null,
-      lastTurn: null,
-      revision: 1,
-      eventSequence: 1,
-      updatedAt: 1,
-    },
+    runtime: threadSnapshot(threadId, name),
+    usage: usageSnapshot(),
     provider_id: "future-provider",
     provider_name: "Future Cloud",
     model: "future-model",
     created_at: "2026-08-11T00:00:00Z",
     updated_at: "2026-08-11T00:00:00Z",
-    token_usage: usage,
     thread: thread(threadId, name),
   }
   return { id, name, status: "executing", root_agent_id: agent.id, thread_count: 1, docker_image: "ubuntu:24.04", created_at: agent.created_at, updated_at: agent.updated_at, root_agent: agent }
 }
 
-function snapshotUpdate(threadId: string, text: string) {
+// Thread 首帧只携带 Thread 级状态；历史 Turn/items 由 `/threads/{id}/turns` 提供。
+function snapshotUpdate(threadId: string) {
   return {
     type: "snapshot",
-    snapshot: {
-      schemaVersion: 7,
-      revision: 1,
-      thread: thread(threadId, threadId),
-      items: [
-        { id: `${threadId}:user`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: "Review the Rust service for correctness and maintainability.", lifecycle: { kind: "completed", data: { completedAt: 1 } } } } },
-        { id: `${threadId}:reasoning`, threadId, turnId: `${threadId}:turn`, ordinal: 1, revision: 0, createdAt: 2, updatedAt: 8, state: { kind: "thinking", data: { summary: ["Inspecting project structure and dependencies"], content: ["I will focus on ownership boundaries and error paths."], lifecycle: { kind: "completed", data: { completedAt: 8 } } } } },
-        { id: `${threadId}:tool`, threadId, turnId: `${threadId}:turn`, ordinal: 2, revision: 0, createdAt: 9, updatedAt: 12, state: { kind: "tool", data: { invocation: { toolCallId: `${threadId}:read`, name: "read_file", arguments: JSON.stringify({ path: "src/runtime.rs" }) }, state: { kind: "succeeded", data: { completedAt: 12, output: { result: "runtime source", exitCode: 0 } } } } } },
-        { id: `${threadId}:skill`, threadId, turnId: `${threadId}:turn`, ordinal: 3, revision: 0, createdAt: 13, updatedAt: 13, state: { kind: "skill", data: { activation: { name: "project-review", source: "project", providerId: "fixture", resourceBase: { kind: "directory", path: "/skills/project-review" }, turnId: `${threadId}:turn`, cause: { kind: "tool", toolCallId: `${threadId}:skill-view` }, activatedAt: 13 } } } },
-        { id: `${threadId}:commentary`, threadId, turnId: `${threadId}:turn`, ordinal: 4, revision: 0, createdAt: 14, updatedAt: 14, state: { kind: "text", data: { channel: "commentary", text: "Checked the runtime boundary and focused the review on actionable findings.", lifecycle: { kind: "completed", data: { completedAt: 14 } } } } },
-        { id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 5, revision: 0, createdAt: 15, updatedAt: 15, state: { kind: "text", data: { channel: "final", text: `## Rust service review\n\n${text}\n\nThe implementation is sound overall.\n\n- **Correctness:** ownership is explicit.\n- **Testing:** add a regression for the failure path.`, lifecycle: { kind: "completed", data: { completedAt: 15 } } } } },
-      ],
-      interactions: [],
-      runtime: { threadId, usage: usageSnapshot(), activeSkills: ["project-review", "rust-code-quality"], activeMcpServers: [], activeLspServers: [], updatedAt: 2 },
-    },
+    snapshot: threadSnapshot(threadId, threadId),
   }
 }
 
+const THREAD_TEXTS: Record<string, string> = { "thread-a": "Alpha message", "thread-b": "Beta message" }
+
+// `/threads/{id}/turns` 的一页：Turn 终态从新到旧返回，`nextCursor` 指向更早的一页。
+function threadTurnPage(threadId: string, cursor: string | null) {
+  const text = THREAD_TEXTS[threadId]
+  if (!text) return { turns: [] }
+  if (cursor) return { turns: [olderTurnHistory(threadId)] }
+  return {
+    turns: [currentTurnHistory(threadId, text)],
+    nextCursor: threadId === "thread-a" ? "older:thread-a" : undefined,
+  }
+}
+
+function currentTurnHistory(threadId: string, text: string) {
+  const turnId = `${threadId}:turn`
+  return { turn: completedTurn(threadId, turnId, 15), contextDisposition: "active", items: [
+    { id: `${threadId}:user`, threadId, turnId, ordinal: 1, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: "Review the Rust service for correctness and maintainability.", lifecycle: { kind: "completed", data: { completedAt: 1 } } } } },
+    { id: `${threadId}:reasoning`, threadId, turnId, ordinal: 2, revision: 0, createdAt: 2, updatedAt: 8, state: { kind: "thinking", data: { summary: ["Inspecting project structure and dependencies"], content: ["I will focus on ownership boundaries and error paths."], lifecycle: { kind: "completed", data: { completedAt: 8 } } } } },
+    { id: `${threadId}:tool`, threadId, turnId, ordinal: 3, revision: 0, createdAt: 9, updatedAt: 12, state: { kind: "tool", data: { invocation: { toolCallId: `${threadId}:read`, name: "read_file", arguments: JSON.stringify({ path: "src/runtime.rs" }) }, state: { kind: "succeeded", data: { completedAt: 12, output: { result: "runtime source", exitCode: 0 } } } } } },
+    { id: `${threadId}:skill`, threadId, turnId, ordinal: 4, revision: 0, createdAt: 13, updatedAt: 13, state: { kind: "skill", data: { activation: { name: "project-review", source: "project", providerId: "fixture", resourceBase: { kind: "directory", path: "/skills/project-review" }, turnId, cause: { kind: "tool", toolCallId: `${threadId}:skill-view` }, activatedAt: 13 } } } },
+    { id: `${threadId}:commentary`, threadId, turnId, ordinal: 5, revision: 0, createdAt: 14, updatedAt: 14, state: { kind: "text", data: { channel: "commentary", text: "Checked the runtime boundary and focused the review on actionable findings.", lifecycle: { kind: "completed", data: { completedAt: 14 } } } } },
+    { id: `${threadId}:item`, threadId, turnId, ordinal: 6, revision: 0, createdAt: 15, updatedAt: 15, state: { kind: "text", data: { channel: "final", text: `## Rust service review\n\n${text}\n\nThe implementation is sound overall.\n\n- **Correctness:** ownership is explicit.\n- **Testing:** add a regression for the failure path.`, lifecycle: { kind: "completed", data: { completedAt: 15 } } } } },
+  ] }
+}
+
+function olderTurnHistory(threadId: string) {
+  const turnId = `${threadId}:turn-older`
+  return { turn: completedTurn(threadId, turnId, 1), contextDisposition: "active", items: [
+    { id: `${threadId}:older:user`, threadId, turnId, ordinal: 1, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "user", text: `Earlier ${threadId} context`, lifecycle: { kind: "completed", data: { completedAt: 1 } } } } },
+  ] }
+}
+
+function completedTurn(threadId: string, turnId: string, updatedAt: number) {
+  return { id: turnId, threadId, revision: 1, state: { kind: "completed", data: { startedAt: null, completedAt: updatedAt, completion: "normal" } }, updatedAt }
+}
+
 function usageSnapshot() {
-  return { model: "future-model", latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
+  return { hasIncompleteUsage: false, model: "future-model", latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
+}
+
+function threadSnapshot(threadId: string, title: string) {
+  return {
+    schemaVersion: 7,
+    revision: 1,
+    thread: thread(threadId, title),
+    interactions: [],
+    runtime: { threadId, usage: usageSnapshot(), activeSkills: ["project-review", "rust-code-quality"], activeMcpServers: [], activeLspServers: [], updatedAt: 2 },
+  }
 }
 
 function thread(id: string, title: string) {
-  return { id, projectId: "", title, mode: "simple", rootThreadId: id, role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false }
+  return { id, projectId: "", title, mode: "mode.simple", workspaceMode: "local", workspacePath: "/workspace", rootThreadId: id, role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false }
 }

@@ -6,25 +6,34 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
         reviewer_agent_id: AgentId,
         turn_id: Option<&str>,
     ) -> Result<projects::review::runs::ReviewRunSnapshot> {
-        let thread_id = agent_host::canonical_id(reviewer_agent_id)?;
-        let runtime = agent_host::load_runtime(&self.deps.store, &thread_id).await?;
-        let token_usage = agent_host::aggregate_usage(&runtime);
-        let history = self
-            .deps
-            .store
-            .list_thread_turns(thread_id.as_str(), None, 200)
-            .await
-            .map(|page| {
-                page.turns
-                    .into_iter()
-                    .find(|history| turn_id.is_none_or(|turn_id| history.turn.id == turn_id))
-            })?;
-        Ok(projects::review::runs::ReviewRunSnapshot {
-            token_usage,
-            history,
-        })
+        // typed SessionHistory 读取已提交 effect；同时保证 reviewer Thread 已驻留，使下面的
+        // canonical usage_summary 与刚完成的 Turn 属于同一 owner。
+        let page = self
+            .thread_turns(
+                reviewer_agent_id.to_string(),
+                None,
+                REVIEW_SNAPSHOT_TURN_LIMIT,
+            )
+            .await?;
+        let updated_at = now().timestamp();
+        let usage = self
+            .resident_thread(reviewer_agent_id)
+            .map(|resident| {
+                projects::review::runs::runtime_usage_snapshot(
+                    &resident.handle.snapshot().usage_summary,
+                    updated_at,
+                )
+            })
+            .unwrap_or_default();
+        let history = page.turns.into_iter().find(|history| {
+            turn_id.is_none_or(|input_id| history.turn.input_id.as_deref() == Some(input_id))
+        });
+        Ok(projects::review::runs::ReviewRunSnapshot { usage, history })
     }
 }
+
+/// 一次 Run 终态快照最多回看的已提交 Thread effect 数。
+const REVIEW_SNAPSHOT_TURN_LIMIT: usize = 200;
 
 impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
     fn project(
@@ -49,6 +58,35 @@ impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
 impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
     async fn retention_config(&self) -> MaiRetentionConfig {
         self.mai_config.read().await.retention.clone()
+    }
+
+    async fn prune_retired_agent_sessions_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let ids = self
+            .deps
+            .store
+            .expired_agent_sessions(cutoff, batch_size)
+            .await?;
+        for id in &ids {
+            if self.resident_thread(*id).is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "retired Agent `{id}` still has a resident Thread"
+                )));
+            }
+            self.session_history.delete(*id).await.map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "could not delete PL session for retired Agent `{id}`: {error}"
+                ))
+            })?;
+            self.deps
+                .store
+                .complete_agent_session_retirement(*id)
+                .await?;
+        }
+        Ok(ids.len())
     }
 
     async fn prune_project_review_jobs_before(
@@ -344,12 +382,13 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
     }
 
     async fn ensure_project_reviewer_thread(&self, agent_id: AgentId) -> Result<()> {
-        self.ensure_framework_agent(agent_id).await.map(|_| ())
+        self.ensure_thread(agent_id).await.map(|_| ())
     }
 
     async fn ensure_project_reviewer_container(
         &self,
         agent_id: AgentId,
+        run_id: Uuid,
         target: projects::review::target::ResolvedProjectReviewTarget,
         project_revision: projects::workspace::ProjectRepositoryRevision,
         repository_view: projects::review::context::ProjectRepositoryView,
@@ -363,6 +402,7 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
                 agent_id,
                 Some(project_id),
                 agents::ContainerSource::ProjectReviewWorkspace {
+                    run_id,
                     target: projects::workspace::ProjectRepositoryReviewTarget {
                         pr: target.pr,
                         head_sha: target.head_sha,
@@ -402,12 +442,30 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
     }
 
     async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
-        AgentRuntime::agent(self.as_ref(), agent_id).await?;
-        let runtime =
-            agent_host::load_runtime(&self.deps.store, &agent_host::canonical_id(agent_id)?)
-                .await?;
-        Ok(agent_host::last_agent_response(&runtime))
+        // 最终回复是 typed history 里最后一条 Final 文本 Item，不在 store 或旧 AgentSnapshot 里。
+        let page = self
+            .thread_turns(
+                agent_id.to_string(),
+                None,
+                REVIEWER_FINAL_RESPONSE_TURN_LIMIT,
+            )
+            .await?;
+        Ok(page
+            .turns
+            .iter()
+            .find_map(|history| last_final_text(&history.items)))
     }
+}
+
+/// 读取 reviewer 最终回复最多回看的已提交 Thread effect 数。
+const REVIEWER_FINAL_RESPONSE_TURN_LIMIT: usize = 64;
+
+/// 返回一条已提交 Turn history 中最后一条 Final 文本。
+fn last_final_text(items: &[mai_protocol::ThreadItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| {
+        let text = item.text()?;
+        (text.channel() == mai_protocol::ThreadTextChannel::Final).then(|| text.text().to_string())
+    })
 }
 
 impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> {
@@ -485,190 +543,40 @@ impl projects::review::discovery::ProjectReviewDiscoveryOps for Arc<AgentRuntime
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use mai_store::{
-        StoredThreadRuntime, ThreadRuntimeCommitDocument, ThreadRuntimeCommitOutcome,
-        ThreadRuntimeTurnCommit,
-    };
-    use pl_protocol::{
-        CompletedTurnState, ThreadRuntimeSnapshot, ThreadRuntimeUsage, ThreadSnapshot, Turn,
-        TurnCompletion, TurnState,
-    };
+    use mai_protocol::{ThreadItem, ThreadItemState, ThreadTextChannel};
+    use pl_protocol::{ThreadContentLifecycle, ThreadTextItem};
     use pretty_assertions::assert_eq;
 
-    use super::*;
+    use super::last_final_text;
 
-    #[tokio::test]
-    async fn review_snapshot_reads_usage_from_durable_thread() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(
-            MaiStore::open_with_config_and_artifact_index_path(
-                directory.path().join("runtime.sqlite3"),
-                directory.path().join("config.toml"),
-                directory.path().join("artifacts/index"),
-            )
-            .await
-            .expect("open store"),
-        );
-        let reviewer_agent_id = Uuid::new_v4();
-        let now = Utc::now();
-        store
-            .save_agent(
-                &AgentSummary {
-                    id: reviewer_agent_id,
-                    parent_id: None,
-                    task_id: None,
-                    project_id: None,
-                    role: Some(AgentRole::Reviewer),
-                    name: "reviewer".to_string(),
-                    resource: AgentResourceSnapshot {
-                        state: AgentResourceState::Ready,
-                        error: None,
-                    },
-                    runtime: None,
-                    container_id: None,
-                    docker_image: "unused".to_string(),
-                    provider_id: "test".to_string(),
-                    provider_name: "Test".to_string(),
-                    model: "test-model".to_string(),
-                    reasoning_effort: None,
-                    created_at: now,
-                    updated_at: now,
-                    token_usage: TokenUsage::default(),
-                },
-                None,
-            )
-            .await
-            .expect("save reviewer");
+    #[test]
+    fn final_response_uses_last_final_text_channel() {
+        let items = vec![
+            text_item("user", ThreadTextChannel::User, "question"),
+            text_item("final-1", ThreadTextChannel::Final, "first"),
+            text_item("commentary", ThreadTextChannel::Commentary, "working"),
+            text_item("final-2", ThreadTextChannel::Final, "second"),
+        ];
 
-        let runtime = AgentRuntime::new(
-            DockerClient::new_with_binary("unused", fake_docker_path(&directory)),
-            Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: directory.path().to_path_buf(),
-                projects_root: directory.path().join("projects"),
-                cache_root: directory.path().join("cache"),
-                artifact_files_root: directory.path().join("artifacts/files"),
-                sidecar_image: "unused".to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-                system_agents_root: None,
-            },
-        )
-        .await
-        .expect("start runtime");
-
-        let thread_id = reviewer_agent_id.to_string();
-        let turn_id = "turn-review";
-        let expected_usage = TokenUsage {
-            prompt_tokens: 101,
-            cached_prompt_tokens: 23,
-            cache_write_tokens: 7,
-            completion_tokens: 31,
-            reasoning_tokens: 11,
-            total_tokens: 150,
-        };
-        let mut snapshot = ThreadSnapshot::empty(thread_id.clone());
-        snapshot.revision = 1;
-        snapshot.runtime = Some(ThreadRuntimeSnapshot {
-            thread_id: thread_id.clone(),
-            usage: ThreadRuntimeUsage {
-                model: "test-model".to_string(),
-                context_window: Some(200_000),
-                latest_context_tokens: 88,
-                prompt_tokens: expected_usage.prompt_tokens,
-                completion_tokens: expected_usage.completion_tokens,
-                cached_prompt_tokens: expected_usage.cached_prompt_tokens,
-                cache_write_tokens: expected_usage.cache_write_tokens,
-                cache_miss_tokens: 78,
-                reasoning_tokens: expected_usage.reasoning_tokens,
-                inference_count: 2,
-                total_tokens: expected_usage.total_tokens,
-                cache_hit_rate: Some(0.2),
-                estimated_costs: Vec::new(),
-                estimated_cache_savings: Vec::new(),
-                has_unpriced_usage: false,
-                prompt_generation: Some(1),
-                prompt_cache_policy: None,
-                prefix_changed_reason: None,
-                updated_at: 2,
-            },
-            turn_completion_tokens: 0,
-            turn_decode_millis: 0,
-            todo: None,
-            active_skills: Vec::new(),
-            active_mcp_servers: Vec::new(),
-            active_lsp_servers: Vec::new(),
-            progress: None,
-            mcp_health: None,
-            workflow: None,
-            updated_at: 2,
-        });
-        let turn = Turn {
-            id: turn_id.to_string(),
-            thread_id: thread_id.clone(),
-            revision: 1,
-            state: TurnState::Completed(CompletedTurnState::new(
-                Some(1),
-                2,
-                TurnCompletion::Normal,
-            )),
-            updated_at: 2,
-        };
-        assert_eq!(
-            store
-                .commit_thread_runtime(ThreadRuntimeCommitDocument {
-                    expected_revision: None,
-                    runtime: StoredThreadRuntime {
-                        thread_id: thread_id.clone(),
-                        revision: 1,
-                        document: serde_json::json!({ "revision": 1 }),
-                        snapshot: Some(snapshot),
-                        updated_at: 2,
-                    },
-                    turn: Some(ThreadRuntimeTurnCommit {
-                        id: turn.id.clone(),
-                        thread_id: thread_id.clone(),
-                        turn: Some(turn),
-                        billing: None,
-                    }),
-                    notifications: Vec::new(),
-                    runtime_events: Vec::new(),
-                    trace_events: Vec::new(),
-                    submissions: Vec::new(),
-                })
-                .await
-                .expect("commit canonical thread"),
-            ThreadRuntimeCommitOutcome::Applied
-        );
-
-        let captured = <AgentRuntime as projects::review::runs::ReviewRunSnapshotSource>::snapshot(
-            runtime.as_ref(),
-            reviewer_agent_id,
-            Some(turn_id),
-        )
-        .await
-        .expect("capture review snapshot");
-        assert_eq!(expected_usage, captured.token_usage);
-        assert_eq!(turn_id, captured.history.expect("turn history").turn.id);
-        runtime.shutdown().await.expect("shutdown runtime");
+        assert_eq!(Some("second".to_string()), last_final_text(&items));
     }
 
-    fn fake_docker_path(directory: &tempfile::TempDir) -> String {
-        let path = directory.path().join("fake-docker.sh");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\ncase \"$1\" in\n  version) echo test-version ;;\n  *) exit 0 ;;\nesac\n",
+    fn text_item(id: &str, channel: ThreadTextChannel, text: &str) -> ThreadItem {
+        ThreadItem::new(
+            id.to_string(),
+            "reviewer".to_string(),
+            "turn".to_string(),
+            0,
+            0,
+            0,
+            0,
+            ThreadItemState::Text(ThreadTextItem::new(
+                channel,
+                text.to_string(),
+                Vec::new(),
+                ThreadContentLifecycle::completed(0),
+            )),
         )
-        .expect("write fake docker");
-        let mut permissions = std::fs::metadata(&path)
-            .expect("fake docker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
-        path.to_string_lossy().into_owned()
     }
 }
 
@@ -758,27 +666,24 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         projects::review::reviewer::start_reviewer_turn(self, reviewer_id, message)
     }
 
-    fn wait_agent_until_complete_with_cancel(
+    fn wait_agent_turn(
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> impl std::future::Future<Output = Result<pl_core::AgentWaitResult>> + Send {
-        AgentRuntime::wait_agent_until_complete_with_cancel(
-            self.as_ref(),
-            agent_id,
-            cancellation_token,
-        )
+    ) -> impl std::future::Future<Output = Result<crate::runtime_agent_api::ThreadWaitOutcome>> + Send
+    {
+        AgentRuntime::wait_agent_turn(self.as_ref(), agent_id, cancellation_token)
     }
 
     async fn reviewer_progress(
         &self,
         reviewer_id: AgentId,
     ) -> Result<projects::review::cycle::ReviewerProgress> {
-        let snapshot = self.ensure_framework_agent(reviewer_id).await?;
-        let inactivity_timeout = reviewer_inactivity_timeout(self, &snapshot)?;
+        let resident = self.ensure_thread(reviewer_id).await?;
+        let state = resident.handle.snapshot();
         Ok(projects::review::cycle::ReviewerProgress {
-            revision: snapshot.revision,
-            inactivity_timeout,
+            revision: state.commit_sequence,
+            inactivity_timeout: reviewer_inactivity_timeout(&state),
         })
     }
 
@@ -1037,46 +942,56 @@ fn redact_url_userinfo(word: &str) -> String {
     format!("{}[redacted]{}", &word[..scheme_end], &word[at..])
 }
 
-fn reviewer_inactivity_timeout(
-    runtime: &AgentRuntime,
-    snapshot: &pl_core::AgentSnapshot,
-) -> Result<std::time::Duration> {
+/// reviewer 的运行看门狗在没有任何 canonical 进展时允许的最长停顿。
+///
+/// 默认十分钟以上的停顿都算无进展；当 canonical Thread 里仍有正在运行的 exec 任务时，按该任务
+/// 声明的 `timeoutSeconds` 加固定宽限延长，避免把正常的长工具执行误判为卡死。所有事实都来自
+/// typed core 快照，不从旧 AgentSnapshot 或工具文本反推。
+fn reviewer_inactivity_timeout(state: &pl_core::thread::ThreadSnapshot) -> std::time::Duration {
     const RUNNING_INACTIVITY_SECS: u64 = 10 * 60;
     const TOOL_TIMEOUT_GRACE_SECS: u64 = 60;
     let mut timeout = std::time::Duration::from_secs(RUNNING_INACTIVITY_SECS);
-    if !matches!(snapshot.state, pl_protocol::AgentState::WaitingTool(_)) {
-        return Ok(timeout);
-    }
-    let view = runtime
-        .framework_handle()?
-        .thread_snapshot(&snapshot.identity.id)
-        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-    let declared_timeout = view.items.iter().rev().find_map(|item| {
-        let tool = item.tool()?;
-        if !matches!(
-            tool.state(),
-            pl_protocol::ThreadToolState::Running(_)
-                | pl_protocol::ThreadToolState::Approved(_)
-                | pl_protocol::ThreadToolState::AwaitingApproval(_)
-        ) {
-            return None;
-        }
-        let invocation = tool.invocation();
-        (invocation.name() == pl_core::TOOL_EXEC)
-            .then(|| serde_json::from_str::<serde_json::Value>(invocation.arguments()).ok())
-            .flatten()
-            .and_then(|arguments| {
-                arguments
-                    .get("timeoutSeconds")
-                    .and_then(|value| value.as_u64())
-            })
-    });
+    let declared_timeout = state
+        .tasks
+        .values()
+        .filter(|task| task.status == pl_core::thread::task::TaskStatus::Running)
+        .filter(|task| task.tool_id == pl_tool::exec::TOOL_EXEC)
+        .find_map(|task| running_tool_timeout_seconds(state, &task.call_id));
     if let Some(declared_timeout) = declared_timeout {
         timeout = timeout.max(std::time::Duration::from_secs(
             declared_timeout.saturating_add(TOOL_TIMEOUT_GRACE_SECS),
         ));
     }
-    Ok(timeout)
+    timeout
+}
+
+/// 在仍驻留的 attempt 输出里找到指定 call 的声明超时秒数。
+fn running_tool_timeout_seconds(
+    state: &pl_core::thread::ThreadSnapshot,
+    call_id: &str,
+) -> Option<u64> {
+    state
+        .attempts
+        .iter()
+        .find_map(|attempt| match &attempt.outcome {
+            pl_core::thread::AttemptOutcome::Committed(output) => output
+                .tool_calls
+                .iter()
+                .find(|call| call.call_id == call_id)
+                .and_then(|call| {
+                    serde_json::from_str::<serde_json::Value>(call.arguments.content()).ok()
+                })
+                .and_then(|arguments| {
+                    arguments
+                        .get("timeoutSeconds")
+                        .and_then(|value| value.as_u64())
+                }),
+            pl_core::thread::AttemptOutcome::Running
+            | pl_core::thread::AttemptOutcome::Interrupted
+            | pl_core::thread::AttemptOutcome::Cancelled { .. }
+            | pl_core::thread::AttemptOutcome::Failed(_)
+            | pl_core::thread::AttemptOutcome::Rejected { .. } => None,
+        })
 }
 
 impl projects::review::ci_watch::ProjectReviewCiWatchOps for Arc<AgentRuntime> {

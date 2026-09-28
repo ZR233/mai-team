@@ -103,7 +103,7 @@ function attempt(index: number, tokenUsage?: TokenUsage, reviewerAgentId = "revi
     history_status: "available",
     started_at: `2026-07-22T00:0${index}:00Z`,
     reviewer_agent_id: reviewerAgentId,
-    token_usage: tokenUsage,
+    usage: tokenUsage ?? usage(0, 0, 0, 0, 0),
   }
 }
 

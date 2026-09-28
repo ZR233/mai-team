@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use pl_core::shell_quote_word;
+use pl_tool::shell::shell_quote_word;
 
 use crate::{Result, RuntimeError};
 
 const PROJECT_INSTRUCTION_CANDIDATE_FILES: [&str; 3] =
     ["AGENTS.override.md", "AGENTS.md", "Agents.md"];
+
+/// mai 产品默认的项目指令文档字节上限。
+const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectInstructionSourceFile {
@@ -42,10 +45,10 @@ pub(crate) fn detected_files_from_stdout(
 }
 
 pub(crate) fn load_workspace_instructions(stage_root: &Path) -> Result<String> {
-    pl_core::load_workspace_instruction_documents(
+    pl_tool::workspace::load_workspace_instruction_documents(
         stage_root,
         stage_root,
-        pl_core::DEFAULT_PROJECT_DOC_MAX_BYTES,
+        DEFAULT_PROJECT_DOC_MAX_BYTES,
         &[],
     )
     .map(|instructions| instructions.content())

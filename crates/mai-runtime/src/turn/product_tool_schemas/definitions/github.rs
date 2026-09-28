@@ -1,13 +1,11 @@
 #[cfg(test)]
-use pl_core::TypedTool;
-#[cfg(test)]
-use pl_model::ToolSpec;
+use pl_protocol::ToolSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 #[cfg(test)]
-use super::super::names::TOOL_GITHUB_API_REQUEST;
+use super::{super::names::TOOL_GITHUB_API_REQUEST, input_schema};
 
 pub(crate) const GITHUB_API_REQUEST_DESCRIPTION: &str = "Call the current Mai project's GitHub REST API through the managed gh sidecar. \
      Use this for PR review submission, issue comments, labels, and other GitHub reads or writes. \
@@ -74,7 +72,6 @@ pub(crate) fn definitions() -> Vec<ToolSpec> {
     vec![ToolSpec::function(
         TOOL_GITHUB_API_REQUEST,
         GITHUB_API_REQUEST_DESCRIPTION,
-        TypedTool::<GithubApiRequest>::new(TOOL_GITHUB_API_REQUEST, GITHUB_API_REQUEST_DESCRIPTION)
-            .input_schema(),
+        input_schema::<GithubApiRequest>(),
     )]
 }

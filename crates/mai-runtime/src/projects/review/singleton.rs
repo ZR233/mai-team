@@ -336,8 +336,15 @@ fn project_reviewer_agent_can_continue(reviewer: &AgentSummary) -> bool {
     matches!(
         reviewer.resource.state,
         AgentResourceState::Provisioning | AgentResourceState::Ready
-    ) && reviewer
-        .runtime
-        .as_ref()
-        .is_none_or(|snapshot| snapshot.state.is_operational())
+    ) && reviewer.runtime.as_ref().is_none_or(|snapshot| {
+        matches!(
+            snapshot.thread.status,
+            mai_protocol::ThreadStatus::Idle
+                | mai_protocol::ThreadStatus::Queued
+                | mai_protocol::ThreadStatus::Running
+                | mai_protocol::ThreadStatus::WaitingTool
+                | mai_protocol::ThreadStatus::WaitingInteraction
+                | mai_protocol::ThreadStatus::Cancelling
+        )
+    })
 }

@@ -1,15 +1,14 @@
 //! mai 产品配置；通过组合 PL 值对象形成独立 serde 文档。
 
 mod conversion;
-mod migration;
 
 use std::collections::BTreeMap;
 
-use pl_core::{
-    AgentModelConfig, AgentRoleId, BuiltinMcpServerState, ModelRouteConfig, ProviderId,
-    ReasoningEffort,
+use pl_model::config::{
+    AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderId, ReasoningEffort,
+    builtin_provider_catalog,
 };
-use pl_model::WebSearchConfig;
+use pl_protocol::search::WebSearchConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, RuntimeError};
@@ -19,9 +18,15 @@ pub(crate) use conversion::{
     agent_config_from_models, preserve_provider_secrets, providers_request_from_models,
     providers_response_from_models, resolve_provider_model,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 9;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 10;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
+pub(crate) const BUILTIN_MCP_SERVER_IDS: [&str; 4] = [
+    "zhipu_search",
+    "zhipu_reader",
+    "zhipu_zread",
+    "zhipu_vision",
+];
 
 /// mai 自己的完整配置文档。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,7 +81,16 @@ pub struct MaiSkillsConfig {
 pub struct MaiMcpConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
+    pub builtin_servers: BTreeMap<String, MaiBuiltinMcpServerState>,
+}
+
+/// mai 持久化的内置 MCP server 开关。
+///
+/// PL 只提供连接配置值对象；内置目录、可用性与开关属于 mai 产品配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct MaiBuiltinMcpServerState {
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
 }
 
 /// GitHub 产品能力开关。
@@ -114,8 +128,13 @@ impl MaiConfig {
             )));
         }
         self.models.validate().map_err(RuntimeError::Model)?;
-        pl_core::validate_builtin_mcp_server_states(&self.mcp.builtin_servers)
-            .map_err(RuntimeError::Model)?;
+        for server_id in self.mcp.builtin_servers.keys() {
+            if !BUILTIN_MCP_SERVER_IDS.contains(&server_id.as_str()) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown built-in MCP server: {server_id}"
+                )));
+            }
+        }
         for role in REQUIRED_ROLES {
             let role = AgentRoleId::new(role).map_err(RuntimeError::Model)?;
             self.models.resolve(&role).map_err(RuntimeError::Model)?;
@@ -155,15 +174,17 @@ impl MaiConfig {
 
 pub(crate) async fn load_or_initialize(store: &mai_store::MaiStore) -> Result<MaiConfig> {
     let documents = store.config_documents();
-    match documents.load::<MaiConfig>().await {
-        Ok(Some(config)) if config.validate().is_ok() => Ok(config),
-        Ok(None) => {
+    match documents.load::<MaiConfig>().await? {
+        Some(config) => {
+            config.validate()?;
+            Ok(config)
+        }
+        None => {
             let config = MaiConfig::default();
             config.validate()?;
             documents.save(&config).await?;
             Ok(config)
         }
-        Ok(Some(_)) | Err(_) => migration::migrate(&documents).await,
     }
 }
 
@@ -187,7 +208,7 @@ pub async fn seed_default_provider_from_env(
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let registry = pl_core::builtin_provider_catalog();
+    let registry = builtin_provider_catalog();
     let preset = registry
         .presets
         .into_iter()
@@ -234,7 +255,7 @@ pub async fn seed_default_provider_from_env(
 
 /// 返回 PL canonical provider/model catalog，供 HTTP 与其它 mai 产品边界直接透传。
 pub fn provider_catalog_snapshot() -> Result<pl_protocol::ProviderCatalogSnapshot> {
-    pl_core::builtin_provider_catalog()
+    builtin_provider_catalog()
         .snapshot()
         .map_err(RuntimeError::Model)
 }
@@ -242,7 +263,7 @@ pub fn provider_catalog_snapshot() -> Result<pl_protocol::ProviderCatalogSnapsho
 impl Default for MaiConfig {
     fn default() -> Self {
         let provider_id = ProviderId::new("deepseek").expect("static provider id is valid");
-        let preset = pl_core::builtin_provider_catalog()
+        let preset = builtin_provider_catalog()
             .presets
             .into_iter()
             .find(|preset| preset.id.as_str() == "deepseek")
@@ -313,6 +334,22 @@ impl Default for MaiMcpConfig {
     }
 }
 
+impl Default for MaiBuiltinMcpServerState {
+    fn default() -> Self {
+        Self {
+            enabled: enabled_by_default(),
+        }
+    }
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
+}
+
 impl Default for MaiGithubConfig {
     fn default() -> Self {
         Self {
@@ -333,7 +370,7 @@ impl Default for MaiReviewConfig {
 impl Default for MaiRetentionConfig {
     fn default() -> Self {
         Self {
-            review_history_days: 7,
+            review_history_days: 5,
             product_events_days: 7,
             agent_logs_days: 7,
             tool_traces_days: 7,
@@ -367,7 +404,7 @@ mod tests {
     fn retention_defaults_match_server_storage_policy() {
         assert_eq!(
             MaiRetentionConfig {
-                review_history_days: 7,
+                review_history_days: 5,
                 product_events_days: 7,
                 agent_logs_days: 7,
                 tool_traces_days: 7,

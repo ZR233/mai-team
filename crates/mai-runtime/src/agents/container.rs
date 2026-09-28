@@ -10,11 +10,14 @@ use crate::projects::review::context::ProjectRepositoryView;
 use crate::projects::workspace::{ProjectRepositoryReviewTarget, ProjectRepositoryRevision};
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ContainerSource {
     FreshImage,
     ProjectReviewWorkspace {
+        /// 创建该 Review Thread 的 Review Run；随创建写入 `AgentSummary::review_run_id`。
+        run_id: Uuid,
         target: ProjectRepositoryReviewTarget,
         revision: ProjectRepositoryRevision,
         repository_view: ProjectRepositoryView,
@@ -29,6 +32,16 @@ pub(crate) enum ContainerSource {
         docker_image: String,
         workspace_volume: Option<String>,
     },
+}
+
+impl ContainerSource {
+    /// 内部 Review Thread 身份；只有 `ProjectReviewWorkspace` 来源会携带 Review Run。
+    pub(crate) fn review_run_id(&self) -> Option<Uuid> {
+        match self {
+            Self::ProjectReviewWorkspace { run_id, .. } => Some(*run_id),
+            Self::FreshImage | Self::ProjectWorkspace { .. } | Self::CloneFrom { .. } => None,
+        }
+    }
 }
 
 pub(crate) struct AgentContainerStartRequest {
@@ -260,7 +273,7 @@ async fn set_resource_state(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use mai_protocol::{AgentResourceSnapshot, TokenUsage};
+    use mai_protocol::{AgentResourceSnapshot, RuntimeUsageSnapshot};
     use pretty_assertions::assert_eq;
     use tokio::sync::RwLock;
     use uuid::Uuid;
@@ -395,9 +408,13 @@ mod tests {
                 task_id: None,
                 project_id: None,
                 role: None,
+                profile_id: None,
+                workspace: None,
+                review_run_id: None,
                 name: "agent".to_string(),
                 resource: AgentResourceSnapshot::default(),
                 runtime: None,
+                last_turn: None,
                 container_id: None,
                 docker_image: "image".to_string(),
                 provider_id: "provider".to_string(),
@@ -406,11 +423,12 @@ mod tests {
                 reasoning_effort: None,
                 created_at: timestamp,
                 updated_at: timestamp,
-                token_usage: TokenUsage::default(),
+                usage: RuntimeUsageSnapshot::default(),
             }),
             container: RwLock::new(None),
             mcp: RwLock::new(None),
             review_context: RwLock::new(None),
+            skill_catalog: RwLock::new(None),
             system_prompt: None,
         }
     }

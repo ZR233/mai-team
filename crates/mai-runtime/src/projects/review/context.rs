@@ -19,7 +19,7 @@ pub(crate) struct ReviewConstraintSource {
 }
 
 /// review 准备阶段固化、供每轮推理复用的仓库事实。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ReviewManifestSnapshot {
     pub(crate) changed_files: Vec<String>,
     pub(crate) changed_files_total: usize,

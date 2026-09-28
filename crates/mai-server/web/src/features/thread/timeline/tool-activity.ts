@@ -54,7 +54,7 @@ export function buildToolActivity(item: ToolCallItem): ToolActivity {
   const output = toolOutput(tool.state)
   const error = tool.state.kind === "failed" ? tool.state.data.failure.message : undefined
   const denialReason = tool.state.kind === "denied" ? tool.state.data.reason : undefined
-  const resultText = output?.result ?? (tool.state.kind === "running" ? tool.state.data.streamedOutput : undefined)
+  const resultText = output?.result ?? streamedOutput(tool.state)
   const parsedArguments = parseToolText(tool.invocation.arguments)
   const parsedResult = parseToolText(resultText)
   const argumentsRecord = asRecord(parsedArguments.value)
@@ -94,12 +94,16 @@ function toolOutcome(item: ToolCallItem, result: ToolJsonRecord | null): ToolOut
   if (exitCode !== undefined && exitCode !== 0) return "failed"
 
   switch (state.kind) {
+    case "queued":
+    case "cancelling":
     case "started":
     case "streaming":
     case "awaitingApproval":
     case "approved":
     case "running":
       return "active"
+    case "interrupted":
+      return "interrupted"
     case "failed":
       return "failed"
     case "denied":
@@ -117,11 +121,34 @@ function toolOutput(state: ToolCallItem["state"]["data"]["state"]): ThreadToolOu
       return state.data.output
     case "failed":
       return state.data.output
+    case "queued":
+    case "cancelling":
+    case "interrupted":
     case "started":
     case "streaming":
     case "awaitingApproval":
     case "approved":
     case "running":
+    case "denied":
+    case "cancelled":
+      return undefined
+  }
+}
+
+/** 仍在流式执行的工具已观测输出；终态输出只在 `ThreadToolOutput` 里。 */
+function streamedOutput(state: ToolCallItem["state"]["data"]["state"]): string | undefined {
+  switch (state.kind) {
+    case "running":
+    case "cancelling":
+      return state.data.streamedOutput
+    case "queued":
+    case "interrupted":
+    case "started":
+    case "streaming":
+    case "awaitingApproval":
+    case "approved":
+    case "succeeded":
+    case "failed":
     case "denied":
     case "cancelled":
       return undefined

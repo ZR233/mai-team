@@ -144,6 +144,9 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
                 task_id: None,
                 project_id: Some(request.project_id),
                 role: Some(AgentRole::Planner),
+                review_run_id: None,
+                profile_id: "project-maintainer".to_string(),
+                workspace: None,
             },
         )
         .await?;

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::cycle::{
     ProjectReviewCycleOps, REVIEWER_TURN_CANCEL_TIMEOUT, ReviewTimeoutKind, ReviewerProgress,
-    cancel_reviewer_turn_with_timeout, last_turn_cancelled, parse_reviewer_final_response,
+    cancel_reviewer_turn_with_timeout, parse_reviewer_final_response,
     retryable_review_timeout_result,
 };
 use super::reviewer::PreparedProjectReviewer;
@@ -18,6 +18,7 @@ use super::reviewer::PreparedProjectReviewerImage;
 use super::runs::FinishReviewRun;
 use super::target::ProjectReviewRequest;
 use super::{ProjectReviewCycleResult, REVIEW_RUNNING_DEADLINE};
+use crate::runtime_agent_api::ThreadWaitOutcome;
 use crate::{Result, RuntimeError};
 
 const REVIEW_CONTINUATION_PROMPT: &str = "Continue the same pull request review after a retryable interruption. Keep using the existing session note as the append-only findings ledger. Re-check the fixed PR head before submission and do not repeat completed investigation unnecessarily. Treat a GitHub review as already submitted by this logical Job only when it targets the fixed head and contains the exact `mai-review-job:<current job UUID>` marker identified by your system prompt, or when this same Job's final submission call returned an ambiguous network result that you are actively reconciling. Existing reviews without that exact marker, including reviews from another Job or another head, are context only and do not fulfill this Job. Never return `review_submitted` unless this Job submitted the review or you confirmed its exact marker and head. Complete the review and return only the required final JSON object.";
@@ -268,7 +269,7 @@ pub(crate) async fn run_project_review_job_attempt(
         summary: None,
         error: None,
         failure: None,
-        token_usage: Default::default(),
+        usage: Default::default(),
         history_status: Default::default(),
         history_archive_id: None,
         history_archived_at: None,
@@ -377,17 +378,17 @@ async fn execute_turn(
     let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
     ops.update_project_review_run_turn(job.project_id, run_id, reviewer_id, turn_id.clone())
         .await?;
-    let wait_result =
+    let wait_outcome =
         match wait_reviewer_with_watchdog(ops, reviewer_id, turn_id, cancellation_token).await? {
-            ReviewerWait::Completed(wait_result) => *wait_result,
+            ReviewerWait::Completed(wait_outcome) => *wait_outcome,
             ReviewerWait::TimedOut(timeout_kind) => {
                 return Ok(retryable_review_timeout_result(timeout_kind));
             }
         };
-    if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
+    if wait_outcome.last_turn_cancelled() && cancellation_token.is_cancelled() {
         return Err(RuntimeError::TurnCancelled);
     }
-    let result = match super::project_review_cycle_result_for_wait_result(&wait_result) {
+    let result = match super::project_review_cycle_result_for_wait_outcome(&wait_outcome) {
         Some(result) => result,
         None => parse_reviewer_final_response(ops, reviewer_id, cancellation_token).await?,
     };
@@ -395,7 +396,7 @@ async fn execute_turn(
 }
 
 enum ReviewerWait {
-    Completed(Box<pl_core::AgentWaitResult>),
+    Completed(Box<ThreadWaitOutcome>),
     TimedOut(ReviewTimeoutKind),
 }
 
@@ -421,13 +422,13 @@ async fn wait_reviewer_with_watchdog(
             }
         };
     let mut last_progress = tokio::time::Instant::now();
-    let wait = ops.wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token);
+    let wait = ops.wait_agent_turn(reviewer_id, cancellation_token);
     tokio::pin!(wait);
     let total_deadline = tokio::time::sleep_until(deadline);
     tokio::pin!(total_deadline);
     loop {
         tokio::select! {
-            result = &mut wait => return result.map(|wait_result| ReviewerWait::Completed(Box::new(wait_result))),
+            result = &mut wait => return result.map(|wait_outcome| ReviewerWait::Completed(Box::new(wait_outcome))),
             _ = &mut total_deadline => {
                 cancel_reviewer_turn_with_timeout(
                     ops,

@@ -6,10 +6,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::Duration;
 
+use crate::runtime_agent_api::ThreadWaitOutcome;
 use crate::{Result, RuntimeError};
 
 pub(crate) mod backoff;
-mod budget;
 pub(crate) mod ci_watch;
 pub(crate) mod cleanup;
 pub(crate) mod context;
@@ -33,9 +33,10 @@ pub(crate) mod selector;
 pub(crate) mod singleton;
 pub(crate) mod state;
 pub(crate) mod target;
+mod watchdog;
 pub(crate) mod worker;
 
-pub(crate) use budget::{REVIEW_RUNNING_DEADLINE, REVIEW_TURN_BUDGET};
+pub(crate) use watchdog::REVIEW_RUNNING_DEADLINE;
 
 #[cfg(test)]
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
@@ -84,7 +85,7 @@ pub(crate) struct ProjectReviewLoopDecision {
 }
 
 pub(crate) fn project_reviewer_system_prompt(context: &context::ProjectReviewContext) -> String {
-    format!(
+    let mut prompt = format!(
         r#"You are an autonomous project pull request reviewer. Review exactly PR #{pr} at head `{head_sha}` against base `{base_sha}`.
 
 Review lifecycle owner: job `{job_id}`, PR #{pr}, head `{head_sha}`. This immutable marker is used only to recover the same reviewer after a service restart.
@@ -104,7 +105,19 @@ Never modify, checkout, fetch, clean, or run Git commands in `/project/repo`; it
         head_sha = context.target.head_sha,
         base_sha = context.project_revision.base_sha,
         job_id = context.run_id,
-    )
+    );
+    // Review Context 是本 Run 的冻结产品事实，创建 Thread 时一次性写入 PL context。
+    // 在这里显式交付默认分支指令和 manifest，避免只在 host 内存里保存而模型不可见。
+    if !context.workspace_instructions.trim().is_empty() {
+        prompt.push_str("\n\n## Default-branch workspace instructions\n\n");
+        prompt.push_str(&context.workspace_instructions);
+    }
+    prompt.push_str("\n\n## Frozen review manifest\n\n");
+    prompt.push_str(
+        &serde_json::to_string_pretty(&context.manifest)
+            .expect("review manifest contains only serializable product facts"),
+    );
+    prompt
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
@@ -315,48 +328,50 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     false
 }
 
-pub(crate) fn project_review_cycle_result_for_wait_result(
-    wait_result: &pl_core::AgentWaitResult,
+/// 把一次等待 reviewer Thread 稳定的 canonical 结果投影成 review cycle 结果。
+///
+/// 只有在最近一条已提交的终态 Turn 是 Completed 时才返回 `None`，表示还需要解析 reviewer 的最终
+/// JSON；Queued/Running 或不存在的 Turn 表示等待到的稳定状态没有可用的终态事实。
+pub(crate) fn project_review_cycle_result_for_wait_outcome(
+    outcome: &ThreadWaitOutcome,
 ) -> Option<ProjectReviewCycleResult> {
-    let Some(last_turn) = wait_result.last_turn.as_ref() else {
-        return Some(ProjectReviewCycleResult {
-            outcome: ProjectReviewOutcome::Failed,
-            review_event: None,
-            pr: None,
-            summary: Some("Review could not be completed.".to_string()),
-            error: Some("reviewer became idle without a turn outcome".to_string()),
-            failure: None,
-        });
+    let Some(last_turn) = outcome.last_turn.as_ref() else {
+        return Some(review_cycle_result_without_turn_outcome());
     };
-    let error = match &last_turn.outcome {
-        pl_protocol::TurnOutcome::Completed(_) => return None,
-        pl_protocol::TurnOutcome::Cancelled(_) => "reviewer turn was cancelled".to_string(),
-        pl_protocol::TurnOutcome::Failed(outcome) => outcome.failure().message.clone(),
-        pl_protocol::TurnOutcome::BudgetLimited(outcome) => {
-            format!("budget limited by {} budget", outcome.limit().kind.as_str())
+    let (error, failure) = match &last_turn.state {
+        pl_protocol::TurnState::Completed(_) => return None,
+        pl_protocol::TurnState::Queued(_) | pl_protocol::TurnState::Running(_) => {
+            return Some(review_cycle_result_without_turn_outcome());
         }
-    };
-    let failure = match &last_turn.outcome {
-        pl_protocol::TurnOutcome::Completed(_) => unreachable!("completed returned above"),
-        pl_protocol::TurnOutcome::BudgetLimited(_) => Some(ProjectReviewFailure {
-            category: mai_protocol::ProjectReviewFailureCategory::Timeout,
-            code: Some("review_turn_budget_limited".to_string()),
-            http_status: None,
-            message: error.clone(),
-            retry: pl_protocol::RetryDisposition::Retryable {
-                retry_after_ms: None,
-            },
-        }),
-        pl_protocol::TurnOutcome::Cancelled(_) => Some(ProjectReviewFailure {
-            category: mai_protocol::ProjectReviewFailureCategory::Internal,
-            code: Some("review_turn_cancelled".to_string()),
-            http_status: None,
-            message: error.clone(),
-            retry: pl_protocol::RetryDisposition::Retryable {
-                retry_after_ms: None,
-            },
-        }),
-        pl_protocol::TurnOutcome::Failed(outcome) => Some(outcome.failure().clone().into()),
+        pl_protocol::TurnState::Cancelled(_) => (
+            "reviewer turn was cancelled".to_string(),
+            Some(ProjectReviewFailure {
+                category: mai_protocol::ProjectReviewFailureCategory::Internal,
+                code: Some("review_turn_cancelled".to_string()),
+                http_status: None,
+                message: "reviewer turn was cancelled".to_string(),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: None,
+                },
+            }),
+        ),
+        pl_protocol::TurnState::Failed(state) => (
+            state.failure().message.clone(),
+            Some(state.failure().clone().into()),
+        ),
+        pl_protocol::TurnState::BudgetLimited(state) => {
+            let error = format!("budget limited by {} budget", state.limit().kind.as_str());
+            (
+                error.clone(),
+                Some(ProjectReviewFailure {
+                    category: mai_protocol::ProjectReviewFailureCategory::Timeout,
+                    code: Some("review_turn_budget_limited".to_string()),
+                    http_status: None,
+                    message: error,
+                    retry: pl_protocol::RetryDisposition::Permanent,
+                }),
+            )
+        }
     };
     Some(ProjectReviewCycleResult {
         outcome: ProjectReviewOutcome::Failed,
@@ -366,6 +381,17 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
         error: Some(error),
         failure,
     })
+}
+
+fn review_cycle_result_without_turn_outcome() -> ProjectReviewCycleResult {
+    ProjectReviewCycleResult {
+        outcome: ProjectReviewOutcome::Failed,
+        review_event: None,
+        pr: None,
+        summary: Some("Review could not be completed.".to_string()),
+        error: Some("reviewer became idle without a turn outcome".to_string()),
+        failure: None,
+    }
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -1034,14 +1060,18 @@ mod tests {
 
     #[test]
     fn failed_reviewer_turn_becomes_failure_result() {
-        let wait_result = test_wait_result(pl_protocol::TurnOutcome::failed(
-            pl_protocol::TurnFailure::permanent(
-                pl_protocol::TurnFailureCategory::Internal,
-                "container command timed out",
+        let wait_outcome = test_wait_outcome(pl_protocol::TurnState::Failed(
+            pl_protocol::FailedTurnState::new(
+                None,
+                1,
+                pl_protocol::TurnFailure::permanent(
+                    pl_protocol::TurnFailureCategory::Internal,
+                    "container command timed out",
+                ),
             ),
         ));
 
-        let result = project_review_cycle_result_for_wait_result(&wait_result)
+        let result = project_review_cycle_result_for_wait_outcome(&wait_outcome)
             .expect("failed reviewer should produce failed review result");
 
         assert_eq!(result.outcome, ProjectReviewOutcome::Failed);
@@ -1065,9 +1095,11 @@ mod tests {
                 retry_after_ms: Some(30_000),
             },
         };
-        let wait_result = test_wait_result(pl_protocol::TurnOutcome::failed(failure));
+        let wait_outcome = test_wait_outcome(pl_protocol::TurnState::Failed(
+            pl_protocol::FailedTurnState::new(None, 1, failure),
+        ));
 
-        let result = project_review_cycle_result_for_wait_result(&wait_result)
+        let result = project_review_cycle_result_for_wait_outcome(&wait_outcome)
             .expect("failed reviewer should produce failed review result");
 
         assert_eq!(
@@ -1085,17 +1117,21 @@ mod tests {
     }
 
     #[test]
-    fn budget_limited_turn_is_a_structured_retryable_timeout() {
-        let wait_result = test_wait_result(pl_protocol::TurnOutcome::budget_limited(
-            pl_protocol::BudgetLimitSnapshot {
-                kind: pl_protocol::BudgetLimitKind::WallClock,
-                usage: pl_protocol::BudgetUsage::default(),
-            },
-            pl_protocol::TurnRolloverOutcome::NotAttempted,
+    fn budget_limited_turn_does_not_resend_review_input() {
+        let wait_outcome = test_wait_outcome(pl_protocol::TurnState::BudgetLimited(
+            pl_protocol::BudgetLimitedTurnState::new(
+                None,
+                1,
+                pl_protocol::BudgetLimitSnapshot {
+                    kind: pl_protocol::BudgetLimitKind::WallClock,
+                    usage: pl_protocol::BudgetUsage::default(),
+                },
+                pl_protocol::TurnRolloverOutcome::NotAttempted,
+            ),
         ));
 
-        let result = project_review_cycle_result_for_wait_result(&wait_result)
-            .expect("budget-limited reviewer should continue in a later attempt");
+        let result = project_review_cycle_result_for_wait_outcome(&wait_outcome)
+            .expect("budget-limited reviewer should report a terminal failure");
 
         assert_eq!(
             Some(ProjectReviewFailure {
@@ -1103,9 +1139,7 @@ mod tests {
                 code: Some("review_turn_budget_limited".to_string()),
                 http_status: None,
                 message: "budget limited by wallClock budget".to_string(),
-                retry: pl_protocol::RetryDisposition::Retryable {
-                    retry_after_ms: None,
-                },
+                retry: pl_protocol::RetryDisposition::Permanent,
             }),
             result.failure
         );
@@ -1113,11 +1147,16 @@ mod tests {
 
     #[test]
     fn unexpected_cancelled_turn_is_a_structured_retryable_interruption() {
-        let wait_result = test_wait_result(pl_protocol::TurnOutcome::cancelled(
-            pl_protocol::TurnCancellationCause::UserRequested,
+        let wait_outcome = test_wait_outcome(pl_protocol::TurnState::Cancelled(
+            pl_protocol::CancelledTurnState::new(
+                None,
+                1,
+                1,
+                pl_protocol::TurnCancellationCause::UserRequested,
+            ),
         ));
 
-        let result = project_review_cycle_result_for_wait_result(&wait_result)
+        let result = project_review_cycle_result_for_wait_outcome(&wait_outcome)
             .expect("an unexpected cancellation should continue in a later attempt");
 
         assert_eq!(
@@ -1136,39 +1175,24 @@ mod tests {
 
     #[test]
     fn completed_reviewer_turn_does_not_skip_final_json_parsing() {
-        let wait_result = test_wait_result(pl_protocol::TurnOutcome::completed(
-            pl_protocol::TurnCompletion::Normal,
+        let wait_outcome = test_wait_outcome(pl_protocol::TurnState::Completed(
+            pl_protocol::CompletedTurnState::new(None, 1, pl_protocol::TurnCompletion::Normal),
         ));
 
-        assert!(project_review_cycle_result_for_wait_result(&wait_result).is_none());
+        assert!(project_review_cycle_result_for_wait_outcome(&wait_outcome).is_none());
     }
 
-    fn test_wait_result(outcome: pl_protocol::TurnOutcome) -> pl_core::AgentWaitResult {
-        let outcome = pl_core::AgentTurnOutcome {
-            turn_id: pl_core::TurnId::new("turn").expect("turn"),
-            thread_id: pl_core::ThreadId::new("reviewer").expect("thread"),
-            outcome,
-            usage: pl_model::TokenUsage::default(),
-            started_at: None,
-            finished_at: 1,
-        };
-        pl_core::AgentWaitResult {
-            snapshot: pl_core::AgentSnapshot {
-                identity: pl_core::AgentIdentity {
-                    id: pl_core::ThreadId::new("reviewer").expect("agent"),
-                    parent_id: None,
-                    role: pl_core::AgentRoleId::new("reviewer").expect("role"),
-                    depth: 0,
-                },
-                state: pl_protocol::AgentState::idle(),
-                pending_inputs: 0,
-                progress: None,
-                last_turn: Some(outcome.clone()),
+    fn test_wait_outcome(state: pl_protocol::TurnState) -> ThreadWaitOutcome {
+        let thread_id = "reviewer";
+        ThreadWaitOutcome {
+            last_turn: Some(pl_protocol::Turn {
+                input_id: None,
+                id: "turn".to_string(),
+                thread_id: thread_id.to_string(),
                 revision: 1,
-                event_sequence: 1,
+                state,
                 updated_at: 1,
-            },
-            last_turn: Some(outcome),
+            }),
         }
     }
 }

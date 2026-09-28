@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// mai 产品外部资源（容器、workspace、MCP）的生命周期。
 ///
 /// 该状态只描述产品资源，不能表达 PL Agent 的执行阶段。执行状态唯一来自
-/// `pl_protocol::AgentSnapshot`。
+/// `pl_protocol::ThreadSnapshot`。
 #[derive(
     Debug,
     Clone,

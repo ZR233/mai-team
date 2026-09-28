@@ -44,7 +44,7 @@ export function projectReviewUsage(attempts: ReviewRunSummary[]): ReviewUsagePro
   let previous: { reviewerAgentId: string; usage: TokenUsage } | null = null
 
   for (const { attempt } of sorted) {
-    const current = normalizeUsage(attempt.token_usage)
+    const current = normalizeUsage(attempt.usage)
     if (!current || usageIsEmpty(current)) continue
 
     const reviewerAgentId = attempt.reviewer_agent_id || ""

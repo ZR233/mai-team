@@ -1,29 +1,60 @@
 use super::*;
 
+use std::sync::Arc;
+
+use pl_core::context::ResourceAccess;
+use pl_core::persistence::SqliteSessionStore;
+use pl_core::thread::{
+    ContextCapacity, ModelStepLimit, ThreadCheckpoint, cold::ColdStoreHandle,
+    input::InputDriverOptions,
+};
+
+use crate::thread_host::{self, ProductRoute, ThreadToolRequest};
+
 impl AgentRuntime {
-    /// 等待 PL Thread repository 进入不可继续的 fail-stop 状态。
+    /// 等待 Runtime 进入不可继续的 fail-stop 状态。
     ///
-    /// 调用方应终止当前 Runtime 并从 durable 状态重新启动，不能在同一进程内
-    /// 丢弃待写提交后继续运行。
+    /// 新 PL 架构把存储故障表达为每个 Thread 的 typed `PersistenceState`，core 会在故障世代内暂停
+    /// 该 Thread 的准入；进程级退出信号统一由 [`crate::thread_host`] 的 fatal latch 上报，调用方
+    /// 应终止当前 Runtime 并从 durable 状态重新启动。
     pub async fn wait_for_fatal_error(&self) -> RuntimeError {
-        match self.agent_framework.get() {
-            Some(framework) => framework.host().wait_for_repository_failure().await,
-            None => RuntimeError::InvalidInput("agent framework is not started".to_string()),
-        }
+        thread_host::wait_for_fatal().await
     }
 
-    /// 先停止 PR discovery，再停止全部 PL actor并排空唯一 Thread 持久化写入器。
+    /// 先停止 PR discovery，再关闭全部驻留 Thread 并排空会话持久化 writer。
+    ///
+    /// Thread 关闭失败或 writer 停止失败都会保留对应 owner/句柄并返回错误，调用方可以重试同一
+    /// `shutdown`，不会丢失释放责任。
     pub async fn shutdown(&self) -> Result<()> {
         self.review_discovery_scheduler.shutdown().await?;
         self.review_ci_watch_scheduler.shutdown().await?;
-        let Some(framework) = self.agent_framework.get() else {
-            return Ok(());
-        };
-        framework
-            .shutdown()
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        framework.host().shutdown_repository().await
+
+        let thread_failures = self.thread_kernel.shutdown().await;
+        if !thread_failures.is_empty() {
+            let detail = thread_failures
+                .iter()
+                .map(|(id, error)| format!("{id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(RuntimeError::InvalidInput(format!(
+                "Thread shutdown left {} owner(s) requiring retry: {detail}",
+                thread_failures.len()
+            )));
+        }
+
+        let session_failures = self.session_history.shutdown().await;
+        if !session_failures.is_empty() {
+            let detail = session_failures
+                .iter()
+                .map(|(agent_id, error)| format!("{agent_id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(RuntimeError::InvalidInput(format!(
+                "session store shutdown left {} writer(s) requiring retry: {detail}",
+                session_failures.len()
+            )));
+        }
+        Ok(())
     }
 
     pub async fn new(
@@ -57,6 +88,7 @@ impl AgentRuntime {
                 container: RwLock::new(None),
                 mcp: RwLock::new(None),
                 review_context: RwLock::new(None),
+                skill_catalog: RwLock::new(None),
                 system_prompt: persisted.system_prompt,
             });
             agents.insert(summary.id, agent);
@@ -136,8 +168,10 @@ impl AgentRuntime {
             Arc::clone(&github_backend),
         ));
         let mai_config = Arc::new(RwLock::new(config::load_or_initialize(&store).await?));
+        let sessions_root = config.sessions_root.clone();
 
         let runtime = Arc::new(Self {
+            self_ref: OnceLock::new(),
             deps: RuntimeDeps {
                 docker,
                 store: Arc::clone(&store),
@@ -154,7 +188,9 @@ impl AgentRuntime {
                 snapshot.recent_events,
             ),
             mai_config: Arc::clone(&mai_config),
-            agent_framework: OnceCell::new(),
+            thread_kernel: thread_kernel::ThreadKernel::default(),
+            session_history: session_history::SessionHistory::new(sessions_root),
+            child_report_progress: Mutex::new(HashMap::new()),
             review_discovery_scheduler:
                 projects::review::discovery::ProjectReviewDiscoveryScheduler::new(),
             review_ci_watch_scheduler:
@@ -166,33 +202,13 @@ impl AgentRuntime {
             github_get_cache: github::GithubGetCache::default(),
             pull_request_state_refreshes: github::PullRequestStateRefreshCoordinator::default(),
             workspace_manager,
-            tool_sets: turn::tool_sets::AgentToolSets::new(),
         });
+        runtime
+            .self_ref
+            .set(Arc::downgrade(&runtime))
+            .expect("a new runtime has no prior self reference");
         runtime.reconcile_project_workspaces().await?;
         runtime.restore_project_repositories().await;
-        let host =
-            agent_host::MaiAgentHost::new(Arc::downgrade(&runtime), Arc::clone(&store), mai_config);
-        let framework = pl_core::AgentRuntime::start(
-            host,
-            pl_core::AgentRuntimeOptions {
-                command_capacity: 128,
-                cancel_grace: Duration::from_millis(
-                    runtime
-                        .mai_config
-                        .read()
-                        .await
-                        .containers
-                        .turn_cancel_grace_ms,
-                ),
-                restored_inputs: pl_core::RestoredInputPolicy::Hold,
-                thread_events: pl_core::ThreadEventOptions::default(),
-            },
-        )
-        .await
-        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        runtime.agent_framework.set(framework).map_err(|_| {
-            RuntimeError::InvalidInput("agent framework already started".to_string())
-        })?;
         runtime
             .cleanup_orphan_project_review_repository_views()
             .await;
@@ -218,156 +234,258 @@ impl AgentRuntime {
             .start(Arc::clone(&runtime))
             .await;
         runtime.start_enabled_project_review_workers().await;
+        tokio::spawn(crate::runtime_child_reports::run_child_report_loop(
+            Arc::downgrade(&runtime),
+        ));
         Ok(runtime)
     }
 
-    pub(super) fn framework_handle(&self) -> Result<pl_core::AgentRuntimeHandle> {
-        self.agent_framework
-            .get()
-            .map(pl_core::AgentRuntime::handle)
-            .ok_or_else(|| RuntimeError::InvalidInput("agent framework is not started".to_string()))
-    }
-
-    pub(super) async fn register_prepared_framework_agent(
-        &self,
-        resource: &mut runtime_agent_creation::PreparedAgentResource,
-    ) -> Result<()> {
-        let product_agent_id = resource.id();
-        let agent = self.agent(product_agent_id).await?;
-        if let Some(parent_id) = agent.summary.read().await.parent_id {
-            self.ensure_framework_agent(parent_id).await?;
-        }
-        resource.include_canonical_runtime();
-        self.register_resident_framework_agent(product_agent_id)
-            .await
-            .map(|_| ())
-    }
-
-    /// 按产品父子图顺序惰性恢复一个 PL actor；没有 v2 document 的长期 Agent
-    /// 在首次访问时创建全新的原生初始运行态。
-    pub(super) async fn ensure_framework_agent(
+    /// 按产品父子图顺序惰性装配并返回一个驻留 Thread。
+    ///
+    /// 祖先先装配，符合 PL `design/14` 对子 Thread 的父必须先激活的要求；同 id 的并发装配归一为
+    /// 同一个已发布 owner。
+    pub(crate) async fn ensure_thread(
         &self,
         product_agent_id: AgentId,
-    ) -> Result<pl_core::AgentSnapshot> {
+    ) -> Result<thread_kernel::ResidentThread> {
+        let owner = self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+            RuntimeError::InvalidInput("runtime owner is unavailable".to_string())
+        })?;
         let mut lineage = Vec::new();
         let mut current = Some(product_agent_id);
         while let Some(agent_id) = current {
             let agent = self.agent(agent_id).await?;
-            let summary = agent.summary.read().await;
+            let parent_id = agent.summary.read().await.parent_id;
             lineage.push(agent_id);
-            current = summary.parent_id;
+            current = parent_id;
         }
         lineage.reverse();
 
-        let framework = self.agent_framework.get().ok_or_else(|| {
-            RuntimeError::InvalidInput("agent framework is not started".to_string())
-        })?;
-        let handle = framework.handle();
         let mut requested = None;
         for agent_id in lineage {
-            let thread_id = agent_host::canonical_id(agent_id)?;
-            let (snapshot, restored) = match handle.snapshot(thread_id.clone()).await {
-                Ok(snapshot) => (snapshot, false),
-                Err(pl_core::AgentRuntimeError::NotFound(_)) => {
-                    match framework.host().restore_thread(&thread_id).await? {
-                        Some(restored) => (
-                            handle
-                                .restore_agent(restored)
-                                .await
-                                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
-                            true,
-                        ),
-                        None => (
-                            self.register_resident_framework_agent(agent_id).await?,
-                            true,
-                        ),
-                    }
-                }
-                Err(error) => return Err(RuntimeError::InvalidInput(error.to_string())),
-            };
-            if restored {
-                agent_host::synchronize_runtime_state(self, snapshot.clone()).await?;
-            }
+            let resident = owner.ensure_resident_thread(agent_id).await?;
             if agent_id == product_agent_id {
-                requested = Some(snapshot);
+                requested = Some(resident);
             }
         }
-        requested.ok_or_else(|| RuntimeError::AgentNotFound(product_agent_id))
+        requested.ok_or(RuntimeError::AgentNotFound(product_agent_id))
     }
 
-    async fn register_resident_framework_agent(
-        &self,
-        product_agent_id: AgentId,
-    ) -> Result<pl_core::AgentSnapshot> {
-        let Some(framework) = self.agent_framework.get() else {
-            return Err(RuntimeError::InvalidInput(
-                "agent framework is not started".to_string(),
-            ));
-        };
-        let handle = framework.handle();
-        let agent = self.agent(product_agent_id).await?;
-        let thread_id = pl_core::ThreadId::new(product_agent_id.to_string())?;
-        match handle.snapshot(thread_id.clone()).await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(pl_core::AgentRuntimeError::NotFound(_)) => {}
-            Err(error) => return Err(RuntimeError::InvalidInput(error.to_string())),
-        }
-        let summary = agent.summary.read().await.clone();
-        let parent_id = if let Some(parent_id) = summary.parent_id {
-            self.agent(parent_id).await?;
-            Some(pl_core::ThreadId::new(parent_id.to_string())?)
-        } else {
-            None
-        };
-        let records = self
-            .state
-            .agents
-            .read()
+    /// 注册一个已经准备好产品资源的 Agent 对应的驻留 Thread。
+    ///
+    /// 父 Thread 先于子 Thread 装配；注册成功后该 Agent 的 canonical 生命周期由 Thread owner
+    /// 承担，创建滚动回滚会关闭它。
+    pub(crate) async fn register_prepared_thread(
+        self: &Arc<Self>,
+        resource: &mut runtime_agent_creation::PreparedAgentResource,
+    ) -> Result<thread_kernel::ResidentThread> {
+        let product_agent_id = resource.id();
+        self.ensure_parent_thread(product_agent_id).await?;
+        resource.include_canonical_runtime();
+        self.assemble_thread(product_agent_id).await
+    }
+
+    /// 用调用方冻结的上下文继承装配并注册一个协作 child 的驻留 Thread。
+    ///
+    /// 与普通装配共用父 Thread 激活顺序与回滚语义，区别只在于初始 context 由 child 自己的
+    /// Profile 指令与调用方继承记录组合而成。
+    pub(crate) async fn register_prepared_child_thread(
+        self: &Arc<Self>,
+        resource: &mut runtime_agent_creation::PreparedAgentResource,
+        caller: &pl_core::tool::opaque::CallContext,
+        inheritance: pl_core::context::ContextInheritance,
+    ) -> Result<thread_kernel::ResidentThread> {
+        let product_agent_id = resource.id();
+        self.ensure_parent_thread(product_agent_id).await?;
+        resource.include_canonical_runtime();
+        self.assemble_child_thread(product_agent_id, caller, inheritance)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut summaries = HashMap::new();
-        for record in records {
-            let summary = record.summary.read().await.clone();
-            summaries.insert(summary.id, summary);
+    }
+
+    /// 先在父 Thread 已经驻留之后才装配子 Thread；根 Agent 直接跳过。
+    async fn ensure_parent_thread(&self, product_agent_id: AgentId) -> Result<()> {
+        let agent = self.agent(product_agent_id).await?;
+        if let Some(parent_id) = agent.summary.read().await.parent_id {
+            self.ensure_thread(parent_id).await?;
         }
-        let role = summary.role.unwrap_or_default();
-        let is_child = parent_id.is_some();
-        let identity = pl_core::AgentIdentity {
-            id: thread_id.clone(),
-            parent_id,
-            role: pl_core::AgentRoleId::new(role.to_string())?,
-            depth: framework_depth(product_agent_id, &summaries),
-        };
-        let mut registration = pl_core::AgentRegistration::new(identity);
-        registration.session = initial_thread_context(&summary);
-        if is_child {
-            let profile =
-                agent_host::product_agent_profile(&summary, agent.system_prompt.as_deref())?;
-            let project_root = if summary.project_id.is_some() {
-                projects::workspace::AGENT_WORKSPACE_REPO_PATH
-            } else {
-                "/workspace"
-            };
-            let assignment = agent_host::agent_workspace_assignment(&profile, project_root, None)?;
-            registration
-                .session
-                .session
-                .replace_agent_profile(Some(profile));
-            registration
-                .session
-                .session
-                .replace_workspace_assignment(Some(assignment));
-        }
-        let snapshot = handle
-            .register(registration)
+        Ok(())
+    }
+
+    /// 装配一个产品 Thread：恢复只消费 core 的 typed checkpoint，新 Thread 才写入初始指令。
+    ///
+    /// 该入口只发布完整驻留的 owner；装配失败时 core 会先关闭尚未发布的 owner，不会留下半成品。
+    pub(crate) async fn assemble_thread(
+        self: &Arc<Self>,
+        product_agent_id: AgentId,
+    ) -> Result<thread_kernel::ResidentThread> {
+        let agent = self.agent(product_agent_id).await?;
+        let thread_id = product_agent_id.to_string();
+        let store = self.open_session_store(product_agent_id).await?;
+        let checkpoint = store
+            .read_thread_checkpoint(&thread_id)
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        framework
-            .host()
-            .await_durable(&snapshot.identity.id, snapshot.revision)
-            .await?;
-        Ok(snapshot)
+        // 恢复路径复用 core 的 typed checkpoint，不允许再用当前配置覆盖旧指令。
+        let seed = if checkpoint.is_none() {
+            self.seed_for_agent(&agent).await
+        } else {
+            thread_host::ThreadSeed::default()
+        };
+        self.assemble_thread_spec(agent, thread_id, checkpoint, store, seed)
+            .await
+    }
+
+    /// 用调用方冻结的上下文继承装配一个全新的 child Thread。
+    ///
+    /// child 先获得自己的 Profile 指令，再追加调用方 context 中由
+    /// [`pl_core::context::ContextSnapshot::inherit`] 选出的记录；继承记录保留原身份，不复制
+    /// 执行器、模型会话或应用状态。只有没有 checkpoint 的新 Thread 才能这样装配。
+    pub(crate) async fn assemble_child_thread(
+        self: &Arc<Self>,
+        product_agent_id: AgentId,
+        caller: &pl_core::tool::opaque::CallContext,
+        inheritance: pl_core::context::ContextInheritance,
+    ) -> Result<thread_kernel::ResidentThread> {
+        let agent = self.agent(product_agent_id).await?;
+        let thread_id = product_agent_id.to_string();
+        let store = self.open_session_store(product_agent_id).await?;
+        let checkpoint = store
+            .read_thread_checkpoint(&thread_id)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        if checkpoint.is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "child Thread `{thread_id}` already has a checkpoint; inherited context assembly is \
+                 only valid for a new Thread"
+            )));
+        }
+        let inherited = caller.context.inherit(inheritance).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "cannot inherit caller context into child Thread `{thread_id}`: {error}"
+            ))
+        })?;
+        let mut seed = self.seed_for_agent(&agent).await;
+        seed.context.extend(inherited);
+        self.assemble_thread_spec(agent, thread_id, None, store, seed)
+            .await
+    }
+
+    /// 生成一个新 Thread 的静态初始指令。
+    async fn seed_for_agent(&self, agent: &Arc<AgentRecord>) -> thread_host::ThreadSeed {
+        let summary = agent.summary.read().await.clone();
+        let system_prompt = agent.system_prompt.clone();
+        let config = self.mai_config.read().await;
+        thread_host::thread_seed(&summary, system_prompt.as_deref(), &config.instructions)
+    }
+
+    /// 打开某个 Agent 独占的会话存储句柄。
+    async fn open_session_store(&self, product_agent_id: AgentId) -> Result<SqliteSessionStore> {
+        self.session_history
+            .open(product_agent_id)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+    }
+
+    /// 由已解析完成的产品事实构造并发布一个 canonical [`thread_kernel::ThreadSpec`]。
+    async fn assemble_thread_spec(
+        self: &Arc<Self>,
+        agent: Arc<AgentRecord>,
+        thread_id: String,
+        checkpoint: Option<ThreadCheckpoint>,
+        store: SqliteSessionStore,
+        seed: thread_host::ThreadSeed,
+    ) -> Result<thread_kernel::ResidentThread> {
+        let summary = agent.summary.read().await.clone();
+        let route = {
+            let config = self.mai_config.read().await;
+            thread_host::resolve_agent_route(&config.models, &summary)
+        };
+        let route = match route {
+            ProductRoute::Available(route) => Some(*route),
+            ProductRoute::Unavailable {
+                provider_id,
+                model,
+                reason,
+            } => {
+                if checkpoint.is_none() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "agent {} has no usable model route `{provider_id}/{model}`: {reason}",
+                        summary.id
+                    )));
+                }
+                tracing::warn!(agent_id = %summary.id, %provider_id, %model, %reason,
+                    "restoring Thread history without an available model route");
+                None
+            }
+        };
+        let tools = if route.is_some() {
+            thread_host::assemble_thread_tools(ThreadToolRequest {
+                runtime: Arc::clone(self),
+                agent: Arc::clone(&agent),
+                thread_id: thread_id.clone(),
+            })
+            .await?
+        } else {
+            thread_host::ThreadToolAssembly::default()
+        };
+        let spec = thread_kernel::ThreadSpec {
+            id: thread_id,
+            checkpoint,
+            route,
+            hosted_tools: tools.hosted_tools,
+            context_preparation: None,
+            initial_context: seed.context,
+            initial_extensions: seed.extensions,
+            registrations: tools.registrations,
+            resources: ResourceAccess::new(thread_resources::MaiResourceStore::new(
+                thread_resources::thread_resources_root(&self.artifact_files_root),
+            )),
+            capacity: ContextCapacity::Unbounded,
+            cold_store: Some(ColdStoreHandle::new(store)),
+            input_driver: InputDriverOptions {
+                // 主会话与独立 Review reviewer 不限步数；协作 child 每个 Turn 单独限 256 步。
+                max_model_steps: if summary.parent_id.is_some()
+                    && summary.profile_id.as_deref() != Some("reviewer")
+                {
+                    ModelStepLimit::Limited(256.try_into().expect("256 is a valid step limit"))
+                } else {
+                    ModelStepLimit::Unlimited
+                },
+            },
+        };
+        self.thread_kernel
+            .assemble(spec)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+    }
+
+    /// 返回一个已经完整发布的驻留 Thread；不触发装配。
+    pub(crate) fn resident_thread(
+        &self,
+        product_agent_id: AgentId,
+    ) -> Option<thread_kernel::ResidentThread> {
+        self.thread_kernel.lookup(&product_agent_id.to_string())
+    }
+
+    /// 关闭并移除一个驻留 Thread；关闭失败时 owner 保留，可重试。
+    pub(crate) async fn close_thread(&self, product_agent_id: AgentId) -> Result<()> {
+        self.thread_kernel
+            .close(&product_agent_id.to_string())
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+    }
+
+    async fn ensure_resident_thread(
+        self: &Arc<Self>,
+        product_agent_id: AgentId,
+    ) -> Result<thread_kernel::ResidentThread> {
+        if let Some(resident) = self.resident_thread(product_agent_id) {
+            return Ok(resident);
+        }
+        match self.assemble_thread(product_agent_id).await {
+            Ok(resident) => Ok(resident),
+            // 并发装配同 id 时内核会拒绝第二个装配者；此时已发布 owner 才是权威结果。
+            Err(error) => self.resident_thread(product_agent_id).ok_or(error),
+        }
     }
 }

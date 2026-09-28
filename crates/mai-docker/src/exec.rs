@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-use pl_core::{ShellCommandTimeout, shell_command_with_timeout};
+use pl_tool::shell::{ShellCommandTimeout, shell_command_with_timeout, shell_quote_word};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -570,7 +570,7 @@ fn managed_exec_pid_file(process_id: &str) -> Result<String> {
 }
 
 fn managed_exec_kill_command(pid_file: &str) -> String {
-    let pid_file = pl_core::shell_quote_word(pid_file);
+    let pid_file = shell_quote_word(pid_file);
     format!(
         "if test -r {pid_file}; then pid=$(cat {pid_file}); kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; sleep 1; kill -KILL -- \"-$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; rm -f {pid_file}; fi"
     )
@@ -792,7 +792,7 @@ mod tests {
         let args_file = dir.join("args.txt");
         let script = fake_docker_script(&format!(
             "printf '%s\\n' \"$@\" > {}\nprintf ready\n",
-            pl_core::shell_quote_word(&args_file.display().to_string())
+            shell_quote_word(&args_file.display().to_string())
         ));
         let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
 

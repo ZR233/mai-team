@@ -16,6 +16,7 @@ describe("Review PL v2 归档展示", () => {
       outcome: "review_submitted",
       review_event: "approve",
       summary: "Review completed",
+      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
       history_status: "available",
       history: {
         turn: {
@@ -67,6 +68,7 @@ describe("Review PL v2 归档展示", () => {
       outcome: "review_submitted",
       review_event: "approve",
       summary: "Review completed",
+      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
       history_status: "pl_v2_archived",
       history_archive_id: "pl-v2-20260826",
       history_archived_at: "2026-08-26T01:00:00Z",

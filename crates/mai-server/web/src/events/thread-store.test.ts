@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest"
 
-import type { ThreadSnapshot } from "@/events/thread-events.generated"
+import type { ThreadNotification, ThreadNotificationEnvelope, ThreadSnapshot } from "@/events/thread-events.generated"
 import { ThreadStoreRegistry } from "@/events/thread-store"
 
 describe("ThreadStoreRegistry", () => {
@@ -16,11 +16,11 @@ describe("ThreadStoreRegistry", () => {
     a.getState().replace(generationA, snapshot("thread-a"))
     b.getState().replace(generationB, snapshot("thread-b"))
 
-    a.getState().apply(generationA, { threadId: "thread-a", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-a", threadId: "thread-a", revision: 0, state: { kind: "queued", data: { queuedAt: 2 } }, updatedAt: 2 } } })
-    b.getState().apply(generationB, { threadId: "thread-b", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-b", threadId: "thread-b", revision: 0, state: { kind: "queued", data: { queuedAt: 2 } }, updatedAt: 2 } } })
+    a.getState().apply(generationA, envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }))
+    b.getState().apply(generationB, envelope("thread-b", { type: "turnStarted", turn: turn("thread-b") }))
 
-    expect(a.getState().snapshot?.activeTurn?.id).toBe("turn-a")
-    expect(b.getState().snapshot?.activeTurn?.id).toBe("turn-b")
+    expect(a.getState().snapshot?.activeTurn?.id).toBe("thread-a:turn")
+    expect(b.getState().snapshot?.activeTurn?.id).toBe("thread-b:turn")
   })
 
   it("旧 generation 不能修改重新订阅后的状态", () => {
@@ -31,14 +31,61 @@ describe("ThreadStoreRegistry", () => {
     store.getState().replace(currentGeneration, snapshot("thread-a", "current"))
     expect(store.getState().snapshot?.thread.title).toBe("current")
   })
+
+  it("广播 epoch 变化会拒绝迟到帧", () => {
+    const store = registry.get("thread-a")
+    const generation = store.getState().begin()
+    store.getState().replace(generation, snapshot("thread-a"))
+    store.getState().apply(generation, envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }, { epoch: 1 }))
+    expect(() => store.getState().apply(generation, envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }, { epoch: 2, baseRevision: 1, revision: 2 }))).toThrow(/epoch changed/)
+  })
+
+  it("首帧到达前拒绝通知", () => {
+    const store = registry.get("thread-a")
+    const generation = store.getState().begin()
+    expect(() => store.getState().apply(generation, envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }))).toThrow(/before authoritative snapshot/)
+  })
 })
 
 function snapshot(threadId: string, title = threadId): ThreadSnapshot {
   return {
-    schemaVersion: 7,
+    schemaVersion: 14,
     revision: 0,
-    thread: { id: threadId, projectId: "", title, mode: "simple", rootThreadId: threadId, role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false },
-    items: [],
+    thread: {
+      id: threadId,
+      projectId: "",
+      title,
+      mode: "mode.simple",
+      workspaceMode: "local",
+      workspacePath: "",
+      rootThreadId: threadId,
+      role: "planner",
+      agentPath: "root",
+      status: "idle",
+      createdAt: 1,
+      updatedAt: 1,
+      archived: false,
+    },
     interactions: [],
+  }
+}
+
+function turn(threadId: string) {
+  return { id: `${threadId}:turn`, threadId, revision: 0, state: { kind: "queued" as const, data: { queuedAt: 2 } }, updatedAt: 2 }
+}
+
+function envelope(
+  threadId: string,
+  notification: ThreadNotification,
+  overrides: { epoch?: number; baseRevision?: number; revision?: number } = {},
+): ThreadNotificationEnvelope {
+  const revision = overrides.revision ?? 1
+  return {
+    threadId,
+    epoch: overrides.epoch ?? 1,
+    baseRevision: overrides.baseRevision ?? 0,
+    revision,
+    emittedAt: revision,
+    notification,
   }
 }

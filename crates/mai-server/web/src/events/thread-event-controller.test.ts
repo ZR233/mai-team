@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ThreadEventController } from "@/events/thread-event-controller"
-import type { ThreadSubscriptionUpdate } from "@/events/thread-events.generated"
+import type { ThreadNotification, ThreadNotificationEnvelope, ThreadSubscriptionUpdate } from "@/events/thread-events.generated"
 import { ThreadStoreRegistry } from "@/events/thread-store"
 
 type EventListenerCallback = (event: MessageEvent<string>) => void
@@ -74,12 +74,7 @@ describe("ThreadEventController", () => {
     sourceB.emit("snapshot", { type: "snapshot", snapshot: snapshot("thread-b") })
     sourceA.emit("notification", {
       type: "notification",
-      notification: {
-        threadId: "thread-b",
-        revision: 1,
-        emittedAt: 2,
-        notification: { type: "turnStarted", turn: turn("thread-b") },
-      },
+      notification: envelope("thread-b", { type: "turnStarted", turn: turn("thread-b") }),
     })
 
     expect(a.getState().snapshot).toBeNull()
@@ -89,6 +84,24 @@ describe("ThreadEventController", () => {
     expect(sourceB.closed).toBe(false)
     vi.runAllTimers()
     expect(FakeEventSource.instances[2].url).toBe("/threads/thread-a/events")
+  })
+
+  it("typed 通知按新水位拼接到权威首帧", () => {
+    vi.useFakeTimers()
+    const store = new ThreadStoreRegistry().get("thread-a")
+    const controller = new ThreadEventController(store)
+    controllers.push(controller)
+    controller.connect()
+    const source = FakeEventSource.instances[0]
+
+    source.emit("snapshot", { type: "snapshot", snapshot: snapshot("thread-a") })
+    source.emit("notification", {
+      type: "notification",
+      notification: envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }),
+    })
+
+    expect(store.getState().snapshot?.activeTurn?.id).toBe("thread-a:turn")
+    expect(store.getState().connection).toBe("live")
   })
 
   it("底层连接永久关闭时创建新的 EventSource generation", () => {
@@ -153,12 +166,7 @@ describe("ThreadEventController", () => {
     const generation = store.getState().generation
     source.emit("notification", {
       type: "notification",
-      notification: {
-        threadId: "thread-a",
-        revision: 1,
-        emittedAt: 2,
-        notification: { type: "lagged", dropped: 7 },
-      },
+      notification: envelope("thread-a", { type: "lagged", dropped: 7 }, { baseRevision: 0, revision: 1 }),
     })
     expect(store.getState().generation).toBe(generation + 1)
     expect(store.getState().snapshot).toBeNull()
@@ -172,12 +180,7 @@ describe("ThreadEventController", () => {
     controller.connect()
     FakeEventSource.instances[0].emit("notification", {
       type: "notification",
-      notification: {
-        threadId: "thread-a",
-        revision: 1,
-        emittedAt: 2,
-        notification: { type: "turnStarted", turn: turn("thread-a") },
-      },
+      notification: envelope("thread-a", { type: "turnStarted", turn: turn("thread-a") }),
     })
 
     controller.dispose()
@@ -190,13 +193,15 @@ describe("ThreadEventController", () => {
 
 function snapshot(threadId: string) {
   return {
-    schemaVersion: 7,
+    schemaVersion: 14,
     revision: 0,
     thread: {
       id: threadId,
       projectId: "",
       title: threadId,
-      mode: "simple" as const,
+      mode: "mode.simple",
+      workspaceMode: "local" as const,
+      workspacePath: "",
       rootThreadId: threadId,
       role: "planner",
       agentPath: "root",
@@ -205,7 +210,6 @@ function snapshot(threadId: string) {
       updatedAt: 1,
       archived: false,
     },
-    items: [],
     interactions: [],
   }
 }
@@ -217,5 +221,21 @@ function turn(threadId: string) {
     revision: 0,
     state: { kind: "queued" as const, data: { queuedAt: 2 } },
     updatedAt: 2,
+  }
+}
+
+function envelope(
+  threadId: string,
+  notification: ThreadNotification,
+  overrides: { epoch?: number; baseRevision?: number; revision?: number } = {},
+): ThreadNotificationEnvelope {
+  const revision = overrides.revision ?? 1
+  return {
+    threadId,
+    epoch: overrides.epoch ?? 1,
+    baseRevision: overrides.baseRevision ?? 0,
+    revision,
+    emittedAt: revision,
+    notification,
   }
 }

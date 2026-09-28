@@ -1,13 +1,14 @@
 #[cfg(test)]
-use pl_core::TypedTool;
-#[cfg(test)]
-use pl_model::ToolSpec;
+use pl_protocol::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[cfg(test)]
-use super::super::names::{
-    TOOL_READ_TOOL_ARTIFACT, TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT,
+use super::{
+    super::names::{
+        TOOL_READ_TOOL_ARTIFACT, TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT,
+    },
+    input_schema,
 };
 
 pub(crate) const SAVE_TASK_PLAN_DESCRIPTION: &str = "Save or update the task plan. Each call replaces the previous plan and increments the version. \
@@ -96,9 +97,5 @@ fn schema<Input>(name: &str, description: &str) -> ToolSpec
 where
     Input: JsonSchema,
 {
-    ToolSpec::function(
-        name,
-        description,
-        TypedTool::<Input>::new(name, description).input_schema(),
-    )
+    ToolSpec::function(name, description, input_schema::<Input>())
 }

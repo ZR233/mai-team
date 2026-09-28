@@ -22,12 +22,27 @@ impl MaiStore {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         delete_agent_row_in_tx(&mut tx, summary.id).await?;
+        Query::<List<RetiredAgentSessionRecord>>::filter(
+            RetiredAgentSessionRecord::fields()
+                .agent_id()
+                .eq(summary.id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
         toasty::create!(AgentRecordRow {
             id: summary.id.to_string(),
             parent_id: summary.parent_id.map(|id| id.to_string()),
             task_id: summary.task_id.map(|id| id.to_string()),
             project_id: summary.project_id.map(|id| id.to_string()),
             role: summary.role.map(|r| r.to_string()),
+            profile_id: summary.profile_id.clone(),
+            workspace_json: summary
+                .workspace
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            review_run_id: summary.review_run_id.map(|id| id.to_string()),
             name: summary.name.clone(),
             resource_state: summary.resource.state.to_string(),
             resource_error: summary.resource.error.clone(),
@@ -56,7 +71,20 @@ impl MaiStore {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         delete_agent_row_in_tx(&mut tx, agent_id).await?;
-        delete_thread_runtime_in_tx(&mut tx, &agent_id.to_string()).await?;
+        Query::<List<RetiredAgentSessionRecord>>::filter(
+            RetiredAgentSessionRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+        toasty::create!(RetiredAgentSessionRecord {
+            agent_id: agent_id.to_string(),
+            retired_at: Utc::now().to_rfc3339(),
+        })
+        .exec(&mut tx)
+        .await?;
         Query::<List<AgentLogRecord>>::filter(
             AgentLogRecord::fields().agent_id().eq(agent_id.to_string()),
         )
@@ -75,6 +103,41 @@ impl MaiStore {
         Ok(())
     }
 
+    /// 查询已到期且没有重新创建产品 Agent 的会话身份；不读取 PL 数据库。
+    pub async fn expired_agent_sessions(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<Vec<AgentId>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<RetiredAgentSessionRecord>>::filter(
+            RetiredAgentSessionRecord::fields()
+                .retired_at()
+                .lt(cutoff.to_rfc3339()),
+        )
+        .exec(&mut db)
+        .await?;
+        rows.sort_by(|left, right| left.retired_at.cmp(&right.retired_at));
+        rows.into_iter()
+            .take(batch_size)
+            .map(|row| parse_agent_id(&row.agent_id))
+            .collect()
+    }
+
+    /// PL 已完成删除后才移除产品清理收据，失败时下轮继续重试。
+    pub async fn complete_agent_session_retirement(&self, agent_id: AgentId) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<RetiredAgentSessionRecord>>::filter(
+            RetiredAgentSessionRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
     pub async fn load_runtime_snapshot(
         &self,
         recent_event_limit: usize,
@@ -86,35 +149,9 @@ impl MaiStore {
         let mut agents = Vec::with_capacity(agent_rows.len());
         for row in agent_rows {
             let system_prompt = row.system_prompt.clone();
-            let mut summary = row.into_summary()?;
-            if let Some(runtime) = self.load_thread_runtime(&summary.id.to_string()).await?
-                && let Some(usage) = runtime.snapshot.and_then(|snapshot| snapshot.runtime)
-            {
-                summary.token_usage.prompt_tokens = summary
-                    .token_usage
-                    .prompt_tokens
-                    .saturating_add(usage.usage.prompt_tokens);
-                summary.token_usage.cached_prompt_tokens = summary
-                    .token_usage
-                    .cached_prompt_tokens
-                    .saturating_add(usage.usage.cached_prompt_tokens);
-                summary.token_usage.cache_write_tokens = summary
-                    .token_usage
-                    .cache_write_tokens
-                    .saturating_add(usage.usage.cache_write_tokens);
-                summary.token_usage.completion_tokens = summary
-                    .token_usage
-                    .completion_tokens
-                    .saturating_add(usage.usage.completion_tokens);
-                summary.token_usage.reasoning_tokens = summary
-                    .token_usage
-                    .reasoning_tokens
-                    .saturating_add(usage.usage.reasoning_tokens);
-                summary.token_usage.total_tokens = summary
-                    .token_usage
-                    .total_tokens
-                    .saturating_add(usage.usage.total_tokens);
-            }
+            // mai-store 只加载 mai 产品 Agent/Task/Project；agent 的累计用量由产品
+            // 运行时在内存中维护，不再从旧 pl-core Thread runtime 重建。
+            let summary = row.into_summary()?;
             agents.push(PersistedAgent {
                 summary,
                 system_prompt,
@@ -154,113 +191,4 @@ pub(crate) async fn delete_agent_row_in_tx(
         .exec(tx)
         .await?;
     Ok(())
-}
-
-async fn delete_thread_runtime_in_tx(
-    tx: &mut toasty::Transaction<'_>,
-    thread_id: &str,
-) -> Result<()> {
-    Query::<List<ThreadRuntimeDocumentRecord>>::filter(
-        ThreadRuntimeDocumentRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadTurnRecord>>::filter(
-        ThreadTurnRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadItemRecord>>::filter(
-        ThreadItemRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadNotificationRecord>>::filter(
-        ThreadNotificationRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadRuntimeEventRecord>>::filter(
-        ThreadRuntimeEventRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadRuntimeTraceRecord>>::filter(
-        ThreadRuntimeTraceRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<ThreadSubmissionRecord>>::filter(
-        ThreadSubmissionRecord::fields()
-            .thread_id()
-            .eq(thread_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn deleting_thread_runtime_removes_durable_submissions() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = MaiStore::open_with_config_and_artifact_index_path(
-            directory.path().join("store.sqlite3"),
-            directory.path().join("config.toml"),
-            directory.path().join("artifacts"),
-        )
-        .await
-        .expect("open store");
-        let thread_id = "reviewer-thread";
-        let mut db = store.db.clone();
-        toasty::create!(ThreadSubmissionRecord {
-            id: format!("{thread_id}:1"),
-            thread_id: thread_id.to_string(),
-            ordinal: 1,
-            created_at: 1,
-            submission_json: "{}".to_string(),
-        })
-        .exec(&mut db)
-        .await
-        .expect("save submission");
-
-        let mut tx = db.transaction().await.expect("begin delete");
-        delete_thread_runtime_in_tx(&mut tx, thread_id)
-            .await
-            .expect("delete runtime");
-        tx.commit().await.expect("commit delete");
-
-        assert_eq!(
-            store
-                .list_thread_submissions(thread_id, 0, 20)
-                .await
-                .expect("list submissions")
-                .items,
-            Vec::new()
-        );
-    }
 }

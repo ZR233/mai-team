@@ -58,7 +58,7 @@ impl AgentRuntime {
         preference: Option<&AgentModelPreference>,
     ) -> Result<ResolvedAgentModel> {
         let mut models = self.mai_config.read().await.models.clone();
-        let role_id = pl_core::AgentRoleId::new(agent_role_label(role))?;
+        let role_id = pl_model::config::AgentRoleId::new(agent_role_label(role))?;
         if let Some(preference) = preference {
             models.routes.insert(role_id.clone(), preference.clone());
         }
@@ -101,19 +101,5 @@ impl AgentRuntime {
             )
             .await?;
         agents::ensure_agent_container_with_source(self, &agent, &source).await
-    }
-
-    pub(super) async fn prepare_agent_mcp_lease(
-        &self,
-        agent: &AgentRecord,
-        config: &MaiConfig,
-    ) -> Result<Option<pl_core::McpTurnLease>> {
-        let Some(runtime) = agent.mcp.read().await.clone() else {
-            return Ok(None);
-        };
-        if !config.mcp.enabled {
-            return Ok(None);
-        }
-        Ok(Some(runtime.handle().acquire_turn_lease().await?))
     }
 }

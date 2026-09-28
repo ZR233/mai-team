@@ -14,7 +14,7 @@ const agent = {
   model: "future-model",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
-  token_usage: {
+  usage: {
     promptTokens: 0,
     cachedPromptTokens: 0,
     cacheWriteTokens: 0,

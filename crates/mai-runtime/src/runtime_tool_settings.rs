@@ -6,8 +6,10 @@ use mai_protocol::{
     McpServerPublicConfig, McpServerScope, McpServerSecretClearRequest, McpServersConfigRequest,
     McpServersResponse, WebSearchLocationSettings, WebSearchSettings, WebSearchSettingsResponse,
 };
-use pl_core::{AgentRoleId, McpServerSourceKind, McpServerStatusKind};
-use pl_model::{WebSearchContextSize, WebSearchLocation, WebSearchMode};
+use pl_model::config::AgentRoleId;
+use pl_protocol::WebSearchContextSize;
+use pl_protocol::search::{WebSearchConfig, WebSearchLocation, WebSearchMode};
+use pl_tool::mcp::config::{McpServerSourceKind, McpServerStatusKind};
 
 use crate::{AgentRuntime, Result, RuntimeError, config, mcp};
 
@@ -24,8 +26,19 @@ impl AgentRuntime {
         for role in ["planner", "explorer", "executor", "reviewer"] {
             let role_id = AgentRoleId::new(role)?;
             let route = config.models.resolve(&role_id)?;
-            let plan = pl_core::plan_web_search(&config.models, &route, &config.web_search)?;
-            roles.insert(role.to_string(), plan.resolution.descriptor());
+            let plans = pl_tool::search::plan_web_searches(
+                &config.models,
+                &route,
+                &config.web_search,
+                !config.web_search.mode.is_disabled(),
+            )?;
+            let resolution = match plans.selected {
+                Some(pl_tool::search::WebSearchBackendKind::DeepSeek) => &plans.deepseek.resolution,
+                Some(pl_tool::search::WebSearchBackendKind::OpenAi) | None => {
+                    &plans.openai.resolution
+                }
+            };
+            roles.insert(role.to_string(), resolution.descriptor());
         }
         Ok(WebSearchSettingsResponse {
             config: web_search_to_api(&config.web_search),
@@ -147,9 +160,8 @@ impl AgentRuntime {
         let states = request
             .servers
             .into_iter()
-            .map(|(id, enabled)| (id, pl_core::BuiltinMcpServerState { enabled }))
+            .map(|(id, enabled)| (id, crate::config::MaiBuiltinMcpServerState { enabled }))
             .collect();
-        pl_core::validate_builtin_mcp_server_states(&states)?;
         {
             let mut config = self.mai_config.write().await;
             let mut next = config.clone();
@@ -341,7 +353,7 @@ fn empty_aggregate(descriptor: McpServerDescriptor) -> McpServerAggregate {
     }
 }
 
-fn web_search_to_api(config: &pl_model::WebSearchConfig) -> WebSearchSettings {
+fn web_search_to_api(config: &WebSearchConfig) -> WebSearchSettings {
     WebSearchSettings {
         mode: mode_name(config.mode).to_string(),
         context_size: config
@@ -361,8 +373,8 @@ fn web_search_to_api(config: &pl_model::WebSearchConfig) -> WebSearchSettings {
     }
 }
 
-fn web_search_from_api(config: WebSearchSettings) -> Result<pl_model::WebSearchConfig> {
-    Ok(pl_model::WebSearchConfig {
+fn web_search_from_api(config: WebSearchSettings) -> Result<WebSearchConfig> {
+    Ok(WebSearchConfig {
         mode: match config.mode.as_str() {
             "disabled" => WebSearchMode::Disabled,
             "cached" => WebSearchMode::Cached,

@@ -3,17 +3,18 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mai_protocol::{AgentId, ToolOutputArtifactInfo};
-use pl_core::{
-    CommandBackend, CommandCaptureStream, CommandExit, CommandOutputSizes, CommandOutputTarget,
-    CommandReader, CommandSpawnRequest, CommandWriter, ManagedCommand, command_output_model_path,
-    tool::output_format::capture::{
-        ToolOutputArtifactPathRequest, ToolOutputCapture, ToolOutputCaptureRequest,
-        ToolOutputStreamSizes, tool_output_artifact_file_path,
-    },
+use pl_tool::command::{
+    CommandBackend, CommandCaptureStream, CommandExit, CommandIo, CommandOutputSizes,
+    CommandOutputTarget, CommandReader, CommandSpawnRequest, CommandWriter, ManagedCommand,
+    command_output_model_path,
 };
+use pl_tool::shell::shell_quote_word;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use super::container::{
+    MaiToolOutputCapture, MaiToolOutputStreamSizes, tool_output_artifact_file_path,
+};
 use crate::{AgentRuntime, Result, RuntimeError};
 
 /// Mai 的容器工作区命令后端。
@@ -25,8 +26,7 @@ pub(crate) struct MaiCommandBackend {
     runtime: Arc<AgentRuntime>,
     agent_id: AgentId,
     workspace_root: PathBuf,
-    container_id: Arc<Mutex<Option<String>>>,
-    captures: Arc<Mutex<HashMap<PathBuf, ToolOutputCapture>>>,
+    captures: Arc<Mutex<HashMap<PathBuf, MaiToolOutputCapture>>>,
     output_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -40,16 +40,13 @@ impl MaiCommandBackend {
             runtime,
             agent_id,
             workspace_root: workspace_root.into(),
-            container_id: Arc::new(Mutex::new(None)),
             captures: Arc::new(Mutex::new(HashMap::new())),
             output_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     async fn current_container_id(&self) -> Result<String> {
-        let container_id = self.runtime.container_id(self.agent_id).await?;
-        *self.container_id.lock().map_err(lock_error)? = Some(container_id.clone());
-        Ok(container_id)
+        self.runtime.container_id(self.agent_id).await
     }
 
     fn workspace_path(&self, path: &Path) -> Result<PathBuf> {
@@ -71,13 +68,13 @@ impl MaiCommandBackend {
         let command = if allow_workspace_escape {
             format!(
                 "resolved=$(readlink -f -- {candidate}) || exit 2; printf '%s' \"$resolved\"",
-                candidate = pl_core::shell_quote_word(candidate),
+                candidate = shell_quote_word(candidate),
             )
         } else {
             format!(
                 "resolved=$(readlink -f -- {candidate}) || exit 2; case \"$resolved\" in {root}|{root}/*) printf '%s' \"$resolved\" ;; *) exit 3 ;; esac",
-                candidate = pl_core::shell_quote_word(candidate),
-                root = pl_core::shell_quote_word(root),
+                candidate = shell_quote_word(candidate),
+                root = shell_quote_word(root),
             )
         };
         let output = self
@@ -187,27 +184,22 @@ impl CommandBackend for MaiCommandBackend {
         let namespace = self.agent_id.to_string();
         let stdout_id = Uuid::new_v4().to_string();
         let stderr_id = Uuid::new_v4().to_string();
-        let capture = ToolOutputCapture::prepare(
-            ToolOutputCaptureRequest::new(
-                &self.runtime.artifact_files_root,
-                call_id,
-                &stdout_id,
-                &stderr_id,
-                command,
-            )
-            .with_namespace(&namespace),
+        let capture = MaiToolOutputCapture::prepare(
+            &self.runtime.artifact_files_root,
+            &namespace,
+            call_id,
+            &stdout_id,
+            &stderr_id,
+            command,
         )
-        .await
-        .map_err(runtime_invalid_input)?;
+        .await?;
         let combined_id = Uuid::new_v4().to_string();
         let capture_file = tool_output_artifact_file_path(
-            ToolOutputArtifactPathRequest::new(
-                &self.runtime.artifact_files_root,
-                call_id,
-                &combined_id,
-                "output.log",
-            )
-            .with_namespace(&namespace),
+            &self.runtime.artifact_files_root,
+            &namespace,
+            call_id,
+            &combined_id,
+            "output.log",
         );
         let model_file = command_output_model_path(session_id, tool_id);
         let target = CommandOutputTarget::new(capture_file.clone(), model_file)
@@ -233,27 +225,38 @@ impl CommandBackend for MaiCommandBackend {
             )
             .map_err(RuntimeError::from)?;
         let host_pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .map(|value| Box::pin(value) as CommandWriter);
-        let stdout = child
-            .stdout
-            .take()
-            .map(|value| Box::pin(value) as CommandReader);
-        let stderr = child
-            .stderr
-            .take()
-            .map(|value| Box::pin(value) as CommandReader);
+        let io = CommandIo {
+            stdin: child
+                .stdin
+                .take()
+                .map(|value| Box::pin(value) as CommandWriter),
+            stdout: child
+                .stdout
+                .take()
+                .map(|value| Box::pin(value) as CommandReader),
+            stderr: child
+                .stderr
+                .take()
+                .map(|value| Box::pin(value) as CommandReader),
+        };
+        let runtime = self.runtime.clone();
+        let process_id = request.process_id.clone();
         Ok(ManagedCommand::new(
             host_pid,
-            stdin,
-            stdout,
-            stderr,
-            async move {
-                child
-                    .wait()
-                    .await
+            io,
+            move |cancellation| async move {
+                let result = tokio::select! {
+                    result = child.wait() => result,
+                    _ = cancellation.cancelled() => {
+                        runtime
+                            .deps
+                            .docker
+                            .terminate_managed_exec(&container_id, &process_id, host_pid)
+                            .await;
+                        child.wait().await
+                    }
+                };
+                result
                     .map(|status| CommandExit {
                         exit_code: status.code(),
                     })
@@ -267,14 +270,14 @@ impl CommandBackend for MaiCommandBackend {
         target: &CommandOutputTarget,
         command: &str,
         working_directory: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _guard = self.output_write_lock.lock().await;
         if let Some(parent) = target.capture_file().parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let header = format!("=== COMMAND ===\n{command}\n\n=== CWD ===\n{working_directory}\n\n");
-        tokio::fs::write(target.capture_file(), header).await?;
-        Ok(())
+        tokio::fs::write(target.capture_file(), header.as_bytes()).await?;
+        Ok(header.len() as u64)
     }
 
     async fn append_output_chunk(
@@ -282,7 +285,7 @@ impl CommandBackend for MaiCommandBackend {
         target: &CommandOutputTarget,
         stream: CommandCaptureStream,
         chunk: &[u8],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _guard = self.output_write_lock.lock().await;
         let mut combined = tokio::fs::OpenOptions::new()
             .create(true)
@@ -307,8 +310,45 @@ impl CommandBackend for MaiCommandBackend {
                 .open(stream_file)
                 .await?;
             capture.write_all(chunk).await?;
+            capture.flush().await?;
         }
-        Ok(())
+        combined.flush().await?;
+        Ok(combined.metadata().await?.len())
+    }
+
+    async fn repair_output_chunk(
+        &self,
+        capture_file: &Path,
+        stream: CommandCaptureStream,
+        committed_len: u64,
+        chunk: &[u8],
+    ) -> Result<u64> {
+        // 先把可能写坏的部分截断回上次确认的偏移，再按正常 append 的 frame 重放一次，
+        // 因此重复 repair 得到相同字节而不是重复追加，命令本身不会被重跑。
+        // 这里只修复模型可见的合并输出片段；artifact 的 per-stream 文件仍只由成功 append 写入。
+        let _guard = self.output_write_lock.lock().await;
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(capture_file)
+            .await?;
+        file.set_len(committed_len).await?;
+        drop(file);
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(capture_file)
+            .await?;
+        let label = match stream {
+            CommandCaptureStream::Stdout => "STDOUT",
+            CommandCaptureStream::Stderr => "STDERR",
+        };
+        file.write_all(format!("=== {label} ===\n").as_bytes())
+            .await?;
+        file.write_all(chunk).await?;
+        if !chunk.ends_with(b"\n") {
+            file.write_all(b"\n").await?;
+        }
+        file.flush().await?;
+        Ok(file.metadata().await?.len())
     }
 
     async fn publish_output(&self, target: &CommandOutputTarget) -> Result<()> {
@@ -335,45 +375,19 @@ impl CommandBackend for MaiCommandBackend {
         let Some(capture) = capture else {
             return Ok(Vec::new());
         };
-        let descriptors = capture
-            .collect_artifacts(ToolOutputStreamSizes::new(
-                sizes.stdout_bytes,
-                sizes.stderr_bytes,
-            ))
-            .await
-            .map_err(runtime_invalid_input)?;
-        super::container::artifact_records_from_descriptors(self.agent_id, descriptors)
+        let artifacts: Vec<ToolOutputArtifactInfo> = capture
+            .collect_artifacts(
+                self.agent_id,
+                MaiToolOutputStreamSizes {
+                    stdout_bytes: sizes.stdout_bytes,
+                    stderr_bytes: sizes.stderr_bytes,
+                },
+            )
+            .await?;
+        artifacts
             .into_iter()
-            .map(|artifact: ToolOutputArtifactInfo| {
-                serde_json::to_value(artifact).map_err(runtime_invalid_input)
-            })
+            .map(|artifact| serde_json::to_value(artifact).map_err(runtime_invalid_input))
             .collect()
-    }
-
-    async fn terminate(&self, process_id: &str, host_pid: Option<u32>) {
-        let container_id = self.container_id.lock().ok().and_then(|id| id.clone());
-        if let Some(container_id) = container_id {
-            self.runtime
-                .deps
-                .docker
-                .terminate_managed_exec(&container_id, process_id, host_pid)
-                .await;
-        } else {
-            self.runtime.deps.docker.terminate_exec_host(host_pid).await;
-        }
-    }
-
-    fn terminate_sync(&self, process_id: &str, host_pid: Option<u32>) {
-        let container_id = self.container_id.lock().ok().and_then(|id| id.clone());
-        if let Some(container_id) = container_id {
-            self.runtime.deps.docker.terminate_managed_exec_sync(
-                &container_id,
-                process_id,
-                host_pid,
-            );
-        } else {
-            self.runtime.deps.docker.terminate_exec_host_sync(host_pid);
-        }
     }
 }
 

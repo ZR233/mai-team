@@ -16,7 +16,7 @@ pub(crate) trait AgentUpdateOps: Send + Sync {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> impl Future<Output = Result<pl_core::ResolvedModelRoute>> + Send;
+    ) -> impl Future<Output = Result<pl_model::config::ResolvedModelRoute>> + Send;
 
     fn persist_agent(&self, agent: Arc<AgentRecord>) -> impl Future<Output = Result<()>> + Send;
 

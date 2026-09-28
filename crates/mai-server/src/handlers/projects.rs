@@ -74,8 +74,8 @@ pub(crate) async fn send_project_message(
     Path(id): Path<ProjectId>,
     Json(request): Json<SendMessageRequest>,
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
-    let turn_id = state.runtime.send_project_message(id, request).await?;
-    Ok(Json(SendMessageResponse { turn_id }))
+    let input_id = state.runtime.send_project_message(id, request).await?;
+    Ok(Json(SendMessageResponse { input_id }))
 }
 
 pub(crate) async fn list_project_review_runs(
@@ -416,6 +416,7 @@ mod tests {
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 projects_root: dir.path().join("projects"),
+                sessions_root: dir.path().join("sessions"),
                 cache_root: dir.path().join("cache"),
                 artifact_files_root: dir.path().join("artifacts/files"),
                 sidecar_image: "sidecar:latest".to_string(),
@@ -457,9 +458,13 @@ mod tests {
                         error: None,
                     },
                     runtime: None,
+                    last_turn: None,
                     task_id: None,
                     project_id: Some(project_id),
                     role: Some(AgentRole::Planner),
+                    profile_id: None,
+                    workspace: None,
+                    review_run_id: None,
                     model: "mock-model".to_string(),
                     provider_id: "mock".to_string(),
                     provider_name: "Mock".to_string(),
@@ -468,7 +473,7 @@ mod tests {
                     container_id: None,
                     created_at: now,
                     updated_at: now,
-                    token_usage: Default::default(),
+                    usage: Default::default(),
                 },
                 None,
             )

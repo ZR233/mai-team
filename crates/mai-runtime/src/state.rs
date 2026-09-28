@@ -103,5 +103,7 @@ pub(crate) struct AgentRecord {
     pub(crate) container: RwLock<Option<ContainerHandle>>,
     pub(crate) mcp: RwLock<Option<Arc<ContainerMcpRuntime>>>,
     pub(crate) review_context: RwLock<Option<Arc<ProjectReviewContext>>>,
+    /// 与当前驻留 Thread 的 `skill_view` 工具共用的 PL 冻结目录。
+    pub(crate) skill_catalog: RwLock<Option<Arc<pl_tool::skill::FrozenSkillCatalog>>>,
     pub(crate) system_prompt: Option<String>,
 }

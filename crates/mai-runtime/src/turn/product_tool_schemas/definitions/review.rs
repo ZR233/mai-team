@@ -1,12 +1,10 @@
 #[cfg(test)]
-use pl_core::TypedTool;
-#[cfg(test)]
-use pl_model::ToolSpec;
+use pl_protocol::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[cfg(test)]
-use super::super::names::TOOL_QUEUE_PROJECT_REVIEW_PRS;
+use super::{super::names::TOOL_QUEUE_PROJECT_REVIEW_PRS, input_schema};
 
 pub(crate) const QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION: &str = "Queue one or more pull requests for the current Mai project's automatic review pool. \
      The server infers the project from the calling agent; do not provide a project id. \
@@ -36,10 +34,6 @@ pub(crate) fn definitions() -> Vec<ToolSpec> {
     vec![ToolSpec::function(
         TOOL_QUEUE_PROJECT_REVIEW_PRS,
         QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
-        TypedTool::<QueueProjectReviewPrsInput>::new(
-            TOOL_QUEUE_PROJECT_REVIEW_PRS,
-            QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
-        )
-        .input_schema(),
+        input_schema::<QueueProjectReviewPrsInput>(),
     )]
 }

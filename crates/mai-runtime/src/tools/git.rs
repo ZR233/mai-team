@@ -7,13 +7,13 @@ use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
 #[cfg(test)]
 use mai_protocol::ProjectSummary;
 use mai_protocol::{AgentId, ProjectId};
-#[cfg(test)]
-use pl_core::GitToolKind;
-use pl_core::{
-    ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
-    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitShellCommandRequest,
-    GitShellCredential, GitWorkspaceConfig, git_shell_command,
+use pl_core::tool::opaque::{Registration, ToolAuthorization};
+use pl_tool::execution::{ExecutionBackend, ExecutionOutput, ExecutionRequest};
+use pl_tool::git::{
+    GIT_TOKEN_ENV, GitCredential, GitCredentialProvider, GitCredentialRequest, GitPolicy,
+    GitWorkspaceConfig,
 };
+use pl_tool::shell::shell_quote_word;
 #[cfg(test)]
 use serde_json::Value;
 use serde_json::json;
@@ -24,8 +24,6 @@ use crate::github::github_clone_url;
 use crate::projects;
 use crate::state::AgentRecord;
 use crate::{AgentRuntime, Result, RuntimeError};
-#[cfg(test)]
-use pl_core::ToolResult;
 
 #[cfg(test)]
 pub(crate) struct GitToolContext<'a> {
@@ -48,7 +46,7 @@ pub(crate) async fn execute_git_tool(
     context: GitToolContext<'_>,
     name: &str,
     arguments: Value,
-) -> Result<ToolResult> {
+) -> Result<pl_core::tool::ToolOutput> {
     let GitToolBackend::Host { projects_root, .. } = &context.backend;
     let clone =
         projects::workspace::agent_clone_path(projects_root, context.project.id, context.agent_id);
@@ -57,42 +55,91 @@ pub(crate) async fn execute_git_tool(
             "project git workspace is not available".to_string(),
         ));
     }
-    let kind = GitToolKind::from_name(name)
+    let kind = pl_tool::git::GitToolKind::from_name(name)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
-    let output = execute_git_tool_via_registry(&context, kind, arguments).await?;
-    Ok(ToolResult::success(output))
-}
-
-#[cfg(test)]
-async fn execute_git_tool_via_registry(
-    context: &GitToolContext<'_>,
-    kind: GitToolKind,
-    arguments: Value,
-) -> Result<String> {
-    let config = git_workspace_config(context);
-    let tool = pl_core::GitTool::new(
+    let tool = pl_tool::git::GitTool::new(
         kind,
-        config,
+        git_workspace_config(&context),
         Arc::new(ProjectGitExecutionBackend),
         Arc::new(MaiGitCredentialProvider::Static {
             token: context.token.clone(),
         }),
     );
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-    let output = pl_core::Tool::execute(
-        &tool,
-        pl_core::ToolInput { arguments },
-        pl_core::ToolCallContext::new(pl_core::ToolCallIdentity::default(), event_tx),
-    )
-    .await
-    .map_err(runtime_error_from_pure)?;
-    Ok(output.into_model_output())
+    let content = serde_json::to_string(&arguments)
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    let input = pl_core::context::OpaquePayload::new("application/json", 1, content)
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    let call = pl_core::tool::opaque::CallContext {
+        grant: Default::default(),
+        context: Default::default(),
+        model_projection: None,
+        tasks: None,
+        thread_id: "test-thread".to_string(),
+        turn_id: "test-turn".to_string(),
+        call_id: "test-call".to_string(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        extensions: Arc::new(std::collections::BTreeMap::new()),
+        catalog: Arc::from(Vec::new()),
+        extension_sequence: 0,
+        history_fence: 0,
+    };
+    pl_core::tool::opaque::Tool::execute(&tool, input, call)
+        .await
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
 }
 
+/// mai 产品宿主上的 pl-tool Git 工具绑定。
+///
+/// mai 负责工作区物理来源、执行后端与凭据选择；通用 Git 工具实现、参数 schema 与
+/// 执行语义由 pl-tool 提供。授权身份由产品层在装配 Thread 时按 project/review 权限
+/// 给出，本模块不推断业务权限。
 pub(crate) struct NativeGitToolRuntime {
     pub(crate) config: GitWorkspaceConfig,
     pub(crate) backend: Arc<MaiGitExecutionBackend>,
     pub(crate) credential_provider: Arc<MaiGitCredentialProvider>,
+    pub(crate) kinds: Vec<pl_tool::git::GitToolKind>,
+}
+
+impl NativeGitToolRuntime {
+    /// 按给定授权身份构造该 Thread 独占的 pl-tool Git 注册项。
+    ///
+    /// 每个注册项持有独立的 `GitTool` 实例；调用方不得缓存或把同一批实例安装到其它 Thread。
+    pub(crate) fn registrations(
+        &self,
+        authorization: ToolAuthorization,
+    ) -> Result<Vec<Registration>> {
+        self.kinds
+            .iter()
+            .map(|kind| self.registration(*kind, authorization.clone()))
+            .collect()
+    }
+
+    fn registration(
+        &self,
+        kind: pl_tool::git::GitToolKind,
+        authorization: ToolAuthorization,
+    ) -> Result<Registration> {
+        let declaration =
+            pl_model::runtime::thread_tool_declaration(&kind.to_spec()).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "failed to encode git tool `{}` declaration: {error}",
+                    kind.name()
+                ))
+            })?;
+        pl_tool::git::GitTool::new(
+            kind,
+            self.config.clone(),
+            self.backend.clone(),
+            self.credential_provider.clone(),
+        )
+        .registration(declaration, authorization)
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "failed to register git tool `{}`: {error}",
+                kind.name()
+            ))
+        })
+    }
 }
 
 pub(crate) async fn native_git_tool_runtime(
@@ -135,6 +182,7 @@ pub(crate) async fn native_git_tool_runtime(
         config,
         backend,
         credential_provider,
+        kinds: pl_tool::git::GitToolKind::all().to_vec(),
     }))
 }
 
@@ -264,8 +312,7 @@ impl ExecutionBackend for MaiGitExecutionBackend {
             &self.workspace_volume,
             &self.repo_path,
             self.agent_id,
-            request.env.get(GIT_TOKEN_ENV).map(String::as_str),
-            &request.args,
+            request,
         )
         .await
     }
@@ -309,33 +356,26 @@ fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Pat
         .env_remove(GIT_TOKEN_ENV);
 }
 
-#[cfg(test)]
-fn runtime_error_from_pure(error: pl_core::PureError) -> RuntimeError {
-    RuntimeError::InvalidInput(error.to_string())
-}
-
 async fn run_sidecar_git_output(
     docker: &DockerClient,
     sidecar_image: &str,
     workspace_volume: &str,
     repo_path: &str,
     agent_id: AgentId,
-    token: Option<&str>,
-    args: &[String],
+    request: ExecutionRequest,
 ) -> Result<ExecutionOutput> {
-    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let token = request.env.get(GIT_TOKEN_ENV).map(String::as_str);
+    // mai 负责 sidecar 物理执行环境，因此不复用宿主侧的 `GIT_ASKPASS` 路径：
+    // 凭据存在时在容器内生成临时 askpass 脚本，并只透传 token 本身。
     let credential = match token {
-        Some(_) => GitShellCredential::EnvToken,
-        None => GitShellCredential::Disabled,
+        Some(_) => SidecarGitCredential::EnvToken,
+        None => SidecarGitCredential::Disabled,
     };
-    let command = git_shell_command(GitShellCommandRequest {
-        safe_directory: repo_path,
-        args: &args,
-        credential,
-    });
+    let command = sidecar_git_command(repo_path, &request.program, &request.args, credential);
     let env = token
         .map(|token| vec![(GIT_TOKEN_ENV.to_string(), token.to_string())])
         .unwrap_or_default();
+    let timeout_secs = request.timeout.map(|timeout| timeout.as_secs());
     let sidecar_name = format!("mai-tool-git-{agent_id}-{}", uuid::Uuid::new_v4());
     let output = docker
         .run_sidecar_shell_env(&SidecarParams {
@@ -347,7 +387,7 @@ async fn run_sidecar_git_output(
             env: &env,
             workspace_volume: Some(workspace_volume),
             mounts: &[],
-            timeout_secs: Some(600),
+            timeout_secs,
         })
         .await?;
     Ok(ExecutionOutput {
@@ -355,6 +395,50 @@ async fn run_sidecar_git_output(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+/// sidecar 内 git 命令的凭据注入模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarGitCredential {
+    Disabled,
+    EnvToken,
+}
+
+/// 构造在 sidecar 容器内执行的 git 命令。
+///
+/// 只复用 pl-tool 公开的 askpass 脚本文本，命令编排属于 mai 的 sidecar 传输层：
+/// 固定关闭 hooks、声明 safe.directory 并清空 credential.helper，参数由 pl-tool 已校验。
+fn sidecar_git_command(
+    repo_path: &str,
+    program: &std::path::Path,
+    args: &[String],
+    credential: SidecarGitCredential,
+) -> String {
+    let mut parts = vec![
+        shell_quote_word(&program.to_string_lossy()),
+        "-c".to_string(),
+        shell_quote_word("core.hooksPath=/dev/null"),
+        "-c".to_string(),
+        shell_quote_word(&format!("safe.directory={repo_path}")),
+        "-c".to_string(),
+        shell_quote_word("credential.helper="),
+    ];
+    parts.extend(args.iter().map(|arg| shell_quote_word(arg)));
+    let git_command = parts.join(" ");
+    match credential {
+        SidecarGitCredential::Disabled => git_command,
+        SidecarGitCredential::EnvToken => format!(
+            "askpass=/tmp/mai-git-askpass-$$.sh\n\
+             trap 'rm -f \"$askpass\"' EXIT\n\
+             cat > \"$askpass\" <<'MAI_GIT_ASKPASS'\n\
+             {}MAI_GIT_ASKPASS\n\
+             chmod 700 \"$askpass\"\n\
+             export GIT_ASKPASS=\"$askpass\"\n\
+             export GIT_TERMINAL_PROMPT=0\n\
+             {git_command}",
+            pl_tool::git::git_askpass_script()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +452,11 @@ mod tests {
 
     use super::*;
     use crate::projects::workspace;
+
+    /// 读取 pl-tool Git 工具返回的完整业务载荷文本。
+    fn output_text(output: &pl_core::tool::ToolOutput) -> String {
+        output.payload().content().to_string()
+    }
 
     #[tokio::test]
     async fn git_status_runs_inside_agent_clone() {
@@ -388,7 +477,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_STATUS,
+            pl_tool::git::TOOL_GIT_STATUS,
             json!({}),
         )
         .await
@@ -419,14 +508,13 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_WORKSPACE_INFO,
+            pl_tool::git::TOOL_GIT_WORKSPACE_INFO,
             json!({}),
         )
         .await
         .expect("execute info");
 
-        let payload: Value =
-            serde_json::from_str(&execution.canonical_output()).expect("json payload");
+        let payload: Value = serde_json::from_str(&output_text(&execution)).expect("json payload");
         assert_eq!(payload["project_id"], json!(project_id));
         assert_eq!(
             payload["repo_cache"],
@@ -457,14 +545,13 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_WORKSPACE_INFO,
+            pl_tool::git::TOOL_GIT_WORKSPACE_INFO,
             json!({}),
         )
         .await
         .expect("execute workspace info");
 
-        let payload: Value =
-            serde_json::from_str(&execution.canonical_output()).expect("json payload");
+        let payload: Value = serde_json::from_str(&output_text(&execution)).expect("json payload");
         assert_eq!(payload["clone"], json!(clone_path));
     }
 
@@ -487,7 +574,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_DIFF,
+            pl_tool::git::TOOL_GIT_DIFF,
             json!({ "path": "../secret" }),
         )
         .await
@@ -516,7 +603,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_BRANCH,
+            pl_tool::git::TOOL_GIT_BRANCH,
             json!({ "action": "create", "name": "../escape" }),
         )
         .await
@@ -545,7 +632,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            pl_core::TOOL_GIT_FETCH,
+            pl_tool::git::TOOL_GIT_FETCH,
             json!({ "remote": "upstream" }),
         )
         .await
@@ -574,7 +661,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            pl_core::TOOL_GIT_FETCH,
+            pl_tool::git::TOOL_GIT_FETCH,
             json!({ "refspec": "pull/679/head:refs/pull/679/head" }),
         )
         .await
@@ -608,7 +695,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            pl_core::TOOL_GIT_COMMIT,
+            pl_tool::git::TOOL_GIT_COMMIT,
             json!({ "message": "save work" }),
         )
         .await
@@ -623,7 +710,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            pl_core::TOOL_GIT_PUSH,
+            pl_tool::git::TOOL_GIT_PUSH,
             json!({}),
         )
         .await
@@ -657,7 +744,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
+            pl_tool::git::TOOL_GIT_SYNC_DEFAULT_BRANCH,
             json!({}),
         )
         .await
@@ -685,14 +772,13 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
+            pl_tool::git::TOOL_GIT_SYNC_DEFAULT_BRANCH,
             json!({ "preserveChanges": true }),
         )
         .await
         .expect("sync default branch");
 
-        let payload: Value =
-            serde_json::from_str(&execution.canonical_output()).expect("sync payload");
+        let payload: Value = serde_json::from_str(&output_text(&execution)).expect("sync payload");
         assert_eq!(payload["preservedChanges"], json!(true));
         let git_log = read_git_log(dir.path());
         assert!(git_log.contains("stash push -u -m pl-core sync default branch"));

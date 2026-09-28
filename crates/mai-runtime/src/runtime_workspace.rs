@@ -1,5 +1,10 @@
 use super::*;
 
+use pl_tool::git::GIT_TOKEN_ENV;
+use pl_tool::shell::shell_quote_word;
+
+use crate::projects::workspace::{git_shell_credential_prelude, git_shell_retry_function};
+
 impl AgentRuntime {
     pub(super) async fn set_project_clone_result(
         &self,

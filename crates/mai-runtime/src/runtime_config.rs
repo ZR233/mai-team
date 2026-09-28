@@ -151,7 +151,7 @@ impl AgentRuntime {
         provider_id: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
-    ) -> Result<pl_core::ResolvedModelRoute> {
+    ) -> Result<pl_model::config::ResolvedModelRoute> {
         config::resolve_provider_model(
             &self.mai_config.read().await.models,
             provider_id,
@@ -165,9 +165,9 @@ impl AgentRuntime {
         role: AgentRole,
         requested_provider: Option<&str>,
         requested_model: Option<&str>,
-    ) -> Result<pl_core::ResolvedModelRoute> {
+    ) -> Result<pl_model::config::ResolvedModelRoute> {
         let models = self.mai_config.read().await.models.clone();
-        let role_id = pl_core::AgentRoleId::new(role.to_string())?;
+        let role_id = pl_model::config::AgentRoleId::new(role.to_string())?;
         let route = models.resolve(&role_id).map_err(RuntimeError::Model)?;
         if requested_provider
             .filter(|value| !value.trim().is_empty())

@@ -9,18 +9,20 @@ mod agent_state;
 
 pub use agent_state::{AgentResourceSnapshot, AgentResourceState};
 pub use pl_protocol::{
-    AgentSnapshot, CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor,
-    McpHealthSnapshot, McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor,
-    ModelDescriptor, ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
+    ChatWindowChange, ChatWindowDirection, ChatWindowFocus, ChatWindowItem, ChatWindowLifecycle,
+    ChatWindowPriority, ChatWindowQuery, ChatWindowSnapshot, ChatWindowUpdate,
+    CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor, McpHealthSnapshot,
+    McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
+    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
     ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
-    ProviderServiceCapabilitiesDescriptor, THREAD_SCHEMA_VERSION, Thread, ThreadAttachment,
-    ThreadContextDisposition, ThreadItem, ThreadItemDelta, ThreadItemDeltaState, ThreadItemKind,
-    ThreadItemState, ThreadMode, ThreadNotification, ThreadNotificationEnvelope,
-    ThreadRuntimeSnapshot, ThreadRuntimeUsage, ThreadSnapshot, ThreadStatus,
-    ThreadSubscriptionRequest, ThreadSubscriptionUpdate, ThreadTextChannel, ThreadToolItem,
-    ThreadToolOutput, ThreadToolState, ThreadTurnHistory, ThreadTurnPage, TokenUsage, Turn,
-    TurnBillingRecord, TurnPhase, TurnState, WebSearchProviderCapabilitiesDescriptor,
-    WebSearchResolutionDescriptor,
+    ProviderServiceCapabilitiesDescriptor, RuntimeUsageSnapshot, THREAD_SCHEMA_VERSION, Thread,
+    ThreadAttachment, ThreadContentField, ThreadContextDisposition, ThreadFieldChange,
+    ThreadFieldUpdate, ThreadItem, ThreadItemKind, ThreadItemState, ThreadModeId,
+    ThreadNotification, ThreadNotificationEnvelope, ThreadRuntimeSnapshot, ThreadRuntimeUsage,
+    ThreadSnapshot, ThreadStatus, ThreadSubscriptionRequest, ThreadSubscriptionUpdate,
+    ThreadTextChannel, ThreadToolItem, ThreadToolOutput, ThreadToolState, ThreadTurnHistory,
+    ThreadTurnPage, TokenUsageSnapshot, Turn, TurnBillingRecord, TurnPhase, TurnState,
+    WebSearchProviderCapabilitiesDescriptor, WebSearchResolutionDescriptor,
 };
 
 pub type AgentId = Uuid;
@@ -28,6 +30,7 @@ pub type EnvironmentId = Uuid;
 pub type ProjectId = Uuid;
 pub type TaskId = Uuid;
 pub type ThreadId = String;
+pub type InputId = String;
 pub type TurnId = String;
 
 #[derive(
@@ -392,11 +395,26 @@ pub struct AgentSummary {
     pub project_id: Option<ProjectId>,
     #[serde(default)]
     pub role: Option<AgentRole>,
+    /// 创建时冻结的 PL Agent Profile 标识；没有 Profile 的 Agent 为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// 创建时冻结的 PL workspace assignment；资源尚未发布 receipt 时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<pl_protocol::AgentWorkspaceAssignmentSnapshot>,
+    /// 该 Agent 作为 Project Review Thread 归属的 Review Run。
+    ///
+    /// 这是内部产品事实：只有 `ContainerSource::ProjectReviewWorkspace` 携带的 run id 会在创建时写入，
+    /// 公共 `CreateAgentRequest` 无法伪造。普通任务 Reviewer 保持 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_run_id: Option<Uuid>,
     pub name: String,
     pub resource: AgentResourceSnapshot,
-    /// PL v2 的原生执行快照；资源创建或销毁窗口中可以暂时不存在。
+    /// PL 的 canonical Thread 快照；资源创建或销毁窗口中可以暂时不存在。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<AgentSnapshot>,
+    pub runtime: Option<ThreadSnapshot>,
+    /// 由 PL typed effect 历史投影出的最近一条终态 Turn。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<Turn>,
     pub container_id: Option<String>,
     #[serde(default)]
     pub docker_image: String,
@@ -407,25 +425,27 @@ pub struct AgentSummary {
     pub reasoning_effort: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub token_usage: TokenUsage,
+    /// 当前 agent 的累计运行用量与估算成本。
+    #[serde(default)]
+    pub usage: RuntimeUsageSnapshot,
 }
 
 impl AgentSummary {
     /// 只有产品资源就绪且 PL actor 完全空闲时才允许修改执行配置。
     pub fn can_reconfigure(&self) -> bool {
         self.resource.state == AgentResourceState::Ready
-            && self
-                .runtime
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.state.is_idle() && snapshot.pending_inputs == 0)
+            && self.runtime.as_ref().is_some_and(|snapshot| {
+                snapshot.thread.status == ThreadStatus::Idle && snapshot.interactions.is_empty()
+            })
     }
 
     /// 返回当前由 PL runtime 管理的活动 Turn。
     pub fn active_turn(&self) -> Option<TurnId> {
         self.runtime
             .as_ref()?
-            .active_turn_id()
-            .map(|turn_id| turn_id.as_str().to_string())
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.id.clone())
     }
 }
 
@@ -590,7 +610,7 @@ pub struct ProjectSummary {
     pub review_last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectReviewRunSummary {
     pub id: Uuid,
     #[serde(default)]
@@ -618,8 +638,9 @@ pub struct ProjectReviewRunSummary {
     pub error: Option<String>,
     #[serde(default)]
     pub failure: Option<ProjectReviewFailure>,
+    /// 本次 review run 的累计运行用量与估算成本。
     #[serde(default)]
-    pub token_usage: TokenUsage,
+    pub usage: RuntimeUsageSnapshot,
     #[serde(default)]
     pub history_status: ProjectReviewHistoryStatus,
     #[serde(default)]
@@ -937,7 +958,7 @@ pub struct SendMessageRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
-    pub turn_id: TurnId,
+    pub input_id: InputId,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1272,7 +1293,7 @@ pub enum ProviderConfigSource {
     },
     Custom {
         /// Custom provider 的内容由 PL serde 与校验器直接解释。
-        config: pl_core::ProviderConfig,
+        config: pl_model::config::ProviderConfig,
     },
 }
 
@@ -1280,9 +1301,9 @@ pub enum ProviderConfigSource {
 pub struct ProviderSummary {
     pub id: String,
     /// 脱敏后的 PL provider 配置。
-    pub config: pl_core::ProviderConfig,
+    pub config: pl_model::config::ProviderConfig,
     /// PL 解析 bundled catalog 与 custom models 后的最终模型列表。
-    pub models: Vec<pl_model::ModelInfo>,
+    pub models: Vec<pl_model::model::ModelInfo>,
     pub has_api_key: bool,
     pub has_http_headers: bool,
 }
@@ -1321,12 +1342,12 @@ pub struct ProviderTestResponse {
     pub ok: bool,
     pub provider_id: String,
     pub provider_name: String,
-    pub transport: pl_model::ModelTransportProfile,
+    pub transport: pl_model::model::ModelTransportProfile,
     pub model: String,
     pub base_url: String,
     pub latency_ms: u64,
     pub output_preview: String,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<TokenUsageSnapshot>,
     pub error: Option<String>,
 }
 
@@ -1349,7 +1370,7 @@ pub struct McpServerSecretClearRequest {
     pub headers: Vec<String>,
 }
 
-pub type AgentModelPreference = pl_core::ModelRouteConfig;
+pub type AgentModelPreference = pl_model::config::ModelRouteConfig;
 
 #[derive(
     Debug,
@@ -1377,7 +1398,7 @@ pub enum AgentRole {
 pub struct ResolvedAgentModelPreference {
     pub provider_id: String,
     pub provider_name: String,
-    pub transport: pl_model::ModelTransportProfile,
+    pub transport: pl_model::model::ModelTransportProfile,
     pub model: String,
     pub model_name: String,
     #[serde(default)]
@@ -1522,7 +1543,7 @@ pub enum ModelOutputItem {
 pub struct ModelResponse {
     pub id: Option<String>,
     pub output: Vec<ModelOutputItem>,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<TokenUsageSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
