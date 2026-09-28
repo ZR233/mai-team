@@ -235,9 +235,11 @@ impl AgentRuntime {
         let agent = self.agent(product_agent_id).await?;
         let summary = agent.summary.read().await.clone();
         ensure_readable_product_thread(&summary)?;
-        let resident = self.ensure_thread(product_agent_id).await?;
-        self.await_agent_durable(product_agent_id, resident.handle.snapshot().commit_sequence)
-            .await?;
+        // 历史查询只依赖 pl-core 的 durable effects；冷 Thread 无需为读历史而启动容器和 MCP。
+        if let Some(resident) = self.resident_thread(product_agent_id) {
+            self.await_agent_durable(product_agent_id, resident.handle.snapshot().commit_sequence)
+                .await?;
+        }
         let before_sequence = cursor.map(parse_turn_cursor).transpose()?;
         let limit = limit.clamp(1, EFFECT_PAGE_LIMIT);
         let mut effects: Vec<ThreadEffectBatch> = Vec::new();

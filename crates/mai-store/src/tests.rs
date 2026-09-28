@@ -1403,7 +1403,11 @@ async fn schema_version_mismatch_is_rejected_without_data_loss() {
         .await
         .err()
         .expect("old schema must be rejected");
-    assert!(error.to_string().contains("仅支持 36"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("仅支持 {}", crate::schema::SCHEMA_VERSION))
+    );
     assert!(error.to_string().contains("创建新数据目录"));
     let connection = rusqlite::Connection::open(db_path).expect("inspect preserved database");
     let preserved: i64 = connection

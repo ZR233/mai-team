@@ -7,6 +7,14 @@ impl AgentRuntime {
     /// store 的 thread runtime，也不解释任何 SQLite 原始表。
     pub(crate) async fn await_agent_durable(&self, agent_id: AgentId, revision: u64) -> Result<()> {
         let resident = self.ensure_thread(agent_id).await?;
+        if durable_through(&resident.handle.snapshot(), revision) {
+            return Ok(());
+        }
+        resident
+            .handle
+            .flush()
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         let mut snapshots = resident.handle.subscribe();
         loop {
             let Some(snapshot) = snapshots.next().await else {

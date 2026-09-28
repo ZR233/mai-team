@@ -270,10 +270,7 @@ pub(crate) async fn list_tasks(state: &RuntimeState) -> Vec<TaskSummary> {
     summaries
 }
 
-pub(crate) async fn list_environments(
-    state: &RuntimeState,
-    ops: &impl TaskReadOps,
-) -> Vec<EnvironmentSummary> {
+pub(crate) async fn list_environments(state: &RuntimeState) -> Vec<EnvironmentSummary> {
     let task_records = {
         let tasks = state.tasks.read().await;
         tasks.values().cloned().collect::<Vec<_>>()
@@ -281,7 +278,7 @@ pub(crate) async fn list_environments(
     let mut summaries = Vec::with_capacity(task_records.len());
     for task in task_records {
         let task_summary = task.summary.read().await.clone();
-        if let Some(summary) = environment_summary(state, ops, &task_summary).await {
+        if let Some(summary) = environment_summary(state, &task_summary).await {
             summaries.push(summary);
         }
     }
@@ -421,7 +418,6 @@ pub(crate) async fn get_task(
 
 pub(crate) async fn environment_summary(
     state: &RuntimeState,
-    ops: &impl TaskReadOps,
     task: &TaskSummary,
 ) -> Option<EnvironmentSummary> {
     let root_agent = {
@@ -429,7 +425,6 @@ pub(crate) async fn environment_summary(
         agents.get(&task.planner_agent_id).cloned()
     }?;
     let root_summary = root_agent.summary.read().await.clone();
-    ops.get_agent(task.planner_agent_id).await.ok()?;
     Some(environment_summary_from_root(task, &root_summary))
 }
 

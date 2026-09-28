@@ -13,7 +13,7 @@ impl AgentRuntime {
     }
 
     pub async fn list_environments(&self) -> Vec<EnvironmentSummary> {
-        tasks::list_environments(&self.state, self).await
+        tasks::list_environments(&self.state).await
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
