@@ -89,6 +89,7 @@ impl AgentRuntime {
             .await
             .as_ref()
             .map(|container| container.id.clone())
+            && agent.mcp.read().await.is_some()
         {
             return Ok(container_id);
         }

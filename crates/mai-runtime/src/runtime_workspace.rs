@@ -60,6 +60,32 @@ impl AgentRuntime {
             return Ok(());
         }
 
+        let maintainer = self.agent(maintainer_agent_id).await?;
+        let source = agents::ContainerSource::ProjectWorkspace {
+            workspace_volume: project_agent_workspace_volume(
+                &project_id.to_string(),
+                &maintainer_agent_id.to_string(),
+            ),
+            repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string(),
+            repository_view: None,
+        };
+        let prepared = async {
+            agents::ensure_agent_container_with_source(self.as_ref(), &maintainer, &source).await?;
+            let summary = maintainer.summary.read().await.clone();
+            let resource = runtime_agent_creation::PreparedAgentResource::new(self, summary);
+            Box::pin(self.register_prepared_agent(resource)).await
+        }
+        .await;
+        if let Err(error) = prepared {
+            self.set_project_clone_result(
+                project_id,
+                ProjectStatus::Failed,
+                ProjectCloneStatus::Failed,
+                Some(error.to_string()),
+            )
+            .await?;
+            return Err(error);
+        }
         self.set_project_clone_result(
             project_id,
             ProjectStatus::Ready,
@@ -67,16 +93,6 @@ impl AgentRuntime {
             None,
         )
         .await?;
-
-        let maintainer = self.agent(maintainer_agent_id).await?;
-        let source = self
-            .agent_container_source_for_project(
-                maintainer_agent_id,
-                Some(project_id),
-                agents::ContainerSource::FreshImage,
-            )
-            .await?;
-        agents::ensure_agent_container_with_source(self.as_ref(), &maintainer, &source).await?;
         self.start_project_review_loop_if_ready(project_id).await?;
         Ok(())
     }
@@ -448,7 +464,8 @@ if [ -d /workspace/repo.git ] && [ "$(git -C /workspace/repo.git rev-parse --is-
   git -C /workspace/repo.git remote set-url origin {repo_url}
 else
   rm -rf /workspace/repo /workspace/repo.git
-  git_with_retry clone --mirror -- {repo_url} /workspace/repo.git
+  git init --bare /workspace/repo.git
+  git -C /workspace/repo.git remote add origin {repo_url}
 fi
 git_with_retry -C /workspace/repo.git fetch --prune origin {default_fetch}
 {review_fetch}base_sha=$(git -C /workspace/repo.git rev-parse {base_commit})
@@ -490,7 +507,7 @@ printf '{base_marker}%s\n' "$base_sha"
                 env: &env,
                 workspace_volume: Some(&volume),
                 mounts: &[],
-                timeout_secs: Some(600),
+                timeout_secs: Some(1800),
             })
             .await?;
         if output.status != 0 {

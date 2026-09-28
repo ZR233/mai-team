@@ -86,7 +86,7 @@ pub(crate) trait ProjectCreateOps: Send + Sync {
         account_id: &str,
     ) -> impl Future<Output = Result<GitAccountSummary>> + Send;
     fn planner_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
-    fn create_project_maintainer_agent(
+    fn create_project_maintainer_record(
         &self,
         request: ProjectMaintainerAgentRequest,
     ) -> impl Future<Output = Result<AgentSummary>> + Send;
@@ -219,7 +219,7 @@ pub(crate) async fn create_project(
     let clone_url = github_clone_url(&owner, &repo);
     let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
     let maintainer = ops
-        .create_project_maintainer_agent(ProjectMaintainerAgentRequest {
+        .create_project_maintainer_record(ProjectMaintainerAgentRequest {
             project_id,
             name: format!("{name} Maintainer"),
             model: planner_model,

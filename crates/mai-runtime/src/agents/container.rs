@@ -111,6 +111,7 @@ pub(crate) async fn ensure_agent_container_with_source(
         .await
         .as_ref()
         .map(|container| container.id.clone())
+        && agent.mcp.read().await.is_some()
     {
         return Ok(container_id);
     }
@@ -127,6 +128,7 @@ pub(crate) async fn ensure_agent_container_with_source(
     if let Some(container_id) = container_guard
         .as_ref()
         .map(|container| container.id.clone())
+        && agent.mcp.read().await.is_some()
     {
         return Ok(container_id);
     }
@@ -138,25 +140,29 @@ pub(crate) async fn ensure_agent_container_with_source(
     }
 
     set_resource_state(ops, agent, AgentResourceState::Provisioning, None).await?;
-    let container = match ops
-        .start_agent_container(AgentContainerStartRequest {
-            agent_id,
-            preferred_container_id,
-            docker_image,
-            source: container_source.clone(),
-        })
-        .await
-    {
-        Ok(container) => container,
-        Err(err) => {
-            let message = err.to_string();
-            drop(container_guard);
-            if let Err(store_err) =
-                set_resource_state(ops, agent, AgentResourceState::Failed, Some(message)).await
-            {
-                tracing::warn!("failed to persist container startup failure: {store_err}");
+    let container = if let Some(container) = container_guard.as_ref() {
+        container.clone()
+    } else {
+        match ops
+            .start_agent_container(AgentContainerStartRequest {
+                agent_id,
+                preferred_container_id,
+                docker_image,
+                source: container_source.clone(),
+            })
+            .await
+        {
+            Ok(container) => container,
+            Err(err) => {
+                let message = err.to_string();
+                drop(container_guard);
+                if let Err(store_err) =
+                    set_resource_state(ops, agent, AgentResourceState::Failed, Some(message)).await
+                {
+                    tracing::warn!("failed to persist container startup failure: {store_err}");
+                }
+                return Err(err);
             }
-            return Err(err);
         }
     };
 
@@ -169,7 +175,6 @@ pub(crate) async fn ensure_agent_container_with_source(
         }
         ops.persist_agent(Arc::clone(agent)).await?;
         *container_guard = Some(container.clone());
-        drop(container_guard);
 
         let mcp_config = ops.agent_mcp_runtime_config(agent).await?;
         for server in mcp_config
@@ -229,11 +234,13 @@ pub(crate) async fn ensure_agent_container_with_source(
     match setup {
         Ok(mcp) => {
             *agent.mcp.write().await = Some(Arc::new(mcp));
+            drop(container_guard);
             Ok(container_id)
         }
         Err(error) => {
             let failure = error.to_string();
-            *agent.container.write().await = None;
+            *container_guard = None;
+            drop(container_guard);
             {
                 let mut summary = agent.summary.write().await;
                 summary.container_id = None;

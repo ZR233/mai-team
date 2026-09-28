@@ -121,7 +121,7 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
             .preference)
     }
 
-    async fn create_project_maintainer_agent(
+    async fn create_project_maintainer_record(
         &self,
         request: projects::service::ProjectMaintainerAgentRequest,
     ) -> Result<AgentSummary> {
@@ -150,8 +150,7 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
             },
         )
         .await?;
-        let resource = runtime_agent_creation::PreparedAgentResource::new(self, created.summary);
-        self.register_prepared_agent(resource).await
+        Ok(created.summary)
     }
 
     async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
