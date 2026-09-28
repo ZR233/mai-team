@@ -157,12 +157,8 @@ impl AgentRuntime {
         tasks::get_task(&self.state, self, task_id, selected_agent_id).await
     }
 
-    pub async fn get_project(
-        &self,
-        project_id: ProjectId,
-        selected_agent_id: Option<AgentId>,
-    ) -> Result<ProjectDetail> {
-        projects::service::get_project(&self.state, self, project_id, selected_agent_id).await
+    pub async fn get_project(&self, project_id: ProjectId) -> Result<ProjectDetail> {
+        projects::service::get_project(&self.state, project_id).await
     }
 
     pub async fn list_project_review_runs(
@@ -190,12 +186,24 @@ impl AgentRuntime {
     }
 
     pub async fn get_project_review_run(
-        &self,
+        self: &Arc<Self>,
         project_id: ProjectId,
         run_id: Uuid,
     ) -> Result<ProjectReviewRunDetail> {
         self.project(project_id).await?;
-        projects::review::runs::get_project_review_run(&self.deps.store, project_id, run_id).await
+        let mut detail =
+            projects::review::runs::get_project_review_run(&self.deps.store, project_id, run_id)
+                .await?;
+        if matches!(
+            detail.summary.status,
+            ProjectReviewRunStatus::Running | ProjectReviewRunStatus::Syncing
+        ) && let (Some(agent_id), Some(input_id)) = (
+            detail.summary.reviewer_agent_id,
+            detail.summary.turn_id.as_deref(),
+        ) {
+            detail.history = self.active_review_turn_history(agent_id, input_id).await?;
+        }
+        Ok(detail)
     }
 
     pub async fn list_project_pull_request_reviews(

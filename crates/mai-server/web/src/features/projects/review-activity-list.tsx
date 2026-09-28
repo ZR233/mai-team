@@ -1,20 +1,29 @@
 import { CheckCircle2, CircleAlert } from "lucide-react"
+import { useState } from "react"
 
 import { Markdown } from "@/components/markdown"
+import { PagePagination } from "@/components/page-pagination"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { TimelineEntriesView } from "@/features/thread/timeline"
 
 import type { ReviewActivity, ReviewConclusionView } from "./review-activity"
 
+const ACTIVITY_PAGE_SIZE = 40
+
 export function ReviewActivityList({ activity }: { activity: ReviewActivity }) {
+  const [selectedPage, setSelectedPage] = useState<number | null>(null)
+  const active = activity.status === "syncing" || activity.status === "running"
+  const totalPages = Math.max(1, Math.ceil(activity.items.length / ACTIVITY_PAGE_SIZE))
+  const page = Math.min(selectedPage ?? totalPages, totalPages)
+  const items = activity.items.slice((page - 1) * ACTIVITY_PAGE_SIZE, page * ACTIVITY_PAGE_SIZE)
   return <div className="flex flex-col gap-4">
-    {activity.historyStatus === "pl_v2_archived"
-      ? <Alert><CircleAlert /><AlertTitle>PL v2 升级离线归档</AlertTitle><AlertDescription>此 Review 的旧 Timeline 已保存到部署归档，不再由当前服务在线读取。{activity.historyArchiveId && <> 归档标识：<code>{activity.historyArchiveId}</code></>}</AlertDescription></Alert>
-      : activity.items.length === 0
-      ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No review activity was archived.</p>
-      : <TimelineEntriesView items={activity.items} />}
-    <ReviewConclusion item={activity.conclusion} />
+    {activity.items.length === 0 && !active
+      ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No committed PL turn activity is available for this attempt.</p>
+      : <TimelineEntriesView items={items} activeTurn={active && page === totalPages ? activity.turn : undefined} />}
+    {active && activity.items.length === 0 && <p className="text-xs text-muted-foreground">The PL turn is still running. Its chat will appear as effects are committed.</p>}
+    {activity.items.length > ACTIVITY_PAGE_SIZE && <PagePagination page={page} totalPages={totalPages} onPageChange={(next) => setSelectedPage(next === totalPages ? null : next)} label="Review activity pages" />}
+    {active ? <p className="text-xs text-muted-foreground">Review conclusion will appear when this attempt finishes.</p> : <ReviewConclusion item={activity.conclusion} />}
   </div>
 }
 

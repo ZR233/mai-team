@@ -27,7 +27,7 @@ export const queryKeys = {
   environments: ["environments"] as const,
   environment: (id: string) => ["environments", id] as const,
   projects: ["projects"] as const,
-  project: (id: string, agentId?: string | null) => ["projects", id, agentId ?? "maintainer"] as const,
+  project: (id: string) => ["projects", id] as const,
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
   projectReviewDiscovery: (id: string) => ["projects", id, "review-discovery"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
@@ -98,9 +98,9 @@ export const projectsQuery = () => queryOptions({
   queryFn: () => api<ProjectSummary[]>("/projects"),
 })
 
-export const projectQuery = (id: string, agentId?: string | null) => queryOptions({
-  queryKey: queryKeys.project(id, agentId),
-  queryFn: () => api<ProjectDetail>(`/projects/${id}${query({ agent_id: agentId })}`),
+export const projectQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.project(id),
+  queryFn: () => api<ProjectDetail>(`/projects/${id}`),
   enabled: Boolean(id),
 })
 
@@ -121,6 +121,7 @@ export const projectReviewRunQuery = (projectId: string, runId?: string | null) 
   queryKey: queryKeys.projectReviewRun(projectId, runId || "none"),
   queryFn: () => api<ReviewRunDetail>(`/projects/${projectId}/review-runs/${runId}`),
   enabled: Boolean(projectId && runId),
+  refetchInterval: (query) => ["syncing", "running"].includes(query.state.data?.status ?? "") ? 5_000 : false,
 })
 
 export const projectPullRequestReviewsQuery = (id: string, page: number, pageSize = 20) => queryOptions({
@@ -133,12 +134,14 @@ export const projectPullRequestReviewHistoryQuery = (id: string, pr: number, pag
   queryKey: queryKeys.projectPullRequestReviewHistoryPage(id, pr, page, pageSize),
   queryFn: () => api<PullRequestReviewHistoryPage>(`/projects/${id}/pull-request-reviews/${pr}/history${query({ page: String(page), page_size: String(pageSize) })}`),
   enabled: Boolean(id && pr),
+  refetchInterval: (query) => query.state.data?.items.some((item) => ["queued", "preparing", "running", "retry_waiting", "submission_pending", "reconciling"].includes(item.job.status)) ? 5_000 : false,
 })
 
 export const projectReviewJobQuery = (projectId: string, jobId?: string | null) => queryOptions({
   queryKey: queryKeys.projectReviewJob(projectId, jobId || "none"),
   queryFn: () => api<ReviewJobDetail>(`/projects/${projectId}/review-jobs/${jobId}`),
   enabled: Boolean(projectId && jobId),
+  refetchInterval: (query) => ["queued", "preparing", "running", "retry_waiting", "submission_pending", "reconciling"].includes(query.state.data?.status ?? "") ? 5_000 : false,
 })
 
 export const tasksQuery = () => queryOptions({

@@ -1,24 +1,5 @@
 use super::*;
 
-impl projects::service::ProjectReadOps for AgentRuntime {
-    fn get_agent(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
-        AgentRuntime::get_agent(self, agent_id)
-    }
-
-    async fn recent_review_runs(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<ProjectReviewRunSummary>> {
-        Ok(self
-            .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
-            .await?
-            .runs)
-    }
-}
-
 impl tasks::TaskReadOps for AgentRuntime {
     fn get_agent(
         &self,

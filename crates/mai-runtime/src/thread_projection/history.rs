@@ -68,33 +68,10 @@ pub(crate) fn project_turn_history_from_effects(
     thread_id: &str,
     effects: &[ThreadEffectBatch],
 ) -> Result<Vec<ThreadTurnHistory>, ProjectionError> {
-    // 1. 归并各 effect，按提交序号升序处理，使条目顺序等于真实时间线顺序。
-    let mut ordered: Vec<&ThreadEffectBatch> = effects.iter().collect();
-    ordered.sort_by_key(|effect| effect.sequence);
-    let identities = collect_identities(&ordered);
+    let accumulators = collect_turns(thread_id, effects);
+    let ordered = ordered_effects(effects);
     let rolled_back = rolled_back_turns(&ordered);
-
-    let mut accumulators: BTreeMap<String, TurnAccumulator> = BTreeMap::new();
-    for effect in &ordered {
-        route_effect(thread_id, effect, &identities, &mut accumulators);
-    }
-    // 只有 Turn 没有 User context 记录时才用 canonical input 兜底，保证排队输入也不丢正文。
-    for (turn_id, accumulator) in accumulators.iter_mut() {
-        if accumulator.has_user {
-            continue;
-        }
-        let Some(inputs) = identities.accepted_by_turn.get(turn_id) else {
-            continue;
-        };
-        let mut inputs = inputs.clone();
-        inputs.sort_by_key(|input| input.sequence);
-        // 逐个插到最前，因此按时间倒序插入，最终仍是升序。
-        for input in inputs.into_iter().rev() {
-            accumulator.push_input_user(&input.record, input.sequence, input.committed_at);
-        }
-    }
-
-    // 2. 只为同时见到起始与终态的 Turn 生成 history。
+    // 只为同时见到起始与终态的 Turn 生成 history。
     let mut terminal: Vec<(u64, String, TurnAccumulator)> = Vec::new();
     for (turn_id, accumulator) in accumulators {
         if accumulator.terminal.is_none() || !accumulator.started {
@@ -134,6 +111,57 @@ pub(crate) fn project_turn_history_from_effects(
         });
     }
     Ok(histories)
+}
+
+/// 从 pl-core 已提交的 typed effect 读取运行中 Turn 的可见条目。
+/// 当前模型流尚未提交的正文不属于 durable history，由实时活动状态单独呈现。
+pub(crate) fn project_active_turn_items_from_effects(
+    thread_id: &str,
+    effects: &[ThreadEffectBatch],
+    turn_id: &str,
+) -> Vec<ThreadItem> {
+    let mut accumulators = collect_turns(thread_id, effects);
+    let Some(mut turn) = accumulators.remove(turn_id) else {
+        return Vec::new();
+    };
+    if !turn.started {
+        return Vec::new();
+    }
+    turn.assign_ordinals();
+    turn.items
+}
+
+fn ordered_effects(effects: &[ThreadEffectBatch]) -> Vec<&ThreadEffectBatch> {
+    let mut ordered: Vec<_> = effects.iter().collect();
+    ordered.sort_by_key(|effect| effect.sequence);
+    ordered
+}
+
+fn collect_turns(
+    thread_id: &str,
+    effects: &[ThreadEffectBatch],
+) -> BTreeMap<String, TurnAccumulator> {
+    let ordered = ordered_effects(effects);
+    let identities = collect_identities(&ordered);
+    let mut accumulators = BTreeMap::new();
+    for effect in &ordered {
+        route_effect(thread_id, effect, &identities, &mut accumulators);
+    }
+    // 只有 Turn 没有 User context 记录时才用 canonical input 兜底。
+    for (turn_id, accumulator) in accumulators.iter_mut() {
+        if accumulator.has_user {
+            continue;
+        }
+        let Some(inputs) = identities.accepted_by_turn.get(turn_id) else {
+            continue;
+        };
+        let mut inputs = inputs.clone();
+        inputs.sort_by_key(|input| input.sequence);
+        for input in inputs.into_iter().rev() {
+            accumulator.push_input_user(&input.record, input.sequence, input.committed_at);
+        }
+    }
+    accumulators
 }
 
 /// 一个 Turn 终态 effect 的提交序号；用于分页游标（排他上界）。
@@ -891,6 +919,33 @@ mod tests {
 
     fn project(effects: &[ThreadEffectBatch]) -> Vec<ThreadTurnHistory> {
         project_turn_history_from_effects(THREAD, effects).expect("project histories")
+    }
+
+    #[test]
+    fn running_turn_exposes_committed_chat_without_a_terminal_effect() {
+        let effects = vec![
+            start_effect(1, "turn-1"),
+            concat_effect(
+                2,
+                vec![
+                    user_context("user-1", "please review", "turn-1"),
+                    assistant_context("assistant-1", "checking files", Vec::new(), "turn-1"),
+                ],
+            ),
+        ];
+
+        assert_eq!(project(&effects).len(), 0);
+        let items = project_active_turn_items_from_effects(THREAD, &effects, "turn-1");
+        let texts = items
+            .iter()
+            .filter_map(ThreadItem::text)
+            .map(ThreadTextItem::text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["please review", "checking files"]);
+        assert_eq!(
+            project_active_turn_items_from_effects(THREAD, &effects[1..], "turn-1"),
+            Vec::new()
+        );
     }
 
     fn text_of<'a>(history: &'a ThreadTurnHistory, value: &str) -> &'a ThreadTextItem {

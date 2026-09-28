@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Check, LoaderCircle, Pencil, Plus, TestTube2, Trash2 } from "lucide-react"
+import { Check, Info, LoaderCircle, Pencil, Plus, TestTube2, Trash2 } from "lucide-react"
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
 
@@ -39,6 +39,7 @@ export default function ProvidersPage() {
   const catalog = useQuery(providerCatalogQuery())
   const providers = useQuery(providersQuery())
   const [editing, setEditing] = useState<number | "new" | null>(null)
+  const [inspectingId, setInspectingId] = useState<string | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
 
   if (catalog.isLoading || providers.isLoading) return <ProvidersFrame><LoadingState rows={6} /></ProvidersFrame>
@@ -85,15 +86,20 @@ export default function ProvidersPage() {
       <div><h2 className="text-base font-semibold">Provider instances</h2><p className="text-sm text-muted-foreground">Preset model, transport, capability, and request semantics come directly from PL.</p></div>
       {providers.data.providers.length === 0
         ? <EmptyState title="No providers configured" description="Create an instance from the PL catalog or provide a complete custom PL configuration." action={<Button onClick={() => setEditing("new")}><Plus data-icon="inline-start" /> Add provider</Button>} />
-        : <div className="overflow-hidden rounded-lg border"><Table><TableHeader><TableRow><TableHead>Provider</TableHead><TableHead className="hidden md:table-cell">Transport</TableHead><TableHead className="hidden lg:table-cell">Models</TableHead><TableHead className="w-32 text-right">Actions</TableHead></TableRow></TableHeader><TableBody>{providers.data.providers.map((provider, index) => {
+        : <>
+        <div className="divide-y rounded-lg border md:hidden">{providers.data.providers.map((provider, index) => <div key={provider.id} className="space-y-2 p-3">
+          <div className="flex items-center gap-3"><Avatar className="size-9 rounded-lg"><AvatarFallback className="rounded-lg">{provider.config.name.slice(0, 1).toUpperCase()}</AvatarFallback></Avatar><div className="min-w-0"><div className="text-sm font-medium">{provider.config.name}</div><div className="truncate text-xs text-muted-foreground">{provider.id} · {provider.config.base_url}</div></div></div>
+          <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate text-xs text-muted-foreground">{provider.models.length} models · {provider.models[0]?.binding.transport.protocol ?? "—"}</span><ProviderActions provider={provider} testing={testingId === provider.id} onInspect={() => setInspectingId(provider.id)} onTest={() => void testProvider(provider)} onEdit={() => setEditing(index)} onRemove={() => void remove(index)} /></div>
+        </div>)}</div>
+        <div className="hidden overflow-hidden rounded-lg border md:block"><Table><TableHeader><TableRow><TableHead>Provider</TableHead><TableHead>Transport</TableHead><TableHead className="hidden lg:table-cell">Models</TableHead><TableHead className="w-40 text-right">Actions</TableHead></TableRow></TableHeader><TableBody>{providers.data.providers.map((provider, index) => {
           const primaryModel = provider.models[0]
           return <TableRow key={provider.id}>
             <TableCell><div className="flex items-center gap-3"><Avatar className="size-9 rounded-lg"><AvatarFallback className="rounded-lg">{provider.config.name.slice(0, 1).toUpperCase()}</AvatarFallback></Avatar><div className="min-w-0"><span className="font-medium">{provider.config.name}</span><div className="max-w-72 truncate text-xs text-muted-foreground">{provider.id} · {provider.config.base_url}</div></div></div></TableCell>
-            <TableCell className="hidden md:table-cell"><span className="text-sm">{primaryModel?.transport.protocol ?? "—"}</span><span className="block text-xs text-muted-foreground">{primaryModel?.transport.default_connection_mode ?? "—"}</span></TableCell>
+            <TableCell><span className="text-sm">{primaryModel?.binding.transport.protocol ?? "—"}</span><span className="block text-xs text-muted-foreground">{primaryModel?.binding.transport.default_connection_mode ?? "—"}</span></TableCell>
             <TableCell className="hidden lg:table-cell"><span className="font-medium">{primaryModel?.slug ?? "—"}</span>{provider.models.length > 1 && <span className="ml-1 text-xs text-muted-foreground">+{provider.models.length - 1}</span>}</TableCell>
-            <TableCell><div className="flex justify-end gap-1"><Button variant="ghost" size="icon" disabled={testingId === provider.id || provider.models.length === 0} onClick={() => void testProvider(provider)} aria-label={`Test ${provider.config.name}`}>{testingId === provider.id ? <LoaderCircle data-icon="inline-start" className="animate-spin" /> : <TestTube2 data-icon="inline-start" />}</Button><Button variant="ghost" size="icon" onClick={() => setEditing(index)} aria-label={`Edit ${provider.config.name}`}><Pencil data-icon="inline-start" /></Button><AlertDialog><AlertDialogTrigger asChild><Button variant="ghost" size="icon" aria-label={`Delete ${provider.config.name}`}><Trash2 data-icon="inline-start" /></Button></AlertDialogTrigger><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete {provider.config.name}?</AlertDialogTitle><AlertDialogDescription>Roles using this provider must be reassigned before it can be removed.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void remove(index)}>Delete provider</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></div></TableCell>
+            <TableCell><ProviderActions provider={provider} testing={testingId === provider.id} onInspect={() => setInspectingId(provider.id)} onTest={() => void testProvider(provider)} onEdit={() => setEditing(index)} onRemove={() => void remove(index)} /></TableCell>
           </TableRow>
-        })}</TableBody></Table></div>}
+        })}</TableBody></Table></div></>}
     </div></div>
     {editing !== null && <ProviderEditor catalog={catalog.data} response={providers.data} index={editing} onClose={() => setEditing(null)} onSave={async (provider) => {
       const next = providers.data.providers.map(providerRequest)
@@ -103,7 +109,44 @@ export default function ProvidersPage() {
       setEditing(null)
       toast.success("Provider saved")
     }} />}
+    {inspectingId && <ProviderModels provider={providers.data.providers.find((provider) => provider.id === inspectingId) ?? null} onClose={() => setInspectingId(null)} />}
   </div>
+}
+
+function ProviderActions({ provider, testing, onInspect, onTest, onEdit, onRemove }: { provider: ProviderInstance; testing: boolean; onInspect(): void; onTest(): void; onEdit(): void; onRemove(): void }) {
+  return <div className="flex shrink-0 justify-end gap-1"><Button variant="ghost" size="icon" onClick={onInspect} aria-label={`View ${provider.config.name} models`}><Info data-icon="inline-start" /></Button><Button variant="ghost" size="icon" disabled={testing || provider.models.length === 0} onClick={onTest} aria-label={`Test ${provider.config.name}`}>{testing ? <LoaderCircle data-icon="inline-start" className="animate-spin" /> : <TestTube2 data-icon="inline-start" />}</Button><Button variant="ghost" size="icon" onClick={onEdit} aria-label={`Edit ${provider.config.name}`}><Pencil data-icon="inline-start" /></Button><AlertDialog><AlertDialogTrigger asChild><Button variant="ghost" size="icon" aria-label={`Delete ${provider.config.name}`}><Trash2 data-icon="inline-start" /></Button></AlertDialogTrigger><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete {provider.config.name}?</AlertDialogTitle><AlertDialogDescription>Roles using this provider must be reassigned before it can be removed.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={onRemove}>Delete provider</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></div>
+}
+
+function ProviderModels({ provider, onClose }: { provider: ProviderInstance | null; onClose(): void }) {
+  if (!provider) return null
+  return <Sheet open onOpenChange={(open: boolean) => { if (!open) onClose() }}>
+    <SheetContent className="w-full gap-0 sm:max-w-2xl">
+      <SheetHeader><SheetTitle>{provider.config.name} models</SheetTitle><SheetDescription>Effective model profiles and capabilities supplied by PL. {provider.models.length} models available.</SheetDescription></SheetHeader>
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pb-5">
+        {provider.models.length === 0 && <EmptyState title="No models available" description="Check the PL provider catalog or custom model configuration." />}
+        {provider.models.map((model) => <section key={model.slug} className="space-y-3 rounded-lg border p-4">
+          <div><h3 className="text-sm font-semibold">{model.display_name}</h3><p className="font-mono text-xs text-muted-foreground">{model.slug}</p>{model.description && <p className="mt-1 text-xs text-muted-foreground">{model.description}</p>}</div>
+          <dl className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+            <ModelFact label="API" value={model.binding.transport.protocol} />
+            <ModelFact label="Connection" value={model.binding.transport.default_connection_mode} />
+            <ModelFact label="Context" value={model.context_window?.toLocaleString() ?? "—"} />
+            <ModelFact label="Max output" value={model.max_output_tokens?.toLocaleString() ?? "—"} />
+          </dl>
+          <div className="flex flex-wrap gap-1.5 text-xs text-muted-foreground">
+            <span>Input: {model.capabilities.input.map((input) => input.modality).join(", ") || "—"}</span>
+            <span>· Output: {model.capabilities.output.join(", ") || "—"}</span>
+            {model.capabilities.reasoning && <span>· Reasoning</span>}
+            {model.capabilities.web_search && <span>· Web search</span>}
+            {model.capabilities.tools.function_calling && <span>· Tools</span>}
+          </div>
+        </section>)}
+      </div>
+    </SheetContent>
+  </Sheet>
+}
+
+function ModelFact({ label, value }: { label: string; value: string }) {
+  return <div><dt className="text-muted-foreground">{label}</dt><dd className="mt-0.5 break-all font-medium">{value}</dd></div>
 }
 
 function ProvidersFrame({ children }: { children: React.ReactNode }) {

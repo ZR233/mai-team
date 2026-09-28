@@ -22,7 +22,10 @@ mod history;
 mod snapshot;
 mod turns;
 
-pub(crate) use history::{project_turn_history_from_effects, turn_terminal_sequence};
+pub(crate) use history::{
+    project_active_turn_items_from_effects, project_turn_history_from_effects,
+    turn_terminal_sequence,
+};
 pub(crate) use snapshot::{ThreadProjectionMetadata, project_snapshot, status};
 pub(crate) use turns::project_turn;
 

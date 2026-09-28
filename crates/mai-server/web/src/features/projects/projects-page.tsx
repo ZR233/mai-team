@@ -6,7 +6,7 @@ import { toast } from "sonner"
 
 import { api, jsonBody } from "@/api/client"
 import type { ProjectDetail } from "@/api/product-types"
-import { projectQuery, projectsQuery, queryKeys } from "@/api/queries"
+import { agentQuery, projectQuery, projectsQuery, queryKeys } from "@/api/queries"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
 import { ResourceSidebar } from "@/components/resource-sidebar"
 import { StatusBadge, StatusDot } from "@/components/status"
@@ -35,7 +35,7 @@ export default function ProjectsPage() {
   const selectedAgentId = search.get("agent")
   const view = (search.get("view") as ProjectView | null) || "agents"
   const reviewPage = positivePage(search.get("review_page"))
-  const detail = useQuery(projectQuery(selectedId, selectedAgentId))
+  const detail = useQuery(projectQuery(selectedId))
   const [createOpen, setCreateOpen] = useState(false)
 
   useEffect(() => {
@@ -71,7 +71,7 @@ export default function ProjectsPage() {
           : detail.error
             ? <ProjectPageState><ErrorState error={detail.error} retry={() => void detail.refetch()} /></ProjectPageState>
             : detail.data
-              ? <ProjectWorkspace detail={detail.data} view={view} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} reviewPage={reviewPage} setReviewPage={(page) => changeSearch({ review_page: page === 1 ? null : String(page) })} refresh={() => queryClient.invalidateQueries({ queryKey: ["projects", selectedId] })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
+              ? <ProjectWorkspace detail={detail.data} view={view} selectedAgentId={selectedAgentId} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} reviewPage={reviewPage} setReviewPage={(page) => changeSearch({ review_page: page === 1 ? null : String(page) })} refresh={() => queryClient.invalidateQueries({ queryKey: queryKeys.project(selectedId) })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
               : null}
       <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={(project) => {
         setCreateOpen(false)
@@ -86,9 +86,10 @@ function ProjectPageState({ children }: { children: React.ReactNode }) {
   return <section className="flex min-w-0 flex-1 flex-col"><WorkspaceHeader crumbs={[{ label: "Projects" }]} /><div className="min-h-0 flex-1 overflow-auto">{children}</div></section>
 }
 
-function ProjectWorkspace({ detail, view, setView, selectAgent, reviewPage, setReviewPage, refresh, onDeleted }: {
+function ProjectWorkspace({ detail, view, selectedAgentId, setView, selectAgent, reviewPage, setReviewPage, refresh, onDeleted }: {
   detail: ProjectDetail
   view: ProjectView
+  selectedAgentId: string | null
   setView(view: ProjectView): void
   selectAgent(id: string): void
   reviewPage: number
@@ -96,7 +97,7 @@ function ProjectWorkspace({ detail, view, setView, selectAgent, reviewPage, setR
   refresh(): Promise<unknown>
   onDeleted(): Promise<void>
 }) {
-  const selected = detail.selected_agent || detail.maintainer_agent
+  const selectedId = detail.agents.some((agent) => agent.id === selectedAgentId) ? selectedAgentId! : detail.maintainer_agent_id
   return (
     <section className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
       <WorkspaceHeader
@@ -114,24 +115,35 @@ function ProjectWorkspace({ detail, view, setView, selectAgent, reviewPage, setR
         </Tabs>
       </div>
       {view === "agents" && <div className="flex min-h-0 flex-1 flex-col">
-        <AgentStrip agents={detail.agents} selectedId={selected.id} onSelect={selectAgent} />
-        <ThreadWorkspace
-          agent={selected}
-          skillsEndpoint={`/projects/${detail.id}/skills`}
-          onAgentUpdated={refresh}
-          onSend={async (message, skillMentions) => {
-            await api(`/threads/${encodeURIComponent(selected.thread.id)}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions }) })
-          }}
-          onStop={async (turnId) => {
-            await api(`/agents/${selected.id}/turns/${turnId}/cancel`, { method: "POST" })
-          }}
-        />
+        <AgentStrip agents={detail.agents} selectedId={selectedId} onSelect={selectAgent} />
+        <ProjectAgentWorkspace projectId={detail.id} agentId={selectedId} refresh={refresh} />
       </div>}
       {view === "review" && <ReviewPanel key={detail.id} project={detail} page={reviewPage} onPageChange={setReviewPage} />}
       {view === "repository" && <RepositoryPanel project={detail} refresh={refresh} onDeleted={onDeleted} />}
       {view === "skills" && <SkillsPanel projectId={detail.id} />}
     </section>
   )
+}
+
+function ProjectAgentWorkspace({ projectId, agentId, refresh }: { projectId: string; agentId: string; refresh(): Promise<unknown> }) {
+  const queryClient = useQueryClient()
+  const agent = useQuery(agentQuery(agentId))
+  if (agent.isLoading) return <LoadingState rows={6} />
+  if (agent.error) return <ErrorState error={agent.error} retry={() => void agent.refetch()} />
+  if (!agent.data) return null
+  return <ThreadWorkspace
+    agent={agent.data}
+    skillsEndpoint={`/projects/${projectId}/skills`}
+    onAgentUpdated={async () => {
+      await Promise.all([refresh(), queryClient.invalidateQueries({ queryKey: queryKeys.agent(agentId) })])
+    }}
+    onSend={async (message, skillMentions) => {
+      await api(`/threads/${encodeURIComponent(agent.data.thread.id)}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions }) })
+    }}
+    onStop={async (turnId) => {
+      await api(`/agents/${agentId}/turns/${turnId}/cancel`, { method: "POST" })
+    }}
+  />
 }
 
 function positivePage(value: string | null) {

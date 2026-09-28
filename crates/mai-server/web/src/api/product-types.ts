@@ -232,11 +232,7 @@ export interface ReviewRunsResponse {
 }
 
 export interface ProjectDetail extends ProjectSummary {
-  maintainer_agent: AgentDetail
   agents: AgentSummary[]
-  selected_agent_id: Id
-  selected_agent: AgentDetail
-  review_runs: ReviewRunSummary[]
   auth_status?: string
   mcp_status?: string
 }
@@ -276,6 +272,12 @@ export interface TaskDetail extends TaskSummary {
   artifacts: Array<{ id: string; name: string; size_bytes: number; created_at: string }>
 }
 
+export interface ProviderTransportProfile {
+  protocol: string
+  supported_connection_modes: string[]
+  default_connection_mode: string
+}
+
 export interface ProviderModel {
   slug: string
   display_name: string
@@ -284,11 +286,26 @@ export interface ProviderModel {
   max_context_window?: number | null
   max_output_tokens?: number | null
   parameters?: Array<{ name: string; label?: string | null; candidates: string[]; wire?: Record<string, unknown> }>
-  transport: {
-    protocol: string
-    supported_connection_modes: string[]
-    default_connection_mode: string
+  binding: {
+    transport: ProviderTransportProfile
+    request: Record<string, unknown>
   }
+  capabilities: {
+    input: Array<{ modality: string }>
+    output: string[]
+    streaming: boolean
+    temperature: boolean
+    reasoning: boolean
+    web_search: boolean
+    tools: {
+      function_calling: boolean
+      parallel_tool_calls: boolean
+      custom_tools: boolean
+      freeform_tools: boolean
+      programmatic_tool_calling: boolean
+    }
+  }
+  pricing: { kind: string }
   [key: string]: unknown
 }
 
@@ -315,6 +332,7 @@ export interface ProviderInstance {
 }
 
 export interface ProviderPreset {
+  pricing_enabled: boolean
   id: string
   display_name: string
   description?: string | null
@@ -323,19 +341,36 @@ export interface ProviderPreset {
   model_catalog_id: string
   icon_key?: string | null
   credential: { label: string; env_var?: string | null }
+  service_capabilities: {
+    web_search: { hosted_responses: boolean; hosted_dialect: string; standalone: string | null }
+    prompt_cache_dialect: string
+    responses_programmatic_tool_calling: boolean
+  }
+  [key: string]: unknown
+}
+
+export interface CatalogModelDescriptor {
+  id: string
+  display_name: string
+  description: string | null
+  context_window: number | null
+  max_context_window: number | null
+  max_output_tokens: number | null
   transport: {
     protocol: string
     connection_modes: Array<{ id: string; display_name: string }>
     default_connection_mode: string
   }
-  [key: string]: unknown
+  capabilities: Record<string, unknown>
+  reasoning: Record<string, unknown> | null
+  pricing: Record<string, unknown> | null
 }
 
 export interface ProviderCatalog {
   schema_version: number
   revision: string
   presets: ProviderPreset[]
-  model_catalogs: Record<string, { models: ProviderModel[]; [key: string]: unknown }>
+  model_catalogs: Record<string, { id: string; models: CatalogModelDescriptor[] }>
 }
 
 export interface ProvidersResponse {
@@ -346,7 +381,7 @@ export interface ProviderTestResponse {
   ok: boolean
   provider_id: string
   provider_name: string
-  transport: ProviderModel["transport"]
+  transport: ProviderTransportProfile
   model: string
   base_url: string
   latency_ms: number

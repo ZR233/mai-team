@@ -6,12 +6,11 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use mai_protocol::{
-    AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId,
-    ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
-    ProjectPullRequestStateRefreshSummary, ProjectReviewDiscoverySnapshot, ProjectReviewJobDetail,
-    ProjectReviewQueueResponse, ProjectReviewRunDetail, ProjectReviewRunsResponse,
-    SendMessageRequest, SendMessageResponse, SkillsListResponse, UpdateProjectRequest,
-    UpdateProjectResponse,
+    CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectPullRequestReviewHistoryPage,
+    ProjectPullRequestReviewPage, ProjectPullRequestStateRefreshSummary,
+    ProjectReviewDiscoverySnapshot, ProjectReviewJobDetail, ProjectReviewQueueResponse,
+    ProjectReviewRunDetail, ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse,
+    SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
@@ -20,11 +19,6 @@ use super::state::{ApiError, AppState};
 const DEFAULT_REVIEW_RUNS_PAGE_SIZE: usize = 50;
 const DEFAULT_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 20;
 const MAX_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 100;
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ProjectDetailQuery {
-    agent_id: Option<AgentId>,
-}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectReviewRunsQuery {
@@ -55,9 +49,8 @@ pub(crate) async fn create_project(
 pub(crate) async fn get_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<ProjectId>,
-    Query(query): Query<ProjectDetailQuery>,
 ) -> std::result::Result<Json<mai_protocol::ProjectDetail>, ApiError> {
-    Ok(Json(state.runtime.get_project(id, query.agent_id).await?))
+    Ok(Json(state.runtime.get_project(id).await?))
 }
 
 pub(crate) async fn update_project(
@@ -254,7 +247,8 @@ mod tests {
     use chrono::Utc;
     use mai_docker::DockerClient;
     use mai_protocol::{
-        AgentResourceSnapshot, AgentResourceState, AgentRole, ProjectCloneStatus, ProjectStatus,
+        AgentId, AgentResourceSnapshot, AgentResourceState, AgentRole, ProjectCloneStatus,
+        ProjectStatus,
     };
     use mai_runtime::{AgentRuntime, RuntimeConfig};
     use mai_store::MaiStore;

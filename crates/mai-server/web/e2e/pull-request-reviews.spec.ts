@@ -252,7 +252,7 @@ function projectDetail() {
     token_usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
     thread: { id: "agent-1", projectId: "project-1", title: "Maintainer", mode: "simple", rootThreadId: "agent-1", role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false },
   }
-  return { ...projectSummary, maintainer_agent: agent, agents: [agent], selected_agent_id: agent.id, selected_agent: agent, review_runs: [] }
+  return { ...projectSummary, agents: [agent], auth_status: "ready", mcp_status: "ready" }
 }
 
 function json(route: Route, body: unknown) {

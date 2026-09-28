@@ -186,7 +186,7 @@ function Attempts({ projectId, attempts, usageByAttemptId }: { projectId: string
               </button>
             ))}
           </div>}
-      <ReviewAttemptActivity projectId={projectId} attempt={selectedAttempt} />
+      <ReviewAttemptActivity key={selectedAttempt?.id} projectId={projectId} attempt={selectedAttempt} />
     </section>
   )
 }

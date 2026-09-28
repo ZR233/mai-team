@@ -38,6 +38,7 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
   const reviews = useQuery({
     ...projectPullRequestReviewsQuery(project.id, page, REVIEW_PAGE_SIZE),
     placeholderData: keepPreviousData,
+    refetchInterval: (query) => (query.state.data?.summary.active ?? 0) > 0 ? 5_000 : false,
   })
   const discovery = useQuery(projectReviewDiscoveryQuery(project.id))
   const [selectedReview, setSelectedReview] = useState<PullRequestReviewSummary | null>(null)

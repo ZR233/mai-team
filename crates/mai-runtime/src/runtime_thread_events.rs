@@ -20,8 +20,9 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use mai_protocol::{
-    AgentId, AgentResourceState, AgentSummary, ThreadNotification, ThreadNotificationEnvelope,
-    ThreadSnapshot, ThreadSubscriptionUpdate, ThreadTurnPage, Turn,
+    AgentId, AgentResourceState, AgentSummary, ThreadContextDisposition, ThreadNotification,
+    ThreadNotificationEnvelope, ThreadSnapshot, ThreadSubscriptionUpdate, ThreadTurnHistory,
+    ThreadTurnPage, Turn,
 };
 use pl_core::persistence::ThreadEffectQuery;
 use pl_core::thread::{
@@ -32,7 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime_agent_api::project_thread_snapshot;
 use crate::state::AgentRecord;
-use crate::thread_projection::{project_turn_history_from_effects, turn_terminal_sequence};
+use crate::thread_projection::{
+    project_active_turn_items_from_effects, project_turn_history_from_effects,
+    turn_terminal_sequence,
+};
 use crate::{AgentRuntime, Result, RuntimeError};
 
 /// Turn history 单页上限，与 pl-core Thread effect 查询的页大小上限一致。
@@ -217,6 +221,63 @@ impl AgentRuntime {
         let state = resident.handle.snapshot();
         ensure_live_canonical_thread(&thread_id, &state)?;
         project_thread_snapshot(&summary, &state)
+    }
+
+    /// 从 pl-core 的权威当前 Turn 与已提交 typed effect 组成运行中 Review 聊天。
+    /// 不为旧会话启动容器；调用方只在 reviewer 当前驻留时使用此视图。
+    pub(crate) async fn active_review_turn_history(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        input_id: &str,
+    ) -> Result<Option<ThreadTurnHistory>> {
+        if self.resident_thread(agent_id).is_none() {
+            return Ok(None);
+        }
+        let thread_id = agent_id.to_string();
+        let snapshot = self.thread_snapshot(thread_id.clone()).await?;
+        let Some(turn) = snapshot
+            .active_turn
+            .filter(|turn| turn.input_id.as_deref() == Some(input_id))
+        else {
+            return Ok(None);
+        };
+        self.await_agent_durable(agent_id, snapshot.revision)
+            .await?;
+        let mut effects = Vec::new();
+        let mut before_sequence = None;
+        loop {
+            let page = self
+                .session_history
+                .effects(
+                    agent_id,
+                    ThreadEffectQuery {
+                        before_sequence,
+                        limit: EFFECT_PAGE_LIMIT,
+                    },
+                )
+                .await?;
+            let started = page.effects.iter().any(|effect| {
+                effect.turn.as_ref().is_some_and(|record| {
+                    record.turn_id == turn.id && record.state == pl_core::thread::TurnState::Running
+                })
+            });
+            effects.extend(page.effects);
+            if started {
+                break;
+            }
+            let Some(next) = page.next_before_sequence else {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "active Review Turn {} has no durable start effect",
+                    turn.id
+                )));
+            };
+            before_sequence = Some(next);
+        }
+        Ok(Some(ThreadTurnHistory {
+            items: project_active_turn_items_from_effects(&thread_id, &effects, &turn.id),
+            turn,
+            context_disposition: ThreadContextDisposition::Active,
+        }))
     }
 
     /// 用 canonical Thread effect 分页读取一个 Thread 的 Turn history。

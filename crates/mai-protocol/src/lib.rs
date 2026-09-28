@@ -816,16 +816,11 @@ pub struct ProjectReviewQueueResponse {
 pub struct ProjectDetail {
     #[serde(flatten)]
     pub summary: ProjectSummary,
-    pub maintainer_agent: AgentDetail,
     pub agents: Vec<AgentSummary>,
-    pub selected_agent_id: AgentId,
-    pub selected_agent: AgentDetail,
     #[serde(default)]
     pub auth_status: String,
     #[serde(default)]
     pub mcp_status: String,
-    #[serde(default)]
-    pub review_runs: Vec<ProjectReviewRunSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

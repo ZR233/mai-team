@@ -6,23 +6,12 @@ use crate::github::{VerifiedGithubRepository, github_clone_url};
 use crate::state::{ProjectRecord, RuntimeState};
 use crate::{Result, RuntimeError};
 use mai_protocol::{
-    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
+    AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
     GitAccountSummary, GithubInstallationsResponse, MaiProductEventKind, ProjectCloneStatus,
     ProjectDetail, ProjectId, ProjectReviewStatus, ProjectStatus, ProjectSummary,
     SendMessageRequest, TurnId, UpdateProjectRequest, now,
 };
 use uuid::Uuid;
-
-/// Supplies the agent details and review run summaries needed to assemble
-/// project read models without exposing the full runtime to project service
-/// queries.
-pub(crate) trait ProjectReadOps: Send + Sync {
-    fn get_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<AgentDetail>> + Send;
-    fn recent_review_runs(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Result<Vec<mai_protocol::ProjectReviewRunSummary>>> + Send;
-}
 
 /// Supplies side effects required by project update/delete lifecycle operations.
 pub(crate) trait ProjectLifecycleOps: Send + Sync {
@@ -128,33 +117,21 @@ pub(crate) async fn list_projects(state: &RuntimeState) -> Vec<ProjectSummary> {
 
 pub(crate) async fn get_project(
     state: &RuntimeState,
-    ops: &impl ProjectReadOps,
     project_id: ProjectId,
-    selected_agent_id: Option<AgentId>,
 ) -> Result<ProjectDetail> {
     let project = project(state, project_id).await?;
     let summary = project.summary.read().await.clone();
     let agents = project_agents(state, project_id).await;
-    let requested_agent_id =
-        selected_agent_id.filter(|id| agents.iter().any(|agent| agent.id == *id));
-    let selected_agent_id = requested_agent_id.unwrap_or(summary.maintainer_agent_id);
-    let maintainer_agent = ops.get_agent(summary.maintainer_agent_id).await?;
-    let selected_agent = ops.get_agent(selected_agent_id).await?;
     let status = if summary.status == ProjectStatus::Ready {
         "ready"
     } else {
         "pending"
     };
-    let review_runs = ops.recent_review_runs(project_id).await?;
     Ok(ProjectDetail {
         summary,
-        maintainer_agent,
         agents,
-        selected_agent_id,
-        selected_agent,
         auth_status: status.to_string(),
         mcp_status: status.to_string(),
-        review_runs,
     })
 }
 
