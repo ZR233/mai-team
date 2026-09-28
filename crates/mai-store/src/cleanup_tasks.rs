@@ -97,33 +97,24 @@ pub struct ProjectReviewCleanupTask {
 }
 
 impl MaiStore {
-    pub async fn load_live_project_review_context_run_ids(&self) -> Result<Vec<Uuid>> {
-        Ok(self
-            .load_live_project_review_contexts()
-            .await?
-            .into_iter()
-            .map(|(_, run_id)| run_id)
-            .collect())
-    }
-
-    pub async fn load_live_project_review_contexts(&self) -> Result<Vec<(ProjectId, Uuid)>> {
+    /// 返回仍由 reviewer 持有的快照任务 ID；每次尝试的 active_run_id 不是快照身份。
+    pub async fn load_live_project_review_context_job_ids(&self) -> Result<Vec<(ProjectId, Uuid)>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let connection = open_cleanup_connection(&path)?;
             let mut statement = connection.prepare(
-                "SELECT project_id, active_run_id FROM project_review_jobs
+                "SELECT project_id, id FROM project_review_jobs
                  WHERE status NOT IN ('succeeded','failed','cancelled','superseded','skipped')
                    AND reviewer_agent_id IS NOT NULL
-                   AND active_run_id IS NOT NULL
-                 ORDER BY project_id ASC, active_run_id ASC",
+                 ORDER BY project_id ASC, id ASC",
             )?;
             statement
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .map(|value| {
-                    let (project_id, run_id) = value?;
-                    Ok((parse_project_id(&project_id)?, parse_uuid(&run_id)?))
+                    let (project_id, job_id) = value?;
+                    Ok((parse_project_id(&project_id)?, parse_uuid(&job_id)?))
                 })
                 .collect()
         })

@@ -97,10 +97,10 @@ pub(crate) struct ProjectReviewContextInit {
 }
 
 impl ProjectRepositoryView {
-    pub(crate) fn for_run(volume: String, run_id: Uuid, base_sha: String) -> Self {
+    pub(crate) fn for_job(volume: String, job_id: Uuid, base_sha: String) -> Self {
         Self {
             volume,
-            volume_subpath: format!("{PROJECT_REVIEW_SNAPSHOT_ROOT}/{run_id}/repo"),
+            volume_subpath: format!("{PROJECT_REVIEW_SNAPSHOT_ROOT}/{job_id}/repo"),
             container_path: PROJECT_REPOSITORY_CONTAINER_PATH.to_string(),
             base_sha,
         }
@@ -197,7 +197,7 @@ mod tests {
                 branch: "main".to_string(),
                 base_sha: "base".to_string(),
             },
-            repository_view: ProjectRepositoryView::for_run(
+            repository_view: ProjectRepositoryView::for_job(
                 "project-volume".to_string(),
                 Uuid::nil(),
                 "base".to_string(),

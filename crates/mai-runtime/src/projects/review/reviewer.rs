@@ -913,7 +913,7 @@ mod tests {
                     branch: "main".to_string(),
                     base_sha: "base-sha".to_string(),
                 },
-                repository_view: ProjectRepositoryView::for_run(
+                repository_view: ProjectRepositoryView::for_job(
                     "project-volume".to_string(),
                     Uuid::new_v4(),
                     "base-sha".to_string(),

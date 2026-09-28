@@ -2338,6 +2338,39 @@ async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() 
 }
 
 #[tokio::test]
+async fn live_review_contexts_follow_job_identity_across_attempts() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut running = test_review_job(project_id, 41, "running-head", None);
+    running.status = ProjectReviewJobStatus::Running;
+    running.reviewer_agent_id = Some(Uuid::new_v4());
+    running.active_run_id = Some(Uuid::new_v4());
+    let mut retrying = test_review_job(project_id, 42, "retrying-head", None);
+    retrying.status = ProjectReviewJobStatus::RetryWaiting;
+    retrying.reviewer_agent_id = Some(Uuid::new_v4());
+    let mut finished = test_review_job(project_id, 43, "finished-head", None);
+    finished.status = ProjectReviewJobStatus::Failed;
+    finished.reviewer_agent_id = Some(Uuid::new_v4());
+    finished.active_run_id = Some(Uuid::new_v4());
+    let unowned = test_review_job(project_id, 44, "unowned-head", None);
+    for job in [&running, &retrying, &finished, &unowned] {
+        store
+            .save_project_review_job(job.clone())
+            .await
+            .expect("save review job");
+    }
+
+    let mut actual = store
+        .load_live_project_review_context_job_ids()
+        .await
+        .expect("load live review contexts");
+    actual.sort_unstable();
+    let mut expected = vec![(project_id, running.id), (project_id, retrying.id)];
+    expected.sort_unstable();
+    assert_eq!(expected, actual);
+}
+
+#[tokio::test]
 async fn active_review_job_projection_does_not_hide_reviewer_owner() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();

@@ -24,7 +24,7 @@ impl AgentRuntime {
             .join(run_id.to_string());
         let stage_root = root.join("stage");
         let skills_cache_dir = root.join("skills");
-        let repository_view = ProjectRepositoryView::for_run(
+        let repository_view = ProjectRepositoryView::for_job(
             project_cache_volume(&project_id.to_string()),
             run_id,
             project_revision.base_sha.clone(),
@@ -146,7 +146,7 @@ impl AgentRuntime {
             .cache_root
             .join(PROJECT_REVIEW_CONTEXT_CACHE_DIR)
             .join(run_id.to_string());
-        let view = ProjectRepositoryView::for_run(
+        let view = ProjectRepositoryView::for_job(
             project_cache_volume(&project_id.to_string()),
             run_id,
             String::new(),
@@ -169,13 +169,16 @@ impl AgentRuntime {
 
     pub(super) async fn cleanup_orphan_project_review_host_contexts(&self) {
         let root = self.cache_root.join(PROJECT_REVIEW_CONTEXT_CACHE_DIR);
-        let live_run_ids = match self
+        let live_job_ids = match self
             .deps
             .store
-            .load_live_project_review_context_run_ids()
+            .load_live_project_review_context_job_ids()
             .await
         {
-            Ok(run_ids) => run_ids.into_iter().collect::<HashSet<_>>(),
+            Ok(contexts) => contexts
+                .into_iter()
+                .map(|(_, job_id)| job_id)
+                .collect::<HashSet<_>>(),
             Err(error) => {
                 tracing::warn!(
                     "failed to load live project review contexts during startup cleanup: {error}"
@@ -214,11 +217,11 @@ impl AgentRuntime {
                     break;
                 }
             };
-            let run_id = entry
+            let job_id = entry
                 .file_name()
                 .to_str()
                 .and_then(|name| Uuid::parse_str(name).ok());
-            if run_id.is_some_and(|run_id| live_run_ids.contains(&run_id)) {
+            if job_id.is_some_and(|job_id| live_job_ids.contains(&job_id)) {
                 continue;
             }
             if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
@@ -233,7 +236,12 @@ impl AgentRuntime {
     }
 
     pub(super) async fn cleanup_orphan_project_review_repository_views(&self) {
-        let live_contexts = match self.deps.store.load_live_project_review_contexts().await {
+        let live_contexts = match self
+            .deps
+            .store
+            .load_live_project_review_context_job_ids()
+            .await
+        {
             Ok(contexts) => contexts,
             Err(error) => {
                 tracing::warn!(
@@ -259,15 +267,15 @@ impl AgentRuntime {
                 continue;
             };
             let _repo_sync_guard = project.repo_sync_lock.lock().await;
-            let live_run_ids = live_contexts
+            let live_job_ids = live_contexts
                 .iter()
-                .filter_map(|(project_id, run_id)| (*project_id == summary.id).then_some(*run_id))
+                .filter_map(|(project_id, job_id)| (*project_id == summary.id).then_some(*job_id))
                 .collect::<Vec<_>>();
             if let Err(error) = self
                 .run_project_repository_command(
                     summary.id,
                     &volume,
-                    &orphan_review_snapshot_cleanup_command(&live_run_ids),
+                    &orphan_review_snapshot_cleanup_command(&live_job_ids),
                     "orphan review snapshot cleanup",
                 )
                 .await
@@ -662,9 +670,9 @@ rmdir "$(dirname "$snapshot")" >/dev/null 2>&1 || true
     )
 }
 
-fn orphan_review_snapshot_cleanup_command(live_run_ids: &[Uuid]) -> String {
-    let live_run_ids = shell_quote_word(
-        &live_run_ids
+fn orphan_review_snapshot_cleanup_command(live_job_ids: &[Uuid]) -> String {
+    let live_job_ids = shell_quote_word(
+        &live_job_ids
             .iter()
             .map(Uuid::to_string)
             .collect::<Vec<_>>()
@@ -673,14 +681,14 @@ fn orphan_review_snapshot_cleanup_command(live_run_ids: &[Uuid]) -> String {
     format!(
         r#"set -eu
 root=/workspace/{PROJECT_REVIEW_SNAPSHOT_ROOT}
-live_run_ids={live_run_ids}
+live_job_ids={live_job_ids}
 if [ -d "$root" ] && [ -d /workspace/repo.git ]; then
   for snapshot in "$root"/*/repo; do
     [ -e "$snapshot" ] || continue
-    run_id="$(basename "$(dirname "$snapshot")")"
+    job_id="$(basename "$(dirname "$snapshot")")"
     keep=false
-    for live_run_id in $live_run_ids; do
-      if [ "$live_run_id" = "$run_id" ]; then
+    for live_job_id in $live_job_ids; do
+      if [ "$live_job_id" = "$job_id" ]; then
         keep=true
         break
       fi
@@ -706,7 +714,7 @@ mod tests {
     use super::*;
 
     fn view() -> ProjectRepositoryView {
-        ProjectRepositoryView::for_run(
+        ProjectRepositoryView::for_job(
             "project-volume".to_string(),
             Uuid::nil(),
             "0123456789abcdef".to_string(),
@@ -799,7 +807,7 @@ mod tests {
         run(Command::new("git").args(["-C", &path(&source), "push", "origin", "main"]));
         let base_sha =
             output(Command::new("git").args(["-C", &path(&source), "rev-parse", "HEAD"]));
-        let view = ProjectRepositoryView::for_run(
+        let view = ProjectRepositoryView::for_job(
             "project-volume".to_string(),
             Uuid::nil(),
             base_sha.clone(),
@@ -834,7 +842,7 @@ mod tests {
         ));
         assert!(!snapshot.exists());
 
-        let second_view = ProjectRepositoryView::for_run(
+        let second_view = ProjectRepositoryView::for_job(
             "project-volume".to_string(),
             Uuid::from_u128(1),
             base_sha,
