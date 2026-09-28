@@ -85,6 +85,28 @@ impl GitAccountService {
     }
 
     pub(crate) async fn verify(&self, account_id: &str) -> Result<GitAccountSummary> {
+        let account = self.summary(account_id).await?;
+        if account.provider == GitProvider::GithubAppRelay {
+            self.store.mark_git_account_verifying(account_id).await?;
+            let verification = self.token(account_id).await;
+            return Ok(self
+                .store
+                .update_git_account_verification(
+                    account_id,
+                    account.installation_account.or(account.login),
+                    GitTokenKind::Unknown,
+                    Vec::new(),
+                    if verification.is_ok() {
+                        GitAccountStatus::Verified
+                    } else {
+                        GitAccountStatus::Failed
+                    },
+                    verification
+                        .err()
+                        .map(|_| "failed to obtain GitHub installation token".to_string()),
+                )
+                .await?);
+        }
         let token = self.token(account_id).await?;
         self.store.mark_git_account_verifying(account_id).await?;
         let response = match self
@@ -637,6 +659,40 @@ mod tests {
             }])
         );
         assert_eq!(github_backend.token_requests.lock().await.as_slice(), &[]);
+    }
+
+    #[tokio::test]
+    async fn relay_account_verification_uses_installation_token() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("relay-account".to_string()),
+                provider: GitProvider::GithubAppRelay,
+                label: "Relay".to_string(),
+                installation_id: Some(42),
+                installation_account: Some("octo".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let github_backend = Arc::new(MockGithubAppBackend::default());
+        let service = GitAccountService::new(
+            Arc::clone(&store),
+            reqwest::Client::new(),
+            "http://127.0.0.1".to_string(),
+            github_backend.clone(),
+        );
+
+        let account = service.verify("relay-account").await.expect("verify relay");
+
+        assert_eq!(account.status, GitAccountStatus::Verified);
+        assert_eq!(account.login.as_deref(), Some("octo"));
+        assert_eq!(account.last_error, None);
+        assert_eq!(
+            github_backend.token_requests.lock().await.as_slice(),
+            &[(42, None, false)]
+        );
     }
 
     #[tokio::test]
