@@ -130,6 +130,11 @@ npm run test:projects
 
 `mai-server` 安装后默认使用 `/var/lib/mai-server` 作为数据目录，并通过 `/etc/mai-server/mai-server.env` 读取运行配置。`mai-relay` 需要设置 `MAI_RELAY_TOKEN`，并通过 Settings 页面与 `mai-server` 建立连接。
 
+升级 pl-core 会话 schema 时，先停止 `mai-server` 并完整备份数据目录，再运行同版本编译出的
+`mai-migrate-pl-sessions --data-path /var/lib/mai-server --backup-archive <备份 tar 路径>`。
+迁移工具只负责遍历 Mai 的 Agent 会话目录，并调用 pl-core 的离线迁移接口；普通服务启动不会
+擅自改写旧会话。迁移成功后再安装并启动同版本的 `mai-server`。
+
 ## 相关文档
 
 - [项目 PR 审查循环契约](docs/project-review-loop.md)

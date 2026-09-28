@@ -1246,7 +1246,7 @@ mod tests {
             outcome: AttemptOutcome::Failed(Arc::new(pl_core::model::ModelError {
                 details: None,
                 kind: pl_core::model::ModelFailureKind::Unavailable,
-                usage: ModelUsage::default(),
+                usage: Box::new(ModelUsage::default()),
                 source: None,
             })),
             input_estimate: None,
