@@ -81,6 +81,7 @@ pub(crate) async fn assemble_thread_tools(
     let skill_catalog = skill_catalog(&runtime, &agent, &config).await?;
     *agent.skill_catalog.write().await = skill_catalog.clone();
     let mcp = tool_mcp::registrations(&runtime, &agent).await?;
+    let active_mcp_servers = mcp.active_servers;
     // Review 身份来自创建时写入的产品事实；Review Context 在 Thread 装配之后才附加，
     // 不能用它判定是否是 Review Thread，否则装配会把 Review Thread 误判成普通 Thread。
     let collaboration = collaboration_availability(&runtime, summary.review_run_id.is_some());
@@ -88,17 +89,18 @@ pub(crate) async fn assemble_thread_tools(
 
     let catalog = assemble_tool_catalog(MaiThreadToolContext {
         runtime,
-        agent,
+        agent: Arc::clone(&agent),
         agent_id,
         workspace,
         git,
         skill_catalog,
-        mcp,
+        mcp: mcp.registrations,
         collaboration,
         search,
     })
     .await?;
     let (hosted_tools, registrations) = catalog.into_parts();
+    *agent.active_mcp_servers.write().await = active_mcp_servers;
     tracing::debug!(
         agent_id = %agent_id,
         thread_id = %thread_id,

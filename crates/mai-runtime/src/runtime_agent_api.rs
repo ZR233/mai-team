@@ -514,7 +514,8 @@ impl AgentRuntime {
         let mut summary = agent.summary.read().await.clone();
         summary.usage = canonical_usage(&state.usage_summary, summary.updated_at.timestamp());
         summary.last_turn = self.last_terminal_turn(summary.id).await?;
-        let thread = project_thread_snapshot(&summary, state)?;
+        let active_mcp_servers = agent.active_mcp_servers.read().await;
+        let thread = project_thread_snapshot(&summary, state, &active_mcp_servers)?;
         summary.runtime = Some(thread.clone());
         Ok((summary, thread))
     }
@@ -587,6 +588,7 @@ fn product_message_input(
 pub(crate) fn project_thread_snapshot(
     summary: &AgentSummary,
     state: &pl_core::thread::ThreadSnapshot,
+    active_mcp_servers: &[String],
 ) -> Result<ThreadSnapshot> {
     let mode = product_thread_mode(summary);
     let (workspace_mode, workspace_path) = match summary.workspace.as_ref() {
@@ -615,6 +617,7 @@ pub(crate) fn project_thread_snapshot(
         mode,
         workspace_mode,
         workspace_path: &workspace_path,
+        active_mcp_servers,
     };
     thread_projection::project_snapshot(summary, state, &metadata)
         .map_err(|error| RuntimeError::InvalidInput(error.to_string()))

@@ -104,6 +104,8 @@ pub(crate) struct AgentRecord {
     pub(crate) registration_pending: AtomicBool,
     pub(crate) container: RwLock<Option<ContainerHandle>>,
     pub(crate) mcp: RwLock<Option<Arc<ContainerMcpRuntime>>>,
+    /// 当前驻留 Thread 装配时冻结的 MCP generation 所含服务。
+    pub(crate) active_mcp_servers: RwLock<Vec<String>>,
     pub(crate) review_context: RwLock<Option<Arc<ProjectReviewContext>>>,
     /// 与当前驻留 Thread 的 `skill_view` 工具共用的 PL 冻结目录。
     pub(crate) skill_catalog: RwLock<Option<Arc<pl_tool::skill::FrozenSkillCatalog>>>,

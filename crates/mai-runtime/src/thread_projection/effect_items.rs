@@ -116,6 +116,10 @@ pub(super) fn skill_item_id(call_id: &str) -> String {
     format!("skill:{}:{call_id}", call_id.len())
 }
 
+pub(super) fn completion_item_id(call_id: &str) -> String {
+    format!("completion:{}:{call_id}", call_id.len())
+}
+
 pub(super) fn response_text_id(attempt_id: &str) -> String {
     format!("model:{}:{attempt_id}:text", attempt_id.len())
 }

@@ -36,12 +36,13 @@ use pl_core::thread::{
 };
 use pl_protocol::{
     ThreadContentLifecycle, ThreadItem, ThreadItemState, ThreadRawItem, ThreadSkillItem,
-    ThreadTextChannel, ThreadToolInvocation, ThreadToolItem, ThreadToolState, ThreadTurnItem,
+    ThreadTextChannel, ThreadTextItem, ThreadToolInvocation, ThreadToolItem, ThreadToolState,
+    ThreadTurnItem,
 };
 
 use super::effect_items::{
-    context_text, delivery_state, raw_payload, response_text_id, running_tool, skill_item_id,
-    succeeded, task_state, text_state, tool_item_id, turn_item_id,
+    completion_item_id, context_text, delivery_state, raw_payload, response_text_id, running_tool,
+    skill_item_id, succeeded, task_state, text_state, tool_item_id, turn_item_id,
 };
 use super::{ProjectionError, project_turn};
 
@@ -314,6 +315,29 @@ impl TurnAccumulator {
         let item = self.item(
             skill_item_id(&delivery.call_id),
             ThreadItemState::Skill(ThreadSkillItem::new(activation)),
+        );
+        self.push(item, RANK_DELIVERY);
+    }
+
+    /// `finish_turn` 的保存回执是显式终态正文，与自然 final 具有相同产品语义。
+    fn push_completion(&mut self, delivery: &pl_core::thread::ToolDelivery) {
+        if !matches!(delivery.outcome, pl_core::thread::ToolOutcome::Succeeded)
+            || delivery.output.control() != pl_core::tool::ToolControl::EndTurn
+        {
+            return;
+        }
+        let Ok(Some(message)) = pl_tool::finish_turn::saved_message(delivery.output.payload())
+        else {
+            return;
+        };
+        let item = self.item(
+            completion_item_id(&delivery.call_id),
+            ThreadItemState::Text(ThreadTextItem::new(
+                ThreadTextChannel::Final,
+                message,
+                Vec::new(),
+                ThreadContentLifecycle::completed(self.at),
+            )),
         );
         self.push(item, RANK_DELIVERY);
     }
@@ -618,6 +642,7 @@ fn route_effect(
             effect.committed_at,
         );
         accumulator.push_skill_activation(delivery);
+        accumulator.push_completion(delivery);
         let at = accumulator.at;
         accumulator.set_tool(
             &delivery.call_id,
@@ -1093,6 +1118,55 @@ mod tests {
         ));
         let ordinals: Vec<u64> = history.items.iter().map(|item| item.ordinal).collect();
         assert_eq!(ordinals, (1..=ordinals.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn finish_turn_receipt_is_projected_as_final_text() {
+        let message = r#"{"outcome":"review_submitted","pr":2491}"#;
+        let payload = OpaquePayload::new(
+            "pl.tool.finish-turn",
+            1,
+            serde_json::to_string(&pl_tool::finish_turn::FinishTurnInput {
+                message: message.to_owned(),
+            })
+            .expect("serialize finish_turn receipt"),
+        )
+        .expect("valid finish_turn receipt");
+        let effects = vec![
+            start_effect(1, "turn-1"),
+            concat_effect(
+                2,
+                vec![assistant_context(
+                    "turn-1:0:output",
+                    "",
+                    vec![named_call("finish-call", "finish_turn", "{}")],
+                    "turn-1",
+                )],
+            ),
+            ThreadEffectBatch {
+                committed_at: COMMITTED_SECONDS + 3,
+                thread_id: THREAD.to_owned(),
+                sequence: 3,
+                deliveries: vec![ToolDelivery {
+                    target: pl_core::thread::ToolDeliveryTarget::CallResult,
+                    call_id: "finish-call".to_owned(),
+                    tool_id: "finish_turn".to_owned(),
+                    output: pl_core::tool::ToolOutput::new(payload, vec![text(message)])
+                        .ending_turn(),
+                    delivered_context: vec![text(message)],
+                    outcome: ToolOutcome::Succeeded,
+                }]
+                .into(),
+                ..ThreadEffectBatch::default()
+            },
+            terminal_effect(4, "turn-1"),
+        ];
+
+        let history = project(&effects).pop().expect("completed turn history");
+        assert_eq!(
+            text_of(&history, message).channel(),
+            ThreadTextChannel::Final
+        );
     }
 
     #[test]

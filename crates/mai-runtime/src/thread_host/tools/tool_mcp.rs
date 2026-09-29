@@ -31,7 +31,7 @@ use crate::{AgentRuntime, Result, RuntimeError};
 pub(super) async fn registrations(
     runtime: &Arc<AgentRuntime>,
     agent: &AgentRecord,
-) -> Result<Vec<Registration>> {
+) -> Result<McpThreadTools> {
     let Some(mcp) = agent.mcp.read().await.clone() else {
         return Err(invalid(format!(
             "agent {} has no resident MCP runtime; its container must be started before Thread tool \
@@ -44,6 +44,7 @@ pub(super) async fn registrations(
             "failed to freeze MCP tools for this Thread: {error}"
         ))
     })?;
+    let active_servers = lease.server_ids().to_vec();
     let media = Arc::new(MaiToolMediaHost {
         store: MaiResourceStore::new(thread_resources_root(&runtime.artifact_files_root)),
     });
@@ -88,7 +89,16 @@ pub(super) async fn registrations(
             })?);
         }
     }
-    Ok(registrations)
+    Ok(McpThreadTools {
+        active_servers,
+        registrations,
+    })
+}
+
+/// 同一个冻结 generation 产生的工具注册项与产品展示事实。
+pub(super) struct McpThreadTools {
+    pub(super) active_servers: Vec<String>,
+    pub(super) registrations: Vec<Registration>,
 }
 
 /// mai 的 MCP 媒体保留端口。

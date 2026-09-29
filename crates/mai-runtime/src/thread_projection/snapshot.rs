@@ -36,6 +36,8 @@ pub(crate) struct ThreadProjectionMetadata<'a> {
     pub workspace_mode: ThreadWorkspaceMode,
     /// 会话工作区地址；mai 的 canonical 产品事实。
     pub workspace_path: &'a str,
+    /// Thread 装配时冻结的 MCP generation 所含服务。
+    pub active_mcp_servers: &'a [String],
 }
 
 /// 投影一个 Thread 的权威首帧。
@@ -60,7 +62,12 @@ pub(crate) fn project_snapshot(
         thread,
         active_turn: project_active_turn(&thread_id, state, updated_at)?,
         interactions: project_interactions(&thread_id, state)?,
-        runtime: Some(project_runtime(&thread_id, state, updated_at)?),
+        runtime: Some(project_runtime(
+            &thread_id,
+            state,
+            updated_at,
+            metadata.active_mcp_servers,
+        )?),
         // 产品活动摘要（typed activity）是另一条独立投影，不在这里伪造。
         activity: None,
         storage: Some(storage_state(&state.persistence)),
@@ -183,6 +190,7 @@ pub(crate) fn project_runtime(
     thread_id: &str,
     state: &CoreThreadSnapshot,
     updated_at: i64,
+    active_mcp_servers: &[String],
 ) -> Result<ThreadRuntimeSnapshot, ProjectionError> {
     let summary: &UsageSummary = &state.usage_summary;
     let active_skills = state
@@ -231,7 +239,7 @@ pub(crate) fn project_runtime(
         // Skill 激活由 pl-tool 保存的 typed extension 投影；其它活动摘要仍各自独立。
         todo: None,
         active_skills,
-        active_mcp_servers: Vec::new(),
+        active_mcp_servers: active_mcp_servers.to_vec(),
         active_lsp_servers: Vec::new(),
         progress: None,
         mcp_health: None,
@@ -339,7 +347,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_projects_active_skills_from_pl_tool_extensions() {
+    fn runtime_projects_active_skills_and_frozen_mcp_servers() {
         let payload = OpaquePayload::new(
             "pl.tool.skill-view",
             1,
@@ -381,9 +389,15 @@ mod tests {
             },
         );
 
-        let runtime = project_runtime("thread-a", &state, 1_700_000_000)
-            .expect("project runtime with typed Skill extension");
+        let runtime = project_runtime(
+            "thread-a",
+            &state,
+            1_700_000_000,
+            &["zhipu_search".to_string()],
+        )
+        .expect("project runtime with typed Skill extension");
 
         assert_eq!(runtime.active_skills, vec!["rust-code-quality"]);
+        assert_eq!(runtime.active_mcp_servers, vec!["zhipu_search"]);
     }
 }

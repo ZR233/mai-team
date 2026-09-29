@@ -139,7 +139,8 @@ impl MaiThreadEventSubscription {
 
     async fn project(&self, state: &CoreThreadSnapshot) -> Result<ThreadSnapshot> {
         let summary = self.agent.summary.read().await.clone();
-        project_thread_snapshot(&summary, state)
+        let active_mcp_servers = self.agent.active_mcp_servers.read().await;
+        project_thread_snapshot(&summary, state, &active_mcp_servers)
     }
 
     /// 用已提交的 typed 历史补齐刚结束 Turn 的终态投影。
@@ -220,7 +221,8 @@ impl AgentRuntime {
         let resident = self.ensure_thread(product_agent_id).await?;
         let state = resident.handle.snapshot();
         ensure_live_canonical_thread(&thread_id, &state)?;
-        project_thread_snapshot(&summary, &state)
+        let active_mcp_servers = agent.active_mcp_servers.read().await;
+        project_thread_snapshot(&summary, &state, &active_mcp_servers)
     }
 
     /// 从 pl-core 的权威当前 Turn 与已提交 typed effect 组成运行中聊天。

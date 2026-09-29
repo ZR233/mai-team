@@ -435,6 +435,7 @@ mod tests {
             registration_pending: std::sync::atomic::AtomicBool::new(false),
             container: RwLock::new(None),
             mcp: RwLock::new(None),
+            active_mcp_servers: RwLock::new(Vec::new()),
             review_context: RwLock::new(None),
             skill_catalog: RwLock::new(None),
             system_prompt: None,

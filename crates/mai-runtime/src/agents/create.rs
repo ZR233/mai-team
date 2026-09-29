@@ -107,6 +107,7 @@ pub(crate) async fn create_agent_record(
         registration_pending: std::sync::atomic::AtomicBool::new(true),
         container: RwLock::new(None),
         mcp: RwLock::new(None),
+        active_mcp_servers: RwLock::new(Vec::new()),
         review_context: RwLock::new(None),
         skill_catalog: RwLock::new(None),
         system_prompt,
