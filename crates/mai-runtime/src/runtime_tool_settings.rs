@@ -7,6 +7,7 @@ use mai_protocol::{
     McpServersResponse, WebSearchLocationSettings, WebSearchSettings, WebSearchSettingsResponse,
 };
 use pl_model::config::AgentRoleId;
+use pl_model::config::ResolvedModelRoute;
 use pl_protocol::WebSearchContextSize;
 use pl_protocol::search::{WebSearchConfig, WebSearchLocation, WebSearchMode};
 use pl_tool::mcp::config::{McpServerSourceKind, McpServerStatusKind};
@@ -26,12 +27,7 @@ impl AgentRuntime {
         for role in ["planner", "explorer", "executor", "reviewer"] {
             let role_id = AgentRoleId::new(role)?;
             let route = config.models.resolve(&role_id)?;
-            let plans = pl_tool::search::plan_web_searches(
-                &config.models,
-                &route,
-                &config.web_search,
-                !config.web_search.mode.is_disabled(),
-            )?;
+            let plans = product_web_search_plans(&config, &route)?;
             let resolution = match plans.selected {
                 Some(pl_tool::search::WebSearchBackendKind::DeepSeek) => &plans.deepseek.resolution,
                 Some(pl_tool::search::WebSearchBackendKind::OpenAi) | None => {
@@ -92,6 +88,8 @@ impl AgentRuntime {
                         checking_agents: 0,
                         total_agents: 0,
                         tool_count: 0,
+                        messages: Vec::new(),
+                        last_checked_at: None,
                         config: public,
                     },
                 )
@@ -115,6 +113,16 @@ impl AgentRuntime {
                     .or_insert_with(|| empty_aggregate(health.server.clone()));
                 item.total_agents += 1;
                 item.tool_count += health.tool_count.unwrap_or_default();
+                if let Some(message) = health.message
+                    && !item.messages.contains(&message)
+                {
+                    item.messages.push(message);
+                }
+                item.last_checked_at = match (item.last_checked_at, health.last_checked_at) {
+                    (Some(current), Some(observed)) => Some(current.max(observed)),
+                    (None, Some(observed)) => Some(observed),
+                    (current, None) => current,
+                };
                 match health.availability.as_str() {
                     "available" => item.ready_agents += 1,
                     "checking" => item.checking_agents += 1,
@@ -240,6 +248,23 @@ impl AgentRuntime {
     }
 }
 
+/// 规划 Mai 产品实际可用的搜索路径。
+///
+/// DeepSeek 官方 Responses API 会忽略 builtin `web_search`；Mai 因此关闭该 hosted 候选，让
+/// DeepSeek 模型通过 PL 的 function tool 使用已配置的 standalone 搜索 backend。
+pub(crate) fn product_web_search_plans(
+    config: &config::MaiConfig,
+    route: &ResolvedModelRoute,
+) -> Result<pl_tool::search::WebSearchPlans> {
+    pl_tool::search::plan_web_searches(
+        &config.models,
+        route,
+        &config.web_search,
+        /* deepseek_enabled */ false,
+    )
+    .map_err(RuntimeError::Model)
+}
+
 fn visible_user_servers(
     servers: &BTreeMap<String, McpServerConfig>,
     has_project: bool,
@@ -349,6 +374,8 @@ fn empty_aggregate(descriptor: McpServerDescriptor) -> McpServerAggregate {
         checking_agents: 0,
         total_agents: 0,
         tool_count: 0,
+        messages: Vec::new(),
+        last_checked_at: None,
         config: None,
     }
 }
@@ -427,9 +454,50 @@ fn context_size_name(size: WebSearchContextSize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use pl_model::config::{ProviderId, builtin_provider_catalog};
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn deepseek_route_uses_pl_standalone_search_backend() {
+        let mut config = config::MaiConfig::default();
+        config
+            .models
+            .providers
+            .get_mut(&ProviderId::new("deepseek").unwrap())
+            .unwrap()
+            .bearer_token = Some("deepseek-secret".to_string());
+        let openai = builtin_provider_catalog()
+            .presets
+            .into_iter()
+            .find(|preset| preset.id.as_str() == "openai")
+            .unwrap();
+        let mut provider = openai.provider;
+        provider.bearer_token = Some("openai-secret".to_string());
+        let openai_id = ProviderId::new("openai").unwrap();
+        config.models.providers.insert(openai_id.clone(), provider);
+        let route = config
+            .models
+            .resolve(&AgentRoleId::new("reviewer").unwrap())
+            .unwrap();
+
+        let plans = product_web_search_plans(&config, &route).unwrap();
+
+        assert_eq!(
+            plans.selected,
+            Some(pl_tool::search::WebSearchBackendKind::OpenAi)
+        );
+        assert_eq!(
+            plans.openai.resolution.path,
+            Some(pl_tool::search::WebSearchPath::Standalone)
+        );
+        assert_eq!(plans.openai.resolution.provider_id, Some(openai_id));
+        assert_eq!(
+            plans.deepseek.resolution.availability,
+            pl_tool::search::WebSearchAvailability::Disabled
+        );
+    }
 
     #[test]
     fn write_only_secrets_are_preserved_or_explicitly_cleared() {

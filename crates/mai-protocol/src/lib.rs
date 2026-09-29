@@ -1659,6 +1659,8 @@ pub struct McpServerAggregate {
     pub checking_agents: usize,
     pub total_agents: usize,
     pub tool_count: usize,
+    pub messages: Vec<String>,
+    pub last_checked_at: Option<i64>,
     pub config: Option<McpServerPublicConfig>,
 }
 

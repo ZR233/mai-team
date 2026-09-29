@@ -174,12 +174,7 @@ fn search_binding(
             return Err(RuntimeError::InvalidInput(reason));
         }
     };
-    let plans = pl_tool::search::plan_web_searches(
-        &config.models,
-        &route,
-        &config.web_search,
-        !config.web_search.mode.is_disabled(),
-    )?;
+    let plans = crate::runtime_tool_settings::product_web_search_plans(config, &route)?;
     let binding = plans.build_thread(&config.web_search).map_err(|error| {
         RuntimeError::InvalidInput(format!("cannot bind web search for Thread: {error}"))
     })?;

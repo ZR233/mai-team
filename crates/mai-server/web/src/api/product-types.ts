@@ -476,6 +476,8 @@ export interface McpServerAggregate {
   checking_agents: number
   total_agents: number
   tool_count: number
+  messages: string[]
+  last_checked_at?: number | null
   config?: {
     scope: string
     enabled: boolean

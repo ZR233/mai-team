@@ -95,7 +95,7 @@ export function McpSection() {
             <Button variant="outline" disabled={recheck.isPending} onClick={() => recheck.mutate()}>{recheck.isPending ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />} Recheck</Button>
           </div>
           {builtins.length === 0 ? <EmptyState title="No built-in services" description="PL did not publish any built-in MCP descriptors." /> : <Table><TableHeader><TableRow><TableHead>Service</TableHead><TableHead>Availability</TableHead><TableHead>Runtime</TableHead><TableHead className="text-right">Enabled</TableHead></TableRow></TableHeader><TableBody>
-            {builtins.map((server) => <TableRow key={server.descriptor.id}><TableCell><ServerIdentity server={server} /></TableCell><TableCell><StatusBadge status={server.availability} /></TableCell><TableCell className="text-muted-foreground">{server.tool_count} tools · {server.ready_agents}/{server.total_agents} agents</TableCell><TableCell className="text-right"><Switch aria-label={`Enable ${server.descriptor.id}`} checked={server.enabled} onCheckedChange={(checked: boolean) => void toggleBuiltin(server.descriptor.id, checked)} /></TableCell></TableRow>)}
+            {builtins.map((server) => <TableRow key={server.descriptor.id}><TableCell><ServerIdentity server={server} /></TableCell><TableCell><StatusBadge status={server.availability} /></TableCell><TableCell><ServerRuntime server={server} /></TableCell><TableCell className="text-right"><Switch aria-label={`Enable ${server.descriptor.id}`} checked={server.enabled} onCheckedChange={(checked: boolean) => void toggleBuiltin(server.descriptor.id, checked)} /></TableCell></TableRow>)}
           </TableBody></Table>}
         </section>
 
@@ -122,6 +122,10 @@ export function McpSection() {
 
 function ServerIdentity({ server }: { server: McpServerAggregate }) {
   return <div className="flex min-w-0 items-center gap-3"><Avatar className="size-9 rounded-lg"><AvatarFallback className="rounded-lg"><ServerCog className="size-4" /></AvatarFallback></Avatar><div className="min-w-0"><strong className="block truncate text-sm">{server.descriptor.id}</strong><p className="max-w-80 truncate text-xs text-muted-foreground">{server.descriptor.endpoint || server.descriptor.transport}</p></div></div>
+}
+
+function ServerRuntime({ server }: { server: McpServerAggregate }) {
+  return <div className="max-w-xl text-xs text-muted-foreground"><p>{server.tool_count} tools · {server.ready_agents}/{server.total_agents} agents</p>{server.messages.map((message) => <p key={message} className="mt-1 whitespace-pre-wrap break-words text-destructive">{message}</p>)}{server.last_checked_at && <p className="mt-1">Checked {new Date(server.last_checked_at * 1000).toLocaleString()}</p>}</div>
 }
 
 function McpEditor({ server, onClose, onSave }: { server: McpServerAggregate | null; onClose(): void; onSave(id: string, config: Record<string, unknown>): Promise<void> }) {

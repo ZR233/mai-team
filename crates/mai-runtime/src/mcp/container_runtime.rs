@@ -97,14 +97,32 @@ impl ContainerMcpRuntime {
         builtin_states: &BTreeMap<String, MaiBuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<()> {
-        self.handle
-            .reset(
-                McpResetScope::All,
-                self.effective_servers(enabled, user_servers, builtin_states, models)
-                    .await?,
-            )
-            .await
-            .map_err(RuntimeError::Model)
+        let servers = self
+            .effective_servers(enabled, user_servers, builtin_states, models)
+            .await?;
+        let required_servers = self.required_servers.read().await.clone();
+        for server_id in servers.keys() {
+            let result = self
+                .handle
+                .reset(
+                    McpResetScope::Server {
+                        server_id: server_id.clone(),
+                    },
+                    servers.clone(),
+                )
+                .await;
+            if let Err(error) = result {
+                if required_servers.contains(server_id) {
+                    return Err(RuntimeError::Model(error));
+                }
+                tracing::warn!(
+                    server_id,
+                    error = %error,
+                    "optional MCP server recheck failed; preserved its current generation"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn effective_servers(
