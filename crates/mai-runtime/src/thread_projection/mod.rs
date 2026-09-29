@@ -55,6 +55,9 @@ pub(crate) enum ProjectionError {
     /// interaction 记录的请求身份与它的 map key 不一致。
     #[error("Thread interaction `{0}` request identity does not match its key")]
     InteractionIdentity(String),
+    /// PL Skill 扩展使用受支持的格式，但内容无法由其所有者解码。
+    #[error("Thread Skill activation cannot be decoded: {0}")]
+    Skill(String),
     /// 计数超出产品 DTO 的表示范围。
     #[error("count exceeds the product representation")]
     Count,

@@ -35,13 +35,13 @@ use pl_core::thread::{
     task::TaskRecord,
 };
 use pl_protocol::{
-    ThreadContentLifecycle, ThreadItem, ThreadItemState, ThreadRawItem, ThreadTextChannel,
-    ThreadToolInvocation, ThreadToolItem, ThreadToolState, ThreadTurnItem,
+    ThreadContentLifecycle, ThreadItem, ThreadItemState, ThreadRawItem, ThreadSkillItem,
+    ThreadTextChannel, ThreadToolInvocation, ThreadToolItem, ThreadToolState, ThreadTurnItem,
 };
 
 use super::effect_items::{
-    context_text, delivery_state, raw_payload, response_text_id, running_tool, succeeded,
-    task_state, text_state, tool_item_id, turn_item_id,
+    context_text, delivery_state, raw_payload, response_text_id, running_tool, skill_item_id,
+    succeeded, task_state, text_state, tool_item_id, turn_item_id,
 };
 use super::{ProjectionError, project_turn};
 
@@ -293,6 +293,29 @@ impl TurnAccumulator {
             ThreadItemState::Tool(ThreadToolItem::new(invocation, state)),
         );
         self.push(item, rank);
+    }
+
+    fn push_skill_activation(&mut self, delivery: &pl_core::thread::ToolDelivery) {
+        if delivery.tool_id != "skill_view"
+            || !matches!(delivery.outcome, pl_core::thread::ToolOutcome::Succeeded)
+        {
+            return;
+        }
+        let Ok(Some(mut activation)) = pl_tool::skill::saved_skill_activation(
+            delivery.output.payload(),
+            self.turn_id.clone(),
+            pl_protocol::SkillActivationCause::Tool {
+                tool_call_id: delivery.call_id.clone(),
+            },
+        ) else {
+            return;
+        };
+        activation.activated_at = self.at;
+        let item = self.item(
+            skill_item_id(&delivery.call_id),
+            ThreadItemState::Skill(ThreadSkillItem::new(activation)),
+        );
+        self.push(item, RANK_DELIVERY);
     }
 
     fn push_attempt(&mut self, attempt: &AttemptUpdate) {
@@ -594,6 +617,7 @@ fn route_effect(
             effect.sequence,
             effect.committed_at,
         );
+        accumulator.push_skill_activation(delivery);
         let at = accumulator.at;
         accumulator.set_tool(
             &delivery.call_id,
@@ -744,8 +768,12 @@ mod tests {
         ContextReplacement, ContextReplacementReason, RequestAttempt, ToolDelivery, ToolOutcome,
         TurnOutcome as CoreTurnOutcome,
     };
-    use pl_protocol::{ThreadTextItem, ThreadToolState};
+    use pl_protocol::{
+        SkillActivation, SkillActivationCause, SkillActivationResourceBase, ThreadTextItem,
+        ThreadToolState,
+    };
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     use super::*;
 
@@ -814,10 +842,14 @@ mod tests {
     }
 
     fn call(call_id: &str) -> ModelToolCall {
+        named_call(call_id, "exec", "{\"command\":\"ls\"}")
+    }
+
+    fn named_call(call_id: &str, tool_id: &str, arguments: &str) -> ModelToolCall {
         ModelToolCall {
             call_id: call_id.to_owned(),
-            tool_id: "exec".to_owned(),
-            arguments: OpaquePayload::text("{\"command\":\"ls\"}"),
+            tool_id: tool_id.to_owned(),
+            arguments: OpaquePayload::text(arguments),
         }
     }
 
@@ -1061,6 +1093,111 @@ mod tests {
         ));
         let ordinals: Vec<u64> = history.items.iter().map(|item| item.ordinal).collect();
         assert_eq!(ordinals, (1..=ordinals.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn successful_skill_view_is_projected_into_turn_history() {
+        let skill_payload = OpaquePayload::new(
+            "pl.tool.skill-view",
+            1,
+            json!({
+                "success": true,
+                "skill": {
+                    "name": "rust-code-quality",
+                    "description": "Rust review rules",
+                    "category": null,
+                    "platforms": [],
+                    "source": "project",
+                    "providerId": "mai-filesystem-skills",
+                    "invocation": {
+                        "modelInvocable": true,
+                        "userInvocable": true
+                    },
+                    "resourceBase": {
+                        "kind": "directory",
+                        "path": "/project/repo/.agents/skills/rust-code-quality"
+                    }
+                },
+                "filePath": "SKILL.md",
+                "resourceBase": {
+                    "kind": "directory",
+                    "path": "/project/repo/.agents/skills/rust-code-quality"
+                },
+                "resourceHint": "Use filePath to read support resources on demand.",
+                "content": "Review Rust code."
+            })
+            .to_string(),
+        )
+        .expect("valid typed Skill receipt");
+        let effects = vec![
+            start_effect(1, "turn-1"),
+            concat_effect(
+                2,
+                vec![assistant_context(
+                    "turn-1:0:output",
+                    "",
+                    vec![named_call(
+                        "skill-call-1",
+                        "skill_view",
+                        "{\"name\":\"rust-code-quality\"}",
+                    )],
+                    "turn-1",
+                )],
+            ),
+            ThreadEffectBatch {
+                committed_at: COMMITTED_SECONDS + 3,
+                thread_id: THREAD.to_owned(),
+                sequence: 3,
+                deliveries: vec![ToolDelivery {
+                    target: pl_core::thread::ToolDeliveryTarget::CallResult,
+                    call_id: "skill-call-1".to_owned(),
+                    tool_id: "skill_view".to_owned(),
+                    output: pl_core::tool::ToolOutput::new(
+                        skill_payload,
+                        vec![text("Skill: rust-code-quality")],
+                    ),
+                    delivered_context: vec![text("Skill: rust-code-quality")],
+                    outcome: ToolOutcome::Succeeded,
+                }]
+                .into(),
+                ..ThreadEffectBatch::default()
+            },
+            terminal_effect(4, "turn-1"),
+        ];
+
+        let history = project(&effects).pop().expect("completed turn history");
+        let activation = history
+            .items
+            .iter()
+            .find_map(|item| match item.state() {
+                ThreadItemState::Skill(skill) => Some(skill.activation()),
+                ThreadItemState::Raw(_)
+                | ThreadItemState::Text(_)
+                | ThreadItemState::Thinking(_)
+                | ThreadItemState::Tool(_)
+                | ThreadItemState::Agent(_)
+                | ThreadItemState::Turn(_)
+                | ThreadItemState::Inference(_)
+                | ThreadItemState::File(_)
+                | ThreadItemState::ContextCompaction(_) => None,
+            })
+            .expect("Skill activation item");
+        assert_eq!(
+            activation,
+            &SkillActivation {
+                name: "rust-code-quality".to_owned(),
+                source: "project".to_owned(),
+                provider_id: "mai-filesystem-skills".to_owned(),
+                resource_base: SkillActivationResourceBase::Directory {
+                    path: "/project/repo/.agents/skills/rust-code-quality".to_owned(),
+                },
+                turn_id: "turn-1".to_owned(),
+                cause: SkillActivationCause::Tool {
+                    tool_call_id: "skill-call-1".to_owned(),
+                },
+                activated_at: COMMITTED_SECONDS + 3,
+            }
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub(crate) fn project_snapshot(
         thread,
         active_turn: project_active_turn(&thread_id, state, updated_at)?,
         interactions: project_interactions(&thread_id, state)?,
-        runtime: Some(project_runtime(&thread_id, state, updated_at)),
+        runtime: Some(project_runtime(&thread_id, state, updated_at)?),
         // 产品活动摘要（typed activity）是另一条独立投影，不在这里伪造。
         activity: None,
         storage: Some(storage_state(&state.persistence)),
@@ -183,9 +183,20 @@ pub(crate) fn project_runtime(
     thread_id: &str,
     state: &CoreThreadSnapshot,
     updated_at: i64,
-) -> ThreadRuntimeSnapshot {
+) -> Result<ThreadRuntimeSnapshot, ProjectionError> {
     let summary: &UsageSummary = &state.usage_summary;
-    ThreadRuntimeSnapshot {
+    let active_skills = state
+        .extensions
+        .values()
+        .filter(|record| record.payload.format() == "pl.tool.skill-view")
+        .map(|record| {
+            pl_tool::skill::saved_skill_name(&record.payload)
+                .map_err(|error| ProjectionError::Skill(error.to_string()))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        .into_iter()
+        .collect();
+    Ok(ThreadRuntimeSnapshot {
         thread_id: thread_id.to_owned(),
         model_route: None,
         usage: ThreadRuntimeUsage {
@@ -217,16 +228,16 @@ pub(crate) fn project_runtime(
         },
         turn_completion_tokens: summary.turn_completion_tokens,
         turn_decode_millis: summary.turn_decode_millis,
-        // 待办、技能/服务器激活、进度与健康是彼此独立的投影，暂不在本模块合成。
+        // Skill 激活由 pl-tool 保存的 typed extension 投影；其它活动摘要仍各自独立。
         todo: None,
-        active_skills: Vec::new(),
+        active_skills,
         active_mcp_servers: Vec::new(),
         active_lsp_servers: Vec::new(),
         progress: None,
         mcp_health: None,
         workflow: None,
         updated_at,
-    }
+    })
 }
 
 /// 投影 Thread 当前仍未决、需要产品回答的 interaction。
@@ -316,4 +327,63 @@ fn runtime_costs(costs: &[UsageCost]) -> Vec<RuntimeCostAmount> {
             amount: cost.amount,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use pl_core::context::OpaquePayload;
+    use pl_core::thread::extensions::ExtensionRecord;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn runtime_projects_active_skills_from_pl_tool_extensions() {
+        let payload = OpaquePayload::new(
+            "pl.tool.skill-view",
+            1,
+            json!({
+                "success": true,
+                "skill": {
+                    "name": "rust-code-quality",
+                    "description": "Rust review rules",
+                    "category": null,
+                    "platforms": [],
+                    "source": "project",
+                    "providerId": "mai-filesystem-skills",
+                    "invocation": {
+                        "modelInvocable": true,
+                        "userInvocable": true
+                    },
+                    "resourceBase": {
+                        "kind": "directory",
+                        "path": "/project/repo/.agents/skills/rust-code-quality"
+                    }
+                },
+                "filePath": "SKILL.md",
+                "resourceBase": {
+                    "kind": "directory",
+                    "path": "/project/repo/.agents/skills/rust-code-quality"
+                },
+                "resourceHint": "Use filePath to read support resources on demand.",
+                "content": "Review Rust code."
+            })
+            .to_string(),
+        )
+        .expect("valid typed Skill receipt");
+        let mut state = CoreThreadSnapshot::default();
+        state.extensions.insert(
+            "pl.tool.skill-view:rust-code-quality".to_owned(),
+            ExtensionRecord {
+                revision: 7,
+                payload,
+            },
+        );
+
+        let runtime = project_runtime("thread-a", &state, 1_700_000_000)
+            .expect("project runtime with typed Skill extension");
+
+        assert_eq!(runtime.active_skills, vec!["rust-code-quality"]);
+    }
 }

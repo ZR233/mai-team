@@ -10,7 +10,7 @@ pub(crate) const PROJECT_REVIEW_CONTEXT_CACHE_DIR: &str = "project-review-contex
 pub(crate) const PROJECT_REPOSITORY_CONTAINER_PATH: &str = "/project/repo";
 pub(crate) const PROJECT_REVIEW_SNAPSHOT_ROOT: &str = "review-contexts";
 
-/// review manifest 中记录的默认分支约束文件。
+/// review manifest 中记录的项目配置分支约束文件。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReviewConstraintSource {
@@ -113,7 +113,7 @@ impl ProjectRepositoryView {
 
 /// 单次 reviewer 固定使用的默认分支上下文快照。
 ///
-/// 技能目录和项目记忆都在 reviewer turn 前从同一个 detached worktree 提取；
+/// 技能目录和项目记忆都在 reviewer turn 前从项目配置分支的同一个 detached worktree 提取；
 /// `Drop` 只能清理 host cache，volume 中的 worktree 必须由 agent 生命周期异步释放。
 #[derive(Debug)]
 pub(crate) struct ProjectReviewContext {
