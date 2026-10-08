@@ -26,7 +26,7 @@ use crate::tools::git::native_git_tool_runtime;
 use crate::turn::core_adapter::{
     CollaborationAvailability, MaiThreadToolContext, assemble_thread_tools as assemble_tool_catalog,
 };
-use crate::turn::tool_sets::{MaiSearchBinding, SearchVisibility};
+use crate::turn::tool_sets::MaiSearchBinding;
 use crate::{AgentRuntime, Result, RuntimeError};
 
 mod tool_mcp;
@@ -180,14 +180,8 @@ fn search_binding(
     let binding = plans.build_thread(&config.web_search).map_err(|error| {
         RuntimeError::InvalidInput(format!("cannot bind web search for Thread: {error}"))
     })?;
-    let visibility = match binding.visibility {
-        pl_tool::search::ToolVisibilityConstraint::Additive
-        | pl_tool::search::ToolVisibilityConstraint::Unavailable => SearchVisibility::Additive,
-        pl_tool::search::ToolVisibilityConstraint::Exclusive => SearchVisibility::Exclusive,
-    };
     Ok(MaiSearchBinding {
         hosted_tools: binding.hosted,
         registrations: binding.tools,
-        visibility,
     })
 }

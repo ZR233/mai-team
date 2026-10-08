@@ -216,6 +216,7 @@ fn canonical_provider(provider: &ApiProviderConfig) -> Result<ProviderConfig> {
             http_headers,
         } => {
             let preset = builtin_provider_catalog()
+                .map_err(RuntimeError::Model)?
                 .presets
                 .into_iter()
                 .find(|preset| preset.id.as_str() == preset_id)
@@ -338,6 +339,7 @@ mod tests {
     #[test]
     fn preset_provider_uses_pl_catalog_and_discards_submitted_model_overrides() {
         let preset = builtin_provider_catalog()
+            .expect("provider catalog")
             .presets
             .into_iter()
             .find(|preset| preset.id.as_str() == "openai")

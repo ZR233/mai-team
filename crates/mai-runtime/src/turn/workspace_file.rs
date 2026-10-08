@@ -31,7 +31,7 @@ impl MaiWorkspaceFileBackend {
             WorkspaceBoundary::HostPermitted => vec![PathBuf::from("/")],
             WorkspaceBoundary::Confined => vec![workspace.root().to_path_buf()],
         };
-        let writable_roots = match (workspace.boundary(), workspace.project_writable_paths()) {
+        let writable_roots = match (workspace.boundary(), workspace.writable_paths()) {
             (WorkspaceBoundary::HostPermitted, None) => vec![PathBuf::from("/")],
             (_, Some(paths)) => paths.to_vec(),
             (WorkspaceBoundary::Confined, None) => vec![workspace.root().to_path_buf()],

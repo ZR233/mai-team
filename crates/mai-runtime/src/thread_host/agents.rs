@@ -144,15 +144,10 @@ impl AgentControlHost for MaiAgentControlHost {
             system_prompt: child_profile.prompt.clone(),
             task_summary: request.task_summary.as_str().to_string(),
             message: request.message.clone(),
-            // child 继承调用方选中的会话记录，但使用自己的 Profile 指令。
-            inheritance: pl_core::context::ContextInheritance {
-                history: request.fork_turns.inheritance(),
-                instructions: pl_core::context::InstructionInheritance::Exclude,
-            },
             workspace: workspace.clone(),
         };
 
-        match runtime.spawn_child_agent(child_request, &context).await {
+        match runtime.spawn_child_agent(child_request).await {
             Ok(child) => encode_output(&SpawnReceipt {
                 agent_id: child.agent_id.to_string(),
                 profile_id: &profile_id,
@@ -198,6 +193,7 @@ impl AgentControlHost for MaiAgentControlHost {
         let delivery = ThreadMessage {
             id: message.id.clone(),
             source_id: format!("agent:{caller}"),
+            kind: pl_core::context::AgentMessageKind::Task,
             payload: OpaquePayload::text(message.message.clone()),
             context: vec![ContextContent::Text {
                 text: Arc::from(message.message),

@@ -24,12 +24,13 @@
 //!   effect 表示调用方还没读到该 Turn 的全部 effect，此时宁可先不输出，也不给出不完整的 Turn。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use mai_protocol::{ThreadContextDisposition, ThreadTurnHistory, Turn};
-use pl_core::context::{ContextContent, ContextRecord, ContextSnapshot, ContextSource};
+use pl_core::context::{ContextContent, ContextRecord, ContextSource};
 use pl_core::thread::{
-    AttemptOutcome, ContextReplacementReason, RequestAttempt, ThreadEffectBatch, TurnRecord,
-    TurnState as CoreTurnState,
+    AttemptOutcome, AttemptStatus, ContextReplacementReason, RequestAttempt, ThreadEffectBatch,
+    TurnRecord, TurnState as CoreTurnState,
     input::{InputChange, InputDelivery, InputRecord, InputState},
     journal::{AttemptUpdate, ContextChange},
     task::TaskRecord,
@@ -94,6 +95,7 @@ pub(crate) fn project_turn_history_from_effects(
             thread_id,
             &snapshot,
             &record,
+            accumulator.attempt_failure.as_deref(),
             committed_at,
             committed_at,
             sequence,
@@ -194,6 +196,7 @@ struct TurnAccumulator {
     ranks: BTreeMap<String, u8>,
     attempts: Vec<RequestAttempt>,
     attempt_index: BTreeMap<String, usize>,
+    attempt_failure: Option<Arc<pl_core::model::ModelError>>,
     tasks: BTreeMap<String, TaskRecord>,
 }
 
@@ -214,6 +217,7 @@ impl TurnAccumulator {
             ranks: BTreeMap::new(),
             attempts: Vec::new(),
             attempt_index: BTreeMap::new(),
+            attempt_failure: None,
             tasks: BTreeMap::new(),
         }
     }
@@ -389,20 +393,30 @@ impl TurnAccumulator {
     }
 
     fn record_attempt(&mut self, attempt: &AttemptUpdate) {
-        let request = RequestAttempt {
-            request_metadata: attempt.request_metadata.clone(),
-            usage_binding: attempt.usage_binding.clone(),
-            tool_projection: attempt.tool_projection.clone(),
-            turn_id: attempt.turn_id.clone(),
-            attempt_id: attempt.attempt_id.clone(),
-            retry_of: attempt.retry_of.clone(),
-            input: ContextSnapshot {
-                revision: attempt.input_revision,
-                records: Vec::new().into(),
-            },
-            tools: attempt.tools.clone(),
-            outcome: attempt.outcome.clone(),
-            input_estimate: attempt.input_estimate,
+        self.attempt_failure = match &attempt.outcome {
+            AttemptOutcome::Failed(error) => Some(Arc::clone(error)),
+            AttemptOutcome::Cancelled { result: Err(error) } => Some(Arc::clone(error)),
+            AttemptOutcome::Running
+            | AttemptOutcome::Interrupted
+            | AttemptOutcome::Committed(_)
+            | AttemptOutcome::Cancelled { result: Ok(_) }
+            | AttemptOutcome::Rejected { .. } => None,
+        };
+        let mut request = RequestAttempt::new(
+            attempt.turn_id.clone(),
+            attempt.attempt_id.clone(),
+            attempt.input_revision,
+            AttemptStatus::from_outcome(&attempt.outcome),
+        );
+        request.retry_of = attempt.retry_of.clone();
+        request.usage = match &attempt.outcome {
+            AttemptOutcome::Committed(output) | AttemptOutcome::Rejected { output, .. } => {
+                Some(output.usage.clone())
+            }
+            AttemptOutcome::Failed(error) => Some(error.usage.as_ref().clone()),
+            AttemptOutcome::Cancelled { result: Ok(output) } => Some(output.usage.clone()),
+            AttemptOutcome::Cancelled { result: Err(error) } => Some(error.usage.as_ref().clone()),
+            AttemptOutcome::Running | AttemptOutcome::Interrupted => None,
         };
         match self.attempt_index.get(&attempt.attempt_id).copied() {
             Some(position) => self.attempts[position] = request,
@@ -593,8 +607,12 @@ fn route_effect(
                     );
                 }
                 ContextSource::User => accumulator.push_context_user(record),
-                // Instruction/Runtime 是当前上下文事实，不是 timeline 条目。
-                ContextSource::Instruction | ContextSource::Runtime { .. } => {}
+                // 指令与运行时事实不是 timeline 条目。
+                ContextSource::Instruction
+                | ContextSource::InstructionSnapshot { .. }
+                | ContextSource::Runtime { .. }
+                | ContextSource::RuntimeFact { .. }
+                | ContextSource::AgentMessage { .. } => {}
             }
         }
     }
@@ -785,7 +803,7 @@ fn input_state_turn(state: &InputState) -> Option<&str> {
 mod tests {
     use std::sync::Arc;
 
-    use pl_core::context::{ContextContent, ContextRecord, OpaquePayload};
+    use pl_core::context::{ContextContent, ContextRecord, ContextSnapshot, OpaquePayload};
     use pl_core::model::{ModelStepOutput, ModelToolCall, ModelUsage};
     use pl_core::thread::input::{InputDelivery, ThreadInput};
     use pl_core::thread::journal::AttemptUpdate;
@@ -1466,6 +1484,7 @@ mod tests {
         if let Some(record) = failed_turn.turn.as_mut() {
             record.state = CoreTurnState::Failed {
                 description: "provider unavailable".to_owned(),
+                model_failure: None,
             };
         }
 

@@ -6,13 +6,13 @@
 
 use mai_protocol::{Turn, TurnPhase, TurnState};
 use pl_core::thread::{
-    AttemptOutcome, ThreadSnapshot as CoreThreadSnapshot, TurnOutcome as CoreTurnOutcome,
+    AttemptStatus, ThreadSnapshot as CoreThreadSnapshot, TurnOutcome as CoreTurnOutcome,
     TurnRecord, TurnState as CoreTurnState, task::TaskStatus,
 };
 use pl_protocol::{
     BudgetLimitKind, BudgetLimitSnapshot, BudgetLimitedTurnState, BudgetUsage, CancelledTurnState,
-    CompletedTurnState, FailedTurnState, ProviderFailureKind, RunningTurnState,
-    TurnCancellationCause, TurnCompletion, TurnFailure, TurnFailureCategory, TurnRolloverOutcome,
+    CompletedTurnState, FailedTurnState, RunningTurnState, TurnCancellationCause, TurnCompletion,
+    TurnFailure, TurnFailureCategory, TurnRolloverOutcome,
 };
 
 use super::ProjectionError;
@@ -33,6 +33,7 @@ pub(crate) fn project_turn(
     thread_id: &str,
     snapshot: &CoreThreadSnapshot,
     record: &TurnRecord,
+    attempt_failure: Option<&pl_core::model::ModelError>,
     created_at: i64,
     updated_at: i64,
     revision: u64,
@@ -46,7 +47,7 @@ pub(crate) fn project_turn(
         id: record.turn_id.clone(),
         thread_id: thread_id.to_owned(),
         revision,
-        state: state(snapshot, record, &stamp)?,
+        state: state(snapshot, record, attempt_failure, &stamp)?,
         updated_at,
     })
 }
@@ -75,6 +76,7 @@ pub(crate) fn project_active_turn(
         thread_id,
         snapshot,
         record,
+        None,
         updated_at,
         updated_at,
         snapshot.commit_sequence,
@@ -85,6 +87,7 @@ pub(crate) fn project_active_turn(
 fn state(
     snapshot: &CoreThreadSnapshot,
     record: &TurnRecord,
+    attempt_failure: Option<&pl_core::model::ModelError>,
     stamp: &Stamp,
 ) -> Result<TurnState, ProjectionError> {
     let started = Some(stamp.started_at);
@@ -145,17 +148,20 @@ fn state(
                 TurnCancellationCause::Recovery
             },
         )),
-        CoreTurnState::Failed { description } => TurnState::Failed(FailedTurnState::new(
+        CoreTurnState::Failed {
+            description,
+            model_failure,
+        } => TurnState::Failed(FailedTurnState::new(
             started,
             at,
-            failure(snapshot, &record.turn_id, description),
+            failure(attempt_failure, model_failure.as_deref(), description),
         )),
     })
 }
 
 /// 运行中 Turn 的 canonical 阶段，实时从 snapshot 的 typed 事实派生。
 ///
-/// 阶段是运行中 tasks 与最新 attempt outcome 的投影，因此任务启动/结束或 attempt 提交时都会改
+/// 阶段是运行中 tasks 与最新 attempt status 的投影，因此任务启动/结束或 attempt 提交时都会改
 /// 变；这些事件都不会重写 Turn 记录本身，调用方必须在每个 effect 之后重新派生，而不是缓存 Turn
 /// 记录里不存在的阶段。
 fn phase(snapshot: &CoreThreadSnapshot, turn_id: &str) -> TurnPhase {
@@ -171,68 +177,69 @@ fn phase(snapshot: &CoreThreadSnapshot, turn_id: &str) -> TurnPhase {
         .iter()
         .rev()
         .find(|attempt| attempt.turn_id == turn_id)
-        .map(|attempt| &attempt.outcome)
+        .map(|attempt| &attempt.status)
     {
         None => TurnPhase::Preparing,
-        Some(AttemptOutcome::Committed(output)) if !output.tool_calls.is_empty() => {
-            TurnPhase::Planning
-        }
-        Some(AttemptOutcome::Committed(_)) => TurnPhase::Responding,
+        Some(AttemptStatus::Committed) => TurnPhase::Responding,
         Some(
-            AttemptOutcome::Running
-            | AttemptOutcome::Interrupted
-            | AttemptOutcome::Cancelled { .. }
-            | AttemptOutcome::Failed(_)
-            | AttemptOutcome::Rejected { .. },
+            AttemptStatus::Running
+            | AttemptStatus::Interrupted
+            | AttemptStatus::Cancelled
+            | AttemptStatus::Failed
+            | AttemptStatus::Rejected { .. },
         ) => TurnPhase::Thinking,
     }
 }
 
-/// 从最新失败 attempt 的 typed receipt 投影结构化失败；缺失或无法解码时显式降级。
-fn failure(snapshot: &CoreThreadSnapshot, turn_id: &str, description: &str) -> TurnFailure {
-    let Some(error) = snapshot
-        .attempts
-        .iter()
-        .rev()
-        .filter(|attempt| attempt.turn_id == turn_id)
-        .find_map(|attempt| match &attempt.outcome {
-            AttemptOutcome::Failed(error) => Some(error),
-            AttemptOutcome::Running
-            | AttemptOutcome::Interrupted
-            | AttemptOutcome::Committed(_)
-            | AttemptOutcome::Cancelled { .. }
-            | AttemptOutcome::Rejected { .. } => None,
-        })
-    else {
-        return TurnFailure::permanent(TurnFailureCategory::Internal, description);
-    };
-    match pl_model::runtime::model_failure_receipt(error) {
-        Ok(Some(receipt)) => match receipt.provider_failure {
-            Some(failure) => TurnFailure {
-                category: if failure.kind == ProviderFailureKind::Capacity {
-                    TurnFailureCategory::ProviderCapacity
-                } else {
-                    TurnFailureCategory::Provider
+/// 从 PL core 的持久化失败类别投影结构化失败。完整 provider receipt 属于 effect history，
+/// 驻留快照只保留这里使用的稳定类别。
+fn failure(
+    attempt_failure: Option<&pl_core::model::ModelError>,
+    model_failure: Option<&pl_core::model::ModelFailureFacts>,
+    description: &str,
+) -> TurnFailure {
+    if let Some(error) = attempt_failure {
+        return match pl_model::runtime::model_failure_receipt(error) {
+            Ok(Some(receipt)) => match receipt.provider_failure {
+                Some(failure) => TurnFailure {
+                    category: if failure.kind == pl_protocol::ProviderFailureKind::Capacity {
+                        TurnFailureCategory::ProviderCapacity
+                    } else {
+                        TurnFailureCategory::Provider
+                    },
+                    provider_kind: Some(failure.kind),
+                    code: failure.code,
+                    http_status: failure.http_status,
+                    message: failure.message,
+                    retry: failure.retry,
                 },
-                provider_kind: Some(failure.kind),
-                code: failure.code,
-                http_status: failure.http_status,
-                message: failure.message,
-                retry: failure.retry,
+                None => TurnFailure::permanent(
+                    TurnFailureCategory::Provider,
+                    if receipt.message.is_empty() {
+                        description.to_owned()
+                    } else {
+                        receipt.message
+                    },
+                ),
             },
-            None => TurnFailure::permanent(
-                TurnFailureCategory::Provider,
-                if receipt.message.is_empty() {
-                    description.to_owned()
-                } else {
-                    receipt.message
-                },
+            Ok(None) => TurnFailure::permanent(TurnFailureCategory::Provider, description),
+            Err(error) => TurnFailure::permanent(
+                TurnFailureCategory::Protocol,
+                format!("{description}; saved model failure cannot be decoded: {error}"),
             ),
-        },
-        Ok(None) => TurnFailure::permanent(TurnFailureCategory::Provider, description),
-        Err(error) => TurnFailure::permanent(
-            TurnFailureCategory::Protocol,
-            format!("{description}; saved model failure cannot be decoded: {error}"),
-        ),
+        };
     }
+    let category = match model_failure.map(|failure| failure.kind) {
+        Some(pl_core::model::ModelFailureKind::Unavailable)
+        | Some(pl_core::model::ModelFailureKind::ContextLimit) => TurnFailureCategory::Provider,
+        Some(pl_core::model::ModelFailureKind::InvalidResponse)
+        | Some(pl_core::model::ModelFailureKind::UnsupportedContent)
+        | Some(pl_core::model::ModelFailureKind::IncompatibleContext) => {
+            TurnFailureCategory::Protocol
+        }
+        Some(pl_core::model::ModelFailureKind::Cancelled)
+        | Some(pl_core::model::ModelFailureKind::ImplementationPanicked)
+        | None => TurnFailureCategory::Internal,
+    };
+    TurnFailure::permanent(category, description)
 }

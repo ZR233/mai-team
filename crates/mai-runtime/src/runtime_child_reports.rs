@@ -210,6 +210,7 @@ fn child_report_message(child_id: AgentId, history: &ThreadTurnHistory) -> Resul
             history.turn.revision
         ),
         source_id: format!("agent:{child_id}"),
+        kind: pl_core::context::AgentMessageKind::Report,
         payload: OpaquePayload::new("mai.child.turn-report", 1, body.clone())
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
         context: vec![ContextContent::Text {

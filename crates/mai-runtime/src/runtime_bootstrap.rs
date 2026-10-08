@@ -294,21 +294,18 @@ impl AgentRuntime {
         self.assemble_thread(product_agent_id).await
     }
 
-    /// 用调用方冻结的上下文继承装配并注册一个协作 child 的驻留 Thread。
+    /// 装配并注册一个协作 child 的驻留 Thread。
     ///
-    /// 与普通装配共用父 Thread 激活顺序与回滚语义，区别只在于初始 context 由 child 自己的
-    /// Profile 指令与调用方继承记录组合而成。
+    /// 与普通装配共用父 Thread 激活顺序与回滚语义；child 的 context 只由自己的 Profile
+    /// 指令和随后通过 inbox 投递的任务消息组成。
     pub(crate) async fn register_prepared_child_thread(
         self: &Arc<Self>,
         resource: &mut runtime_agent_creation::PreparedAgentResource,
-        caller: &pl_core::tool::opaque::CallContext,
-        inheritance: pl_core::context::ContextInheritance,
     ) -> Result<thread_kernel::ResidentThread> {
         let product_agent_id = resource.id();
         self.ensure_parent_thread(product_agent_id).await?;
         resource.include_canonical_runtime();
-        self.assemble_child_thread(product_agent_id, caller, inheritance)
-            .await
+        self.assemble_child_thread(product_agent_id).await
     }
 
     /// 先在父 Thread 已经驻留之后才装配子 Thread；根 Agent 直接跳过。
@@ -351,16 +348,13 @@ impl AgentRuntime {
         .await
     }
 
-    /// 用调用方冻结的上下文继承装配一个全新的 child Thread。
+    /// 装配一个全新的 child Thread。
     ///
-    /// child 先获得自己的 Profile 指令，再追加调用方 context 中由
-    /// [`pl_core::context::ContextSnapshot::inherit`] 选出的记录；继承记录保留原身份，不复制
-    /// 执行器、模型会话或应用状态。只有没有 checkpoint 的新 Thread 才能这样装配。
+    /// child 只获得自己的 Profile 指令；任务正文由 canonical inbox 消息投递。只有没有
+    /// checkpoint 的新 Thread 才能走此入口。
     pub(crate) async fn assemble_child_thread(
         self: &Arc<Self>,
         product_agent_id: AgentId,
-        caller: &pl_core::tool::opaque::CallContext,
-        inheritance: pl_core::context::ContextInheritance,
     ) -> Result<thread_kernel::ResidentThread> {
         let agent = self.agent(product_agent_id).await?;
         let thread_id = product_agent_id.to_string();
@@ -375,13 +369,7 @@ impl AgentRuntime {
                  only valid for a new Thread"
             )));
         }
-        let inherited = caller.context.inherit(inheritance).map_err(|error| {
-            RuntimeError::InvalidInput(format!(
-                "cannot inherit caller context into child Thread `{thread_id}`: {error}"
-            ))
-        })?;
-        let mut seed = self.seed_for_agent(&agent).await;
-        seed.context.extend(inherited);
+        let seed = self.seed_for_agent(&agent).await;
         self.assemble_thread_spec(
             agent,
             thread_id,

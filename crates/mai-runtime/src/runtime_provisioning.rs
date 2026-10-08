@@ -73,20 +73,15 @@ impl AgentRuntime {
         self.finish_agent_registration(resource, registered).await
     }
 
-    /// 注册一个已经准备好产品资源的协作 child，并用调用方冻结的上下文继承装配新 Thread。
+    /// 注册一个已经准备好产品资源的协作 child。
     ///
-    /// 与普通创建唯一的区别是 Thread 的初始 context：child 先写入自己的 Profile 指令，再追加
-    /// 由 [`pl_core::context::ContextSnapshot::inherit`] 选出的调用方记录。注册失败时整棵创建
+    /// child 的 Profile 指令由自身装配，初始任务通过 PL inbox 投递。注册失败时整棵创建
     /// 被回滚，不会留下半成品 child。
     pub(super) async fn register_prepared_child_agent(
         self: &Arc<Self>,
         mut resource: runtime_agent_creation::PreparedAgentResource,
-        caller: &pl_core::tool::opaque::CallContext,
-        inheritance: pl_core::context::ContextInheritance,
     ) -> Result<AgentSummary> {
-        let registered = self
-            .register_prepared_child_thread(&mut resource, caller, inheritance)
-            .await;
+        let registered = self.register_prepared_child_thread(&mut resource).await;
         self.finish_agent_registration(resource, registered).await
     }
 

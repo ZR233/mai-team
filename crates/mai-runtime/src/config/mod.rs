@@ -208,7 +208,7 @@ pub async fn seed_default_provider_from_env(
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let registry = builtin_provider_catalog();
+    let registry = builtin_provider_catalog().map_err(RuntimeError::Model)?;
     let preset = registry
         .presets
         .into_iter()
@@ -256,6 +256,7 @@ pub async fn seed_default_provider_from_env(
 /// 返回 PL canonical provider/model catalog，供 HTTP 与其它 mai 产品边界直接透传。
 pub fn provider_catalog_snapshot() -> Result<pl_protocol::ProviderCatalogSnapshot> {
     builtin_provider_catalog()
+        .map_err(RuntimeError::Model)?
         .snapshot()
         .map_err(RuntimeError::Model)
 }
@@ -264,6 +265,7 @@ impl Default for MaiConfig {
     fn default() -> Self {
         let provider_id = ProviderId::new("deepseek").expect("static provider id is valid");
         let preset = builtin_provider_catalog()
+            .expect("PL provider catalog resolves")
             .presets
             .into_iter()
             .find(|preset| preset.id.as_str() == "deepseek")

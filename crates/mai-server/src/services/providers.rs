@@ -354,6 +354,7 @@ pub(crate) async fn provider_test_store(
     let selected_model = match &provider.source {
         ProviderConfigSource::Preset { preset_id, .. } => {
             let preset = pl_model::config::builtin_provider_catalog()
+                .expect("provider catalog")
                 .presets
                 .into_iter()
                 .find(|preset| preset.id.as_str() == preset_id)
@@ -427,6 +428,7 @@ pub(crate) async fn provider_test_store(
 #[cfg(test)]
 pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> ProviderConfig {
     let mut model = pl_model::config::builtin_provider_catalog()
+        .expect("provider catalog")
         .presets
         .into_iter()
         .find(|preset| preset.id.as_str() == "openai")

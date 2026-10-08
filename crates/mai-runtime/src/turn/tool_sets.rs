@@ -46,28 +46,16 @@ impl ThreadToolCatalog {
     }
 }
 
-/// Web Search 对本轮其它工具组的可见性约束。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum SearchVisibility {
-    /// 搜索工具与其它产品工具同时可见。
-    #[default]
-    Additive,
-    /// 本轮只允许搜索工具；其余本地工具组与协作工具都不挂载。
-    Exclusive,
-}
-
 /// mai 配置层已经规划完成的 Web Search 绑定。
 ///
-/// provider、模型能力与 exclusive/additive 判定依赖 mai 的模型配置，因此规划结果由
-/// mai 配置层给出；本模块只负责把它们并入 Thread 工具目录。
+/// provider 与模型能力判定依赖 mai 的模型配置，因此规划结果由 mai 配置层给出；本模块只
+/// 负责把它们并入 Thread 工具目录。
 #[derive(Debug, Default)]
 pub(crate) struct MaiSearchBinding {
     /// provider 托管声明；不会产生本地执行器。
     pub(crate) hosted_tools: Vec<HostedTool>,
     /// mai 侧 standalone 搜索工具注册项；没有独立搜索后端时为空。
     pub(crate) registrations: Vec<Registration>,
-    /// 搜索工具对本轮其它工具组的可见性。
-    pub(crate) visibility: SearchVisibility,
 }
 
 /// 容器/工作区后端迁移方必须实现的最小稳定接口。

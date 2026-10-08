@@ -14,8 +14,8 @@ use pl_tool::skill::FrozenSkillCatalog;
 use crate::state::AgentRecord;
 use crate::tools::git::NativeGitToolRuntime;
 use crate::turn::tool_sets::{
-    MaiSearchBinding, SearchVisibility, ThreadCollaborationTools, ThreadToolCatalog,
-    ThreadWorkspaceTools, skill_registrations, standard_registrations,
+    MaiSearchBinding, ThreadCollaborationTools, ThreadToolCatalog, ThreadWorkspaceTools,
+    skill_registrations, standard_registrations,
 };
 use crate::{AgentRuntime, Result};
 
@@ -45,8 +45,6 @@ pub(crate) struct MaiThreadToolContext {
 
 /// 装配一个 Thread 的完整工具目录。
 ///
-/// `SearchVisibility::Exclusive` 时只保留搜索工具与 provider 托管声明，其它本地工具组
-/// 与协作工具都不挂载；这是旧引擎“卸载其余工具组”语义的等价实现。
 pub(crate) async fn assemble_thread_tools(ctx: MaiThreadToolContext) -> Result<ThreadToolCatalog> {
     let MaiThreadToolContext {
         runtime,
@@ -62,17 +60,12 @@ pub(crate) async fn assemble_thread_tools(ctx: MaiThreadToolContext) -> Result<T
     let MaiSearchBinding {
         hosted_tools,
         registrations: search_registrations,
-        visibility,
     } = search;
     let mut catalog = ThreadToolCatalog::new();
     for tool in hosted_tools {
         catalog.push_hosted(tool);
     }
     catalog.extend(search_registrations);
-    if visibility == SearchVisibility::Exclusive {
-        return Ok(catalog);
-    }
-
     catalog.extend(workspace.command_registrations()?);
     catalog.extend(workspace.workspace_file_registrations()?);
     if let Some(git) = git {

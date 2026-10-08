@@ -179,7 +179,7 @@ impl ContainerMcpRuntime {
     }
 
     pub(crate) async fn shutdown(&self) {
-        self.handle.shutdown().await;
+        let _ = self.handle.shutdown().await;
         if let Err(error) = self
             .docker
             .delete_container(&self.sidecar_container_id)
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn zhipu_provider_enables_all_builtin_servers_from_one_token() {
-        let registry = pl_model::config::builtin_provider_catalog();
+        let registry = pl_model::config::builtin_provider_catalog().unwrap();
         let mut provider = registry
             .presets
             .into_iter()

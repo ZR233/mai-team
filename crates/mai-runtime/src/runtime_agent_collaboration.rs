@@ -9,15 +9,14 @@
 //! 约束：
 //! - child id 由调用方与 `call_id` 决定（UUID v5），同一个 `spawn_agent` 重试不会创建第二个
 //!   child；
-//! - child 的初始 context 由 child 自己的 Profile 指令与
-//!   [`pl_core::context::ContextSnapshot::inherit`] 选出的调用方记录组合，不复制模型会话或
-//!   执行器；
+//! - child 使用自己的 Profile 指令，并通过 PL inbox 接收带有明确用途的初始任务消息，不复制
+//!   调用方的模型会话或执行器；
 //! - 关系校验的权威来源是产品 [`AgentSummary::parent_id`]，并显式防环；
 //! - 不可逆清理只在调用方 Thread 达到持久化屏障之后执行。
 
 use super::*;
 
-use pl_core::context::{ContextContent, ContextInheritance, OpaquePayload};
+use pl_core::context::{AgentMessageKind, ContextContent, OpaquePayload};
 use pl_core::thread::ThreadLifecycle;
 use pl_core::thread::inbox::ThreadMessage;
 use pl_protocol::AgentWorkspaceAssignmentSnapshot;
@@ -44,8 +43,6 @@ pub(crate) struct SpawnChildRequest {
     pub(crate) system_prompt: String,
     pub(crate) task_summary: String,
     pub(crate) message: String,
-    /// child 初始 context 的继承选择。
-    pub(crate) inheritance: ContextInheritance,
     /// 创建时冻结的 child 工作区收据。
     pub(crate) workspace: AgentWorkspaceAssignmentSnapshot,
 }
@@ -267,7 +264,6 @@ impl AgentRuntime {
     pub(crate) async fn spawn_child_agent(
         self: &Arc<Self>,
         request: SpawnChildRequest,
-        caller_context: &pl_core::tool::opaque::CallContext,
     ) -> Result<SpawnedChild> {
         let child_id = child_agent_id(request.caller, &request.call_id);
         if let Some(existing) = self.existing_child(child_id, &request).await? {
@@ -309,8 +305,7 @@ impl AgentRuntime {
                 },
             })
             .await?;
-        self.register_prepared_child_agent(resource, caller_context, request.inheritance)
-            .await?;
+        self.register_prepared_child_agent(resource).await?;
 
         let resident = self.ensure_thread(child_id).await?;
         let sequence = resident
@@ -455,6 +450,7 @@ fn initial_child_message(caller: AgentId, call_id: &str, message: &str) -> Threa
     ThreadMessage {
         id: format!("initial:{caller}:{call_id}"),
         source_id: format!("agent:{caller}"),
+        kind: AgentMessageKind::Task,
         payload: OpaquePayload::text(message.to_string()),
         context: vec![ContextContent::Text {
             text: Arc::from(message),

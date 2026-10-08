@@ -28,11 +28,10 @@ impl AgentRuntime {
             let role_id = AgentRoleId::new(role)?;
             let route = config.models.resolve(&role_id)?;
             let plans = product_web_search_plans(&config, &route)?;
-            let resolution = match plans.selected {
-                Some(pl_tool::search::WebSearchBackendKind::DeepSeek) => &plans.deepseek.resolution,
-                Some(pl_tool::search::WebSearchBackendKind::OpenAi) | None => {
-                    &plans.openai.resolution
-                }
+            let resolution = if plans.openai.resolution.path.is_some() {
+                &plans.openai.resolution
+            } else {
+                &plans.deepseek.resolution
             };
             roles.insert(role.to_string(), resolution.descriptor());
         }
@@ -469,6 +468,7 @@ mod tests {
             .unwrap()
             .bearer_token = Some("deepseek-secret".to_string());
         let openai = builtin_provider_catalog()
+            .unwrap()
             .presets
             .into_iter()
             .find(|preset| preset.id.as_str() == "openai")
@@ -484,10 +484,6 @@ mod tests {
 
         let plans = product_web_search_plans(&config, &route).unwrap();
 
-        assert_eq!(
-            plans.selected,
-            Some(pl_tool::search::WebSearchBackendKind::OpenAi)
-        );
         assert_eq!(
             plans.openai.resolution.path,
             Some(pl_tool::search::WebSearchPath::Standalone)

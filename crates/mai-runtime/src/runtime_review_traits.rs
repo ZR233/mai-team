@@ -967,31 +967,11 @@ fn reviewer_inactivity_timeout(state: &pl_core::thread::ThreadSnapshot) -> std::
 
 /// 在仍驻留的 attempt 输出里找到指定 call 的声明超时秒数。
 fn running_tool_timeout_seconds(
-    state: &pl_core::thread::ThreadSnapshot,
-    call_id: &str,
+    _state: &pl_core::thread::ThreadSnapshot,
+    _call_id: &str,
 ) -> Option<u64> {
-    state
-        .attempts
-        .iter()
-        .find_map(|attempt| match &attempt.outcome {
-            pl_core::thread::AttemptOutcome::Committed(output) => output
-                .tool_calls
-                .iter()
-                .find(|call| call.call_id == call_id)
-                .and_then(|call| {
-                    serde_json::from_str::<serde_json::Value>(call.arguments.content()).ok()
-                })
-                .and_then(|arguments| {
-                    arguments
-                        .get("timeoutSeconds")
-                        .and_then(|value| value.as_u64())
-                }),
-            pl_core::thread::AttemptOutcome::Running
-            | pl_core::thread::AttemptOutcome::Interrupted
-            | pl_core::thread::AttemptOutcome::Cancelled { .. }
-            | pl_core::thread::AttemptOutcome::Failed(_)
-            | pl_core::thread::AttemptOutcome::Rejected { .. } => None,
-        })
+    // pl-core 的驻留快照不再保留已提交模型输出；工具超时参数由执行任务的产品配置负责。
+    None
 }
 
 impl projects::review::ci_watch::ProjectReviewCiWatchOps for Arc<AgentRuntime> {

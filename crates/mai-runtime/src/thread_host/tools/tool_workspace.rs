@@ -232,7 +232,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn directory_assignment_keeps_project_writable_paths() {
+    fn directory_assignment_keeps_writable_paths() {
         let assignment = AgentWorkspaceAssignmentSnapshot {
             mode: AgentWorkspaceMode::Directory,
             project_root: "/workspace/repo".to_string(),
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(workspace.root(), std::path::Path::new("/workspace/repo"));
         assert_eq!(workspace.boundary(), WorkspaceBoundary::HostPermitted);
         assert_eq!(
-            workspace.project_writable_paths(),
+            workspace.writable_paths(),
             Some([PathBuf::from("/workspace/repo/src")].as_slice())
         );
     }
@@ -264,7 +264,7 @@ mod tests {
         let workspace = workspace_from_assignment(&assignment);
 
         assert_eq!(workspace.boundary(), WorkspaceBoundary::HostPermitted);
-        assert_eq!(workspace.project_writable_paths(), None);
+        assert_eq!(workspace.writable_paths(), None);
     }
 
     #[test]

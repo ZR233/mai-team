@@ -375,19 +375,8 @@ mod tests {
         drop(runtime);
         drop(store);
 
-        let connection = rusqlite::Connection::open(&database_path).expect("open runtime database");
-        connection
-            .execute_batch(
-                "DELETE FROM thread_submissions;
-                 DELETE FROM thread_notifications;
-                 DELETE FROM thread_runtime_traces;
-                 DELETE FROM thread_runtime_events;
-                 DELETE FROM thread_items;
-                 DELETE FROM thread_turns;
-                 DELETE FROM thread_runtime_documents;",
-            )
-            .expect("simulate schema32 framework reset");
-        drop(connection);
+        // PL 会话历史已由独立的 session store 管理；重启验证只需重新打开 mai 产品存储，
+        // 不再操作已经移除的旧 framework thread 表。
 
         let store = Arc::new(
             mai_store::MaiStore::open_with_config_and_artifact_index_path(

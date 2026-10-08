@@ -106,6 +106,7 @@ pub(crate) fn project_thread_metadata(
         status: status(state),
         created_at: summary.created_at.timestamp(),
         updated_at: summary.updated_at.timestamp(),
+        last_user_message_at: None,
         archived: state.lifecycle == ThreadLifecycle::Closed,
     }
 }
