@@ -80,7 +80,7 @@ impl SessionHistory {
             let Some(attempt) = effect.attempt else {
                 continue;
             };
-            if attempt.turn_id != *turn_id {
+            if !attempt_belongs_to_input(&attempt.turn_id, turn_id) {
                 continue;
             }
             let status = match &attempt.outcome {
@@ -139,5 +139,30 @@ impl SessionHistory {
             }
         }
         failures
+    }
+}
+
+fn attempt_belongs_to_input(attempt_turn_id: &str, input_id: &TurnId) -> bool {
+    attempt_turn_id.starts_with(&format!("input:{input_id}:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attempt_belongs_to_input;
+
+    #[test]
+    fn matches_only_the_canonical_input_turn_prefix() {
+        assert!(attempt_belongs_to_input(
+            "input:review-input:2",
+            &"review-input".to_owned(),
+        ));
+        assert!(!attempt_belongs_to_input(
+            "input:review-input-other:2",
+            &"review-input".to_owned(),
+        ));
+        assert!(!attempt_belongs_to_input(
+            "message:7",
+            &"review-input".to_owned(),
+        ));
     }
 }
