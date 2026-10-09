@@ -61,7 +61,9 @@ function agent(
     usage: {
       promptTokens: 0,
       cachedPromptTokens: 0,
+      cacheMissTokens: 0,
       cacheWriteTokens: 0,
+      hasIncompleteUsage: false,
       completionTokens: 0,
       reasoningTokens: 0,
       totalTokens: 0,

@@ -238,6 +238,33 @@ describe("pull request review history", () => {
     expect(duration.parentElement).not.toHaveTextContent("1h 1m")
   })
 
+  it("loads PL billing diagnostics and paginates older model calls", async () => {
+    const executedJob = job("executed-job", 42, "succeeded", 1)
+    const attempt = { id: "run-1", job_id: executedJob.id, attempt_index: 1, status: "completed", started_at: "2026-08-11T10:00:00Z", finished_at: "2026-08-11T10:01:00Z", reviewer_agent_id: "agent-1", turn_id: "turn-1", summary: "Review completed" }
+    const billingPage = (nextBeforeSequence: number | null, generation: number) => ({
+      records: [{ effectSequence: generation, committedAt: 1_000, turnId: "turn-1", attemptId: `attempt-${generation}`, status: "committed", billing: { inferenceId: `inference-${generation}`, provider: "DeepSeek", model: "deepseek-flash", promptGeneration: generation, promptCachePolicy: "implicit_prefix", prefixChangedReason: generation === 1 ? null : "tool_schema_changed", accounting: { usage: { inputTokens: 100, cacheReadTokens: 80, outputTokens: 20 } } } }],
+      nextBeforeSequence,
+    })
+    const requested: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      requested.push(path)
+      if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({ items: [{ job: executedJob }], page: 1, page_size: 20, total_items: 1, total_pages: 1 })
+      if (path.endsWith("/review-jobs/executed-job")) return jsonResponse({ ...executedJob, attempts: [attempt] })
+      if (path.endsWith("/review-runs/run-1")) return jsonResponse({ ...attempt, history: null })
+      if (path.includes("/review-runs/run-1/billing") && path.includes("before_sequence=1")) return jsonResponse(billingPage(null, 2))
+      if (path.includes("/review-runs/run-1/billing")) return jsonResponse(billingPage(1, 1))
+      return jsonResponse({ error: `unexpected request ${path}` }, 404)
+    }))
+    renderWithQuery(<ReviewJobDetails projectId="project-1" repository="owner/repo" review={review(42, executedJob)} onClose={() => undefined} onRereview={() => undefined} pending={false} />)
+
+    expect(await screen.findByText("Model call diagnostics")).toBeVisible()
+    expect(screen.getByText("Generation").parentElement).toHaveTextContent("1")
+    await userEvent.click(screen.getByRole("button", { name: "Load older" }))
+    expect(await screen.findByText(/tool_schema_changed/)).toBeVisible()
+    expect(requested.some((path) => path.includes("before_sequence=1"))).toBe(true)
+  })
+
   it("defaults to the latest job, avoids details without attempts, and restores executed history", async () => {
     const requested: string[] = []
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

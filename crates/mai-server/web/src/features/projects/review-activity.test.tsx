@@ -18,7 +18,7 @@ describe("Review PL Thread activity", () => {
       outcome: "review_submitted",
       review_event: "approve",
       summary: "Review completed",
-      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
+      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheMissTokens: 0, cacheWriteTokens: 0, hasIncompleteUsage: false, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
       history_status: "available",
       history: {
         turn: {
@@ -66,7 +66,7 @@ describe("Review PL Thread activity", () => {
       id: "run-1",
       status: "running",
       started_at: "2026-08-26T00:00:00Z",
-      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
+      usage: { promptTokens: 0, cachedPromptTokens: 0, cacheMissTokens: 0, cacheWriteTokens: 0, hasIncompleteUsage: false, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
       history_status: "available",
       history: null,
     }

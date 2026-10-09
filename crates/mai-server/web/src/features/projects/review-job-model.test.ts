@@ -77,6 +77,14 @@ describe("review job presentation model", () => {
     expect(cacheHitRate(usage(0, 0, 10, 0, 10))).toBeNull()
     expect(cacheHitRate(null)).toBeNull()
   })
+
+  it("uses PL's valid cache-sample denominator when prompt totals include incomplete samples", () => {
+    expect(cacheHitRate({
+      ...usage(1_000, 900, 10, 0, 1_010),
+      cacheMissTokens: 50,
+      hasIncompleteUsage: true,
+    })).toBeCloseTo(94.7368)
+  })
 })
 
 function job(status: ReviewJobSummary["status"]): ReviewJobSummary {
@@ -111,7 +119,9 @@ function usage(input: number, cached: number, output: number, reasoning: number,
   return {
     promptTokens: input,
     cachedPromptTokens: cached,
+    cacheMissTokens: input - cached,
     cacheWriteTokens: 0,
+    hasIncompleteUsage: false,
     completionTokens: output,
     reasoningTokens: reasoning,
     totalTokens: total,

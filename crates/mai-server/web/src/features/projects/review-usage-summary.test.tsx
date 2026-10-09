@@ -8,7 +8,9 @@ import { ReviewAttemptUsage, ReviewUsageSummary } from "./review-usage-summary"
 const usage: TokenUsage = {
   promptTokens: 1_200,
   cachedPromptTokens: 400,
+  cacheMissTokens: 800,
   cacheWriteTokens: 0,
+  hasIncompleteUsage: false,
   completionTokens: 180,
   reasoningTokens: 80,
   totalTokens: 1_380,
@@ -41,7 +43,7 @@ describe("review usage summary", () => {
   })
 
   it("renders a compact per-attempt increment", () => {
-    render(<ReviewAttemptUsage usage={{ ...usage, promptTokens: 500, cachedPromptTokens: 200, totalTokens: 600 }} />)
+    render(<ReviewAttemptUsage usage={{ ...usage, promptTokens: 500, cachedPromptTokens: 200, cacheMissTokens: 300, totalTokens: 600 }} />)
 
     expect(screen.getByText("600 tokens")).toHaveAttribute("title", "600 tokens")
     expect(screen.getByText("40% cache")).toBeVisible()

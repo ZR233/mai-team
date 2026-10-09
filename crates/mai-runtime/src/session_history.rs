@@ -2,11 +2,14 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use mai_protocol::AgentId;
+use mai_protocol::{
+    AgentId, ReviewInferenceBilling, ReviewInferenceBillingPage, ReviewInferenceStatus, TurnId,
+};
 use pl_core::persistence::{
     SessionStoreError, SqliteSessionOptions, SqliteSessionStore, ThreadEffectPage,
     ThreadEffectQuery,
 };
+use pl_core::thread::AttemptOutcome;
 use tokio::sync::Mutex;
 
 /// 将产品 Agent 身份映射到一个长期持有的 pl-core 会话存储句柄。
@@ -53,6 +56,59 @@ impl SessionHistory {
             .await?
             .query_thread_effects(&agent_id.to_string(), query)
             .await
+    }
+
+    /// 查询一个 review Turn 的模型计费事实；分页和完整性校验仍由 PL effect 查询负责。
+    pub(crate) async fn billing(
+        &self,
+        agent_id: AgentId,
+        turn_id: &TurnId,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<ReviewInferenceBillingPage, SessionStoreError> {
+        let page = self
+            .effects(
+                agent_id,
+                ThreadEffectQuery {
+                    before_sequence,
+                    limit,
+                },
+            )
+            .await?;
+        let mut records = Vec::new();
+        for effect in page.effects {
+            let Some(attempt) = effect.attempt else {
+                continue;
+            };
+            if attempt.turn_id != *turn_id {
+                continue;
+            }
+            let status = match &attempt.outcome {
+                AttemptOutcome::Committed(_) => ReviewInferenceStatus::Committed,
+                AttemptOutcome::Rejected { .. } => ReviewInferenceStatus::Rejected,
+                AttemptOutcome::Cancelled { .. } => ReviewInferenceStatus::Cancelled,
+                AttemptOutcome::Failed(_) => ReviewInferenceStatus::Failed,
+                AttemptOutcome::Running | AttemptOutcome::Interrupted => continue,
+            };
+            let Some(billing) =
+                pl_model::runtime::model_attempt_billing(&attempt, effect.committed_at)
+                    .map_err(|error| SessionStoreError::Invalid(error.to_string()))?
+            else {
+                continue;
+            };
+            records.push(ReviewInferenceBilling {
+                effect_sequence: effect.sequence,
+                committed_at: effect.committed_at,
+                turn_id: attempt.turn_id,
+                attempt_id: attempt.attempt_id,
+                status,
+                billing,
+            });
+        }
+        Ok(ReviewInferenceBillingPage {
+            records,
+            next_before_sequence: page.next_before_sequence,
+        })
     }
 
     /// 产品 Agent 已删除且保留期到期后，通过 PL 的维护接口删除该会话。

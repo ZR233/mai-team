@@ -5,7 +5,11 @@ import type { Thread, ThreadSnapshot, ThreadTurnHistory, Turn } from "@/events/t
 export interface TokenUsage {
   promptTokens: number
   cachedPromptTokens: number
+  /** PL 有效缓存样本中的未命中输入。 */
+  cacheMissTokens: number
   cacheWriteTokens: number
+  /** 提供方缺少用量字段或返回了相互矛盾的字段。 */
+  hasIncompleteUsage: boolean
   completionTokens: number
   reasoningTokens: number
   totalTokens: number
@@ -225,6 +229,37 @@ export interface PullRequestReviewHistoryPage {
 
 export interface ReviewRunDetail extends ReviewRunSummary {
   history?: ThreadTurnHistory | null
+}
+
+export interface ReviewInferenceBilling {
+  effectSequence: number
+  committedAt: number
+  turnId: string
+  attemptId: string
+  status: "committed" | "rejected" | "cancelled" | "failed"
+  billing: {
+    inferenceId: string
+    provider: string
+    model: string
+    promptGeneration?: number | null
+    promptCachePolicy?: string | null
+    prefixChangedReason?: string | null
+    accounting: {
+      usage: {
+        inputTokens?: number | null
+        outputTokens?: number | null
+        cacheReadTokens?: number | null
+        cacheWriteTokens?: number | null
+        reasoningTokens?: number | null
+        totalTokens?: number | null
+      }
+    }
+  }
+}
+
+export interface ReviewInferenceBillingPage {
+  records: ReviewInferenceBilling[]
+  nextBeforeSequence?: number | null
 }
 
 export interface ReviewRunsResponse {

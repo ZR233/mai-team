@@ -1,9 +1,9 @@
-import { useQuery, type UseQueryResult } from "@tanstack/react-query"
+import { useInfiniteQuery, useQuery, type UseQueryResult } from "@tanstack/react-query"
 import { ChevronDown, CircleAlert, ExternalLink, RefreshCw } from "lucide-react"
 import { useEffect, useState } from "react"
 
-import type { PullRequestReviewHistoryItem, PullRequestReviewHistoryPage, PullRequestReviewSummary, ReviewJobDetail, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
-import { projectPullRequestReviewHistoryQuery, projectReviewJobQuery, projectReviewRunQuery } from "@/api/queries"
+import type { PullRequestReviewHistoryItem, PullRequestReviewHistoryPage, PullRequestReviewSummary, ReviewInferenceBilling, ReviewJobDetail, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
+import { projectPullRequestReviewHistoryQuery, projectReviewJobQuery, projectReviewRunBillingQuery, projectReviewRunQuery } from "@/api/queries"
 import { PagePagination } from "@/components/page-pagination"
 import { ErrorState, LoadingState } from "@/components/page-state"
 import { StatusBadge } from "@/components/status"
@@ -193,11 +193,31 @@ function Attempts({ projectId, attempts, usageByAttemptId }: { projectId: string
 
 function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; attempt: ReviewRunSummary | null }) {
   const detail = useQuery(projectReviewRunQuery(projectId, attempt?.id))
+  const billing = useInfiniteQuery(projectReviewRunBillingQuery(projectId, attempt?.id ?? null, Boolean(attempt?.reviewer_agent_id && attempt?.turn_id), Boolean(attempt && ["running", "syncing"].includes(attempt.status))))
   if (!attempt) return null
   if (detail.isLoading) return <LoadingState rows={3} />
   if (detail.error) return <ErrorState error={detail.error} retry={() => void detail.refetch()} />
   const activity = detail.data ? buildReviewActivity(detail.data as ReviewRunDetail) : null
-  return <section aria-label="Attempt activity" className="flex flex-col gap-1 border-t pt-4"><h4 className="text-sm font-medium">Attempt activity</h4>{activity && <ReviewActivityList activity={activity} />}</section>
+  const billingRecords = billing.data?.pages.flatMap((page) => page.records) ?? []
+  return <section aria-label="Attempt activity" className="flex flex-col gap-4 border-t pt-4"><div className="flex flex-col gap-1"><h4 className="text-sm font-medium">Attempt activity</h4>{activity && <ReviewActivityList activity={activity} />}</div><ReviewBillingDetails billing={billingRecords} loading={billing.isLoading} error={billing.error} hasNext={Boolean(billing.hasNextPage)} loadNext={() => void billing.fetchNextPage()} loadingNext={billing.isFetchingNextPage} /></section>
+}
+
+function ReviewBillingDetails({ billing, loading, error, hasNext, loadNext, loadingNext }: { billing: ReviewInferenceBilling[]; loading: boolean; error: Error | null; hasNext: boolean; loadNext(): void; loadingNext: boolean }) {
+  if (!billing.length && !loading && !error && !hasNext) return null
+  return <section aria-label="Model call diagnostics" className="rounded-lg border bg-muted/20 p-3"><div className="flex items-center justify-between gap-3"><div><h4 className="text-sm font-medium">Model call diagnostics</h4><p className="text-xs text-muted-foreground">PL-reported prompt cache and model receipt facts.</p></div>{hasNext && <Button type="button" variant="outline" size="sm" onClick={loadNext} disabled={loadingNext}>{loadingNext ? "Loading…" : "Load older"}</Button>}</div>{loading && <p className="mt-3 text-xs text-muted-foreground">Loading model calls…</p>}{error && <p className="mt-3 text-xs text-destructive">Unable to load model call diagnostics: {error.message}</p>}{billing.length > 0 && <div className="mt-3 flex flex-col gap-2">{billing.map((record) => <BillingRow key={`${record.effectSequence}-${record.attemptId}`} record={record} />)}</div>}</section>
+}
+
+function BillingRow({ record }: { record: ReviewInferenceBilling }) {
+  const usage = record.billing.accounting.usage
+  const input = usage.inputTokens
+  const cached = usage.cacheReadTokens
+  const miss = input != null && cached != null ? Math.max(0, input - cached) : null
+  const cacheLabel = input != null && input > 0 && cached != null ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(cached / input * 100)}% cache` : "cache —"
+  return <div className="rounded-md border bg-background px-3 py-2 text-xs"><div className="flex flex-wrap items-center justify-between gap-2"><span className="font-medium">{record.billing.provider} · {record.billing.model}</span><span className="text-muted-foreground">{record.status} · {cacheLabel}</span></div><dl className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 text-muted-foreground sm:grid-cols-4"><span><dt className="inline">Input </dt><dd className="inline font-medium text-foreground">{formatBillingNumber(input)}</dd></span><span><dt className="inline">Cached </dt><dd className="inline font-medium text-foreground">{formatBillingNumber(cached)}</dd></span><span><dt className="inline">Miss </dt><dd className="inline font-medium text-foreground">{formatBillingNumber(miss)}</dd></span><span><dt className="inline">Generation </dt><dd className="inline font-medium text-foreground">{record.billing.promptGeneration ?? "—"}</dd></span></dl>{(record.billing.promptCachePolicy || record.billing.prefixChangedReason) && <p className="mt-1 text-muted-foreground">{record.billing.promptCachePolicy ? `Policy: ${record.billing.promptCachePolicy}` : ""}{record.billing.prefixChangedReason ? ` · Prefix: ${record.billing.prefixChangedReason}` : ""}</p>}</div>
+}
+
+function formatBillingNumber(value: number | null | undefined) {
+  return value == null ? "—" : new Intl.NumberFormat().format(value)
 }
 
 function ReviewDetailActions({ pr, repository, reviewable, onRereview, pending }: { pr?: number; repository: string; reviewable: boolean; onRereview(pr: number): void; pending: boolean }) {

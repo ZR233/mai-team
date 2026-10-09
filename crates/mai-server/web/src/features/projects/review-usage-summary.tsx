@@ -47,9 +47,11 @@ export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null
           aria-valuenow={hitRate ?? 0}
         />
       </div>
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-4">
-        <UsageDetail label="Input" value={usage.promptTokens} />
+      {usage.hasIncompleteUsage && <p className="text-xs text-muted-foreground">Cache rate uses provider samples with complete input and cache fields; some samples were incomplete.</p>}
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-5">
+        <UsageDetail label="Prompt input" value={usage.promptTokens} />
         <UsageDetail label="Cached input" value={usage.cachedPromptTokens} />
+        <UsageDetail label="Cache miss" value={usage.cacheMissTokens} />
         <UsageDetail label="Output" value={usage.completionTokens} />
         <UsageDetail label="Reasoning" value={usage.reasoningTokens} />
       </dl>
