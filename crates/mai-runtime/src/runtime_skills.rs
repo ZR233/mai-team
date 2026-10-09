@@ -154,10 +154,7 @@ impl AgentRuntime {
             .docker
             .exec_shell(
                 &container_id,
-                &format!(
-                    "rm -rf {root} && mkdir -p {root}",
-                    root = shell_quote_word(CONTAINER_SKILLS_ROOT)
-                ),
+                &container_skills_cleanup_command(),
                 Some("/"),
                 Some(10),
             )
@@ -407,6 +404,25 @@ impl AgentRuntime {
             source.host_path = Some(target);
         }
         Ok(sources)
+    }
+}
+
+fn container_skills_cleanup_command() -> String {
+    let root = shell_quote_word(CONTAINER_SKILLS_ROOT);
+    format!("mkdir -p -- {root} && find {root} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +",)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::container_skills_cleanup_command;
+
+    #[test]
+    fn skill_cleanup_preserves_container_root() {
+        let command = container_skills_cleanup_command();
+        assert!(command.starts_with("mkdir -p -- /tmp/.mai-team/skills && find "));
+        assert!(command.contains("-mindepth 1 -maxdepth 1"));
+        assert!(command.contains("-exec rm -rf -- {} +"));
+        assert!(!command.starts_with("rm -rf /tmp/.mai-team/skills"));
     }
 }
 
