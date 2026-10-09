@@ -22,11 +22,11 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "19531679a534f90e7e27f646659d085f6b0eb911", default-features = false, features = ["sqlite"] }
-pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "19531679a534f90e7e27f646659d085f6b0eb911" }
-pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "19531679a534f90e7e27f646659d085f6b0eb911" }
-pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "19531679a534f90e7e27f646659d085f6b0eb911" }
-pl-tool = { git = "https://github.com/ZR233/pure-lang.git", rev = "19531679a534f90e7e27f646659d085f6b0eb911" }
+pl-core = { git = "https://github.com/ZR233/pure-lang.git", branch = "main", default-features = false, features = ["sqlite"] }
+pl-model = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
+pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
+pl-trace = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
+pl-tool = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
 
 schemars = "1"
 shell-words = "1"
