@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.14...mai-server-v0.2.0) - 2026-10-10
+
+### Added
+
+- *(review)* expose PL billing diagnostics ([#45](https://github.com/ZR233/mai-team/pull/45))
+- *(web)* unify review and thread timelines
+- *(review)* 原生迁移 PL 并独立发现 PR
+- [**breaking**] 原生迁移 PL v2 运行时
+- 统一 Review 保留与 Timeline 投影
+- *(web)* group consecutive tool calls in chat timeline
+- *(review)* track pull request lifecycle states
+- track merged pull request reviews
+- *(review)* paginate pull request review history
+- show review token usage
+
+### Fixed
+
+- *(tools)* restore search and resilient MCP health
+- *(review)* project configured-branch skill activations
+- *(thread)* show active history and PL usage in agent workspace
+- *(review)* recover stale reviewer slots
+- *(review)* prevent periodic discovery from missing changed heads
+- *(review)* emphasize agent text and require project skills
+- *(review)* recover detached run ownership
+- *(server)* close SSE before runtime shutdown
+- *(web)* consume native PL thread items
+- *(runtime)* restore thread event channels
+- *(web)* use native PL token usage fields
+- *(runtime)* 惰性恢复迁移后的长期 Agent
+- *(review)* measure duration from running start
+- *(review)* bound repair turns and retire thread state
+- *(review)* clarify GitHub search query encoding
+- *(review)* reconcile ownership after restart
+- *(review)* make harness tool contracts unambiguous
+- *(web)* reconcile timeline controls with agent lifecycle
+- *(review)* refresh floating reviewer images
+- *(review)* handle completed workflow runs
+- *(review)* queue completed CI signals once per PR
+
+### Other
+
+- adapt mai to latest pl mainline
+- *(pl)* adopt schema 9 usage accounting with offline migration
+- *(web)* align provider and review views with PL threads
+- migrate mai runtime to current pl-core threads
+- 直接组合 PL 模型配置
+- migrate runtime and review timeline to PL threads
+
 ## [0.1.14](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.13...mai-server-v0.1.14) - 2026-07-23
 
 ### Added
