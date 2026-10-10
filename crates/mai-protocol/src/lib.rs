@@ -8,6 +8,7 @@ use uuid::Uuid;
 mod agent_state;
 
 pub use agent_state::{AgentResourceSnapshot, AgentResourceState};
+pub use pl_protocol::InferenceBillingRecord;
 pub use pl_protocol::{
     ChatWindowChange, ChatWindowDirection, ChatWindowFocus, ChatWindowItem, ChatWindowLifecycle,
     ChatWindowPriority, ChatWindowQuery, ChatWindowSnapshot, ChatWindowUpdate,
@@ -796,6 +797,37 @@ pub struct ProjectReviewRunDetail {
     pub summary: ProjectReviewRunSummary,
     #[serde(default)]
     pub history: Option<ThreadTurnHistory>,
+}
+
+/// 一次 review Thread attempt 的 PL 计费与缓存诊断事实。
+///
+/// `effect_sequence` 和 `status` 让调用方可以稳定续读分页，并区分同一 Turn 的重试、拒绝
+/// 和失败调用；计费字段由 `pl-model` receipt 解码，不从 Mai 的持久化表重建。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewInferenceBilling {
+    pub effect_sequence: u64,
+    pub committed_at: i64,
+    pub turn_id: TurnId,
+    pub attempt_id: String,
+    pub status: ReviewInferenceStatus,
+    pub billing: InferenceBillingRecord,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewInferenceStatus {
+    Committed,
+    Rejected,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewInferenceBillingPage {
+    pub records: Vec<ReviewInferenceBilling>,
+    pub next_before_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

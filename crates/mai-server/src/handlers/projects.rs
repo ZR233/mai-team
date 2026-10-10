@@ -9,8 +9,9 @@ use mai_protocol::{
     CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectPullRequestReviewHistoryPage,
     ProjectPullRequestReviewPage, ProjectPullRequestStateRefreshSummary,
     ProjectReviewDiscoverySnapshot, ProjectReviewJobDetail, ProjectReviewQueueResponse,
-    ProjectReviewRunDetail, ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse,
-    SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ProjectReviewRunDetail, ProjectReviewRunsResponse, ReviewInferenceBillingPage,
+    SendMessageRequest, SendMessageResponse, SkillsListResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
@@ -19,10 +20,18 @@ use super::state::{ApiError, AppState};
 const DEFAULT_REVIEW_RUNS_PAGE_SIZE: usize = 50;
 const DEFAULT_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 20;
 const MAX_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 100;
+const DEFAULT_REVIEW_BILLING_PAGE_SIZE: usize = 50;
+const MAX_REVIEW_BILLING_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectReviewRunsQuery {
     offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProjectReviewBillingQuery {
+    before_sequence: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -105,6 +114,27 @@ pub(crate) async fn get_project_review_run(
     })?;
     Ok(Json(
         state.runtime.get_project_review_run(id, run_id).await?,
+    ))
+}
+
+pub(crate) async fn list_project_review_run_billing(
+    State(state): State<Arc<AppState>>,
+    Path((id, run_id)): Path<(ProjectId, String)>,
+    Query(query): Query<ProjectReviewBillingQuery>,
+) -> std::result::Result<Json<ReviewInferenceBillingPage>, ApiError> {
+    let run_id = run_id.parse().map_err(|err| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid review run id: {err}"),
+    })?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_REVIEW_BILLING_PAGE_SIZE)
+        .clamp(1, MAX_REVIEW_BILLING_PAGE_SIZE);
+    Ok(Json(
+        state
+            .runtime
+            .list_project_review_run_billing(id, run_id, query.before_sequence, limit)
+            .await?,
     ))
 }
 

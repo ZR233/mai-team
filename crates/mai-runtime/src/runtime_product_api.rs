@@ -206,6 +206,35 @@ impl AgentRuntime {
         Ok(detail)
     }
 
+    pub async fn list_project_review_run_billing(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        run_id: Uuid,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<ReviewInferenceBillingPage> {
+        self.project(project_id).await?;
+        let detail =
+            projects::review::runs::get_project_review_run(&self.deps.store, project_id, run_id)
+                .await?;
+        let (Some(agent_id), Some(turn_id)) =
+            (detail.summary.reviewer_agent_id, detail.summary.turn_id)
+        else {
+            return Ok(ReviewInferenceBillingPage {
+                records: Vec::new(),
+                next_before_sequence: None,
+            });
+        };
+        if let Some(resident) = self.resident_thread(agent_id) {
+            self.await_agent_durable(agent_id, resident.handle.snapshot().commit_sequence)
+                .await?;
+        }
+        self.session_history
+            .billing(agent_id, &turn_id, before_sequence, limit)
+            .await
+            .map_err(RuntimeError::from)
+    }
+
     pub async fn list_project_pull_request_reviews(
         &self,
         project_id: ProjectId,

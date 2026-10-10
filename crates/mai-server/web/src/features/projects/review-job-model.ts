@@ -1,7 +1,7 @@
 import type { ReviewJobSummary, ReviewRunSummary, TokenUsage } from "@/api/product-types"
 
 const activeStatuses = new Set(["queued", "preparing", "running", "retry_waiting", "submission_pending", "reconciling"])
-const usageFields = ["promptTokens", "cachedPromptTokens", "cacheWriteTokens", "completionTokens", "reasoningTokens", "totalTokens"] as const
+const usageFields = ["promptTokens", "cachedPromptTokens", "cacheMissTokens", "cacheWriteTokens", "completionTokens", "reasoningTokens", "totalTokens"] as const
 
 export interface ReviewUsageProjection {
   total: TokenUsage | null
@@ -63,8 +63,10 @@ export function projectReviewUsage(attempts: ReviewRunSummary[]): ReviewUsagePro
 }
 
 export function cacheHitRate(usage?: TokenUsage | null) {
-  if (!usage || usage.promptTokens <= 0) return null
-  return Math.min(100, Math.max(0, usage.cachedPromptTokens / usage.promptTokens * 100))
+  if (!usage) return null
+  const cacheInputTokens = usage.cachedPromptTokens + usage.cacheMissTokens
+  if (cacheInputTokens <= 0) return null
+  return Math.min(100, Math.max(0, usage.cachedPromptTokens / cacheInputTokens * 100))
 }
 
 function compareAttempts(left: ReviewRunSummary, right: ReviewRunSummary) {
@@ -75,7 +77,10 @@ function compareAttempts(left: ReviewRunSummary, right: ReviewRunSummary) {
 
 function normalizeUsage(usage?: TokenUsage): TokenUsage | null {
   if (!usage) return null
-  return Object.fromEntries(usageFields.map((field) => [field, normalizeTokenCount(usage[field])])) as unknown as TokenUsage
+  return {
+    ...Object.fromEntries(usageFields.map((field) => [field, normalizeTokenCount(usage[field])])),
+    hasIncompleteUsage: Boolean(usage.hasIncompleteUsage),
+  } as unknown as TokenUsage
 }
 
 function normalizeTokenCount(value: number) {
@@ -83,7 +88,7 @@ function normalizeTokenCount(value: number) {
 }
 
 function emptyUsage(): TokenUsage {
-  return { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+  return { promptTokens: 0, cachedPromptTokens: 0, cacheMissTokens: 0, cacheWriteTokens: 0, hasIncompleteUsage: false, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 }
 }
 
 function usageIsEmpty(usage: TokenUsage) {
@@ -91,9 +96,13 @@ function usageIsEmpty(usage: TokenUsage) {
 }
 
 function subtractUsage(current: TokenUsage, previous: TokenUsage): TokenUsage {
-  return Object.fromEntries(usageFields.map((field) => [field, current[field] - previous[field]])) as unknown as TokenUsage
+  return {
+    ...Object.fromEntries(usageFields.map((field) => [field, current[field] - previous[field]])),
+    hasIncompleteUsage: current.hasIncompleteUsage,
+  } as unknown as TokenUsage
 }
 
 function addUsage(total: TokenUsage, usage: TokenUsage) {
   for (const field of usageFields) total[field] += usage[field]
+  total.hasIncompleteUsage ||= usage.hasIncompleteUsage
 }

@@ -12,6 +12,7 @@ import type {
   ProjectDetail,
   ProjectReviewDiscoverySnapshot,
   ReviewJobDetail,
+  ReviewInferenceBillingPage,
   ReviewRunDetail,
   ReviewRunsResponse,
   ProjectSummary,
@@ -32,6 +33,7 @@ export const queryKeys = {
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
   projectReviewDiscovery: (id: string) => ["projects", id, "review-discovery"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
+  projectReviewRunBilling: (id: string, runId: string) => ["projects", id, "review-runs", runId, "billing"] as const,
   projectPullRequestReviews: (id: string) => ["projects", id, "pull-request-reviews"] as const,
   projectPullRequestReviewPage: (id: string, page: number, pageSize: number) => ["projects", id, "pull-request-reviews", page, pageSize] as const,
   projectPullRequestReviewHistory: (id: string, pr: number) => ["projects", id, "pull-request-reviews", pr, "history"] as const,
@@ -130,6 +132,15 @@ export const projectReviewRunQuery = (projectId: string, runId?: string | null) 
   queryFn: () => api<ReviewRunDetail>(`/projects/${projectId}/review-runs/${runId}`),
   enabled: Boolean(projectId && runId),
   refetchInterval: (query) => ["syncing", "running"].includes(query.state.data?.status ?? "") ? 5_000 : false,
+})
+
+export const projectReviewRunBillingQuery = (projectId: string, runId: string | null, enabled = true, active = false) => infiniteQueryOptions({
+  queryKey: queryKeys.projectReviewRunBilling(projectId, runId || "none"),
+  queryFn: ({ pageParam }) => api<ReviewInferenceBillingPage>(`/projects/${projectId}/review-runs/${runId}/billing${query({ before_sequence: pageParam ? String(pageParam) : undefined, limit: "100" })}`),
+  initialPageParam: undefined as number | undefined,
+  getNextPageParam: (lastPage) => lastPage.nextBeforeSequence ?? undefined,
+  enabled: Boolean(projectId && runId && enabled),
+  refetchInterval: active ? 5_000 : false,
 })
 
 export const projectPullRequestReviewsQuery = (id: string, page: number, pageSize = 20) => queryOptions({
