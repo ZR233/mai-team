@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "mai-relay"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "mai-server"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
