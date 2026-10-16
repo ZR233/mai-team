@@ -1,4 +1,4 @@
-import { Bot, Github, KeyRound, Search, ServerCog, Sparkles } from "lucide-react"
+import { Bot, FolderGit2, Github, KeyRound, Search, ServerCog, Sparkles } from "lucide-react"
 import { Navigate, useNavigate, useParams } from "react-router-dom"
 
 import { ResourceSidebar } from "@/components/resource-sidebar"
@@ -7,6 +7,7 @@ import { WorkspaceHeader } from "@/components/workspace-header"
 import { GitAccountsSection } from "./sections/git-accounts-section"
 import { GithubAppSection } from "./sections/github-app-section"
 import { McpSection } from "./sections/mcp-section"
+import { ReferenceSourcesSection } from "./sections/reference-sources-section"
 import { RolesSection } from "./sections/roles-section"
 import { SkillsSection } from "./sections/skills-section"
 import { WebSearchSection } from "./sections/web-search-section"
@@ -18,6 +19,7 @@ const sections = [
   { id: "github-app", title: "GitHub App", detail: "Relay and installations", icon: Github },
   { id: "web-search", title: "Web Search", detail: "Provider capability planning", icon: Search },
   { id: "mcp", title: "MCP Servers", detail: "Built-in and custom tools", icon: ServerCog },
+  { id: "reference-sources", title: "Reference Sources", detail: "Read-only source snapshots", icon: FolderGit2 },
 ] as const
 
 type SettingsSection = typeof sections[number]["id"]
@@ -40,6 +42,7 @@ export default function SettingsPage() {
         {active === "github-app" && <GithubAppSection />}
         {active === "web-search" && <WebSearchSection />}
         {active === "mcp" && <McpSection />}
+        {active === "reference-sources" && <ReferenceSourcesSection />}
       </section>
     </div>
   )

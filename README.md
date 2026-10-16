@@ -130,8 +130,17 @@ npm run test:projects
 
 `mai-server` 安装后默认使用 `/var/lib/mai-server` 作为数据目录，并通过 `/etc/mai-server/mai-server.env` 读取运行配置。`mai-relay` 需要设置 `MAI_RELAY_TOKEN`，并通过 Settings 页面与 `mai-server` 建立连接。
 
-升级 pl-core 会话 schema 时，先停止 `mai-server` 并完整备份数据目录，再运行同版本编译出的
-`mai-migrate-pl-sessions --data-path /var/lib/mai-server --backup-archive <备份 tar 路径>`。
+升级 pl-core 会话 schema 时，先停止 `mai-server` 并完整备份数据目录。本次会话 schema 11→12 必须使用同版本发布包里的工具，先检查，再写入一个不存在且位于数据目录之外的备份目录。发布包中的 server 与两个离线迁移工具均需提取并核对内部校验和，通用安装脚本不会代为执行离线迁移。请在服务用户可读取和进入的解包目录执行下列命令。维护工具必须用服务的实际运行用户执行（以下为安装脚本默认的 `mai-server`），备份父目录也由该用户持有：
+
+```bash
+tar -xzf mai-server-x86_64-unknown-linux-gnu.tar.gz mai-server mai-migrate-pl-sessions mai-migrate-references SHA256SUMS
+sha256sum -c SHA256SUMS
+sudo install -d -m 0700 -o mai-server -g mai-server /var/backups/mai-server
+sudo -u mai-server ./mai-migrate-pl-sessions check --data-path /var/lib/mai-server
+sudo -u mai-server ./mai-migrate-pl-sessions migrate --data-path /var/lib/mai-server --backup-directory /var/backups/mai-server/pl-sessions-20261016
+```
+
+工具逐库创建包含 WAL 已提交数据的 SQLite 一致备份，持久化收据，再调用 PL 原生事务迁移；原始会话、历史及 checkpoint 摘要必须保持一致。服务与工具共用数据目录独占锁；旧版本服务不持有此锁，升级前仍必须确认旧进程已停止。失败停止后续库，不自动回滚已完成的库；修复原因后使用新的备份目录重新执行。更旧的 schema 不在本次转换范围。完整升级与回退边界见 [PL 主线适配记录](docs/pl-mainline-8fd235ac.md)。
 迁移工具只负责遍历 Mai 的 Agent 会话目录，并调用 pl-core 的离线迁移接口；普通服务启动不会
 擅自改写旧会话。迁移成功后再安装并启动同版本的 `mai-server`。
 

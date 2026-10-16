@@ -6,6 +6,21 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 mod agent_state;
+mod references;
+pub use references::{
+    ALIAS_PATTERN, AgentReferenceApplication, AppliedReference, AppliedReferenceSnapshot,
+    ApplyProjectReferencesRequest, DEFAULT_MAX_BINDINGS_PER_PROJECT,
+    DEFAULT_REFERENCE_STATUS_LIMIT, MAX_ALIAS_CHARS, MAX_DESCRIPTION_CHARS, MAX_JS_SAFE_INTEGER,
+    MAX_REFERENCE_STATUS_LIMIT, MAX_REVISION_LABEL_CHARS, MAX_SOURCE_NAME_CHARS,
+    ModelVisibleReference, NewReferenceSourceRequest, PatchReferenceSourceRequest,
+    ProjectReferenceApplicationState, ProjectReferenceBinding, ProjectReferenceConfiguration,
+    ProjectReferenceStatus, REFERENCE_CONTAINER_ROOT, ReferenceAccess, ReferenceApplicationCounts,
+    ReferenceApplicationState, ReferenceApplyOperation, ReferenceApplyPhase, ReferenceApplyPolicy,
+    ReferenceErrorCode, ReferenceErrorResponse, ReferenceFieldError, ReferencePageInfo,
+    ReferenceSource, ReferenceSourcePolicy, ReferenceStatusQuery, ReferenceValidationFailure,
+    ReplaceProjectReferencesRequest, SourceProvenance, SourceProvenanceKind, SourceState,
+    default_max_bindings_per_project,
+};
 
 pub use agent_state::{AgentResourceSnapshot, AgentResourceState};
 pub use pl_protocol::InferenceBillingRecord;
@@ -903,6 +918,8 @@ pub struct CreateEnvironmentResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateProjectRequest {
     #[serde(default)]
+    pub reference_bindings: Vec<ProjectReferenceBinding>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub git_account_id: Option<String>,
@@ -1482,6 +1499,20 @@ pub struct MaiProductEventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MaiProductEventKind {
+    ProjectReferencesChanged {
+        project_id: ProjectId,
+        revision: u64,
+    },
+    AgentReferenceApplicationChanged {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        revision: u64,
+        state: ReferenceApplicationState,
+    },
+    ReferenceSourceChanged {
+        source_id: Uuid,
+        state: SourceState,
+    },
     AgentCreated {
         agent: AgentSummary,
     },

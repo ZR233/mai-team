@@ -14,7 +14,7 @@ pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
 // 配置或 memory 重建；workspace 使用严格 JSON 读写，不做静默回退。
 // 版本 36 记录产品 Agent 删除时间，供 PL 会话历史到期清理；不复制 PL 内容。
 // 版本 37 用完整 JSON 保存 Review Run 的 PL 用量投影，避免旧计数字段丢失成本与时间。
-pub(crate) const SCHEMA_VERSION: &str = "37";
+pub(crate) const SCHEMA_VERSION: &str = "38";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const SQLITE_POOL_MAX_SIZE: usize = 4;
 const SQLITE_POOL_WAIT_TIMEOUT_SECS: u64 = 30;

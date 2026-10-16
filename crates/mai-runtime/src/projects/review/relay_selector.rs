@@ -176,7 +176,8 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::Http(_))
         | Err(RuntimeError::GithubUnavailable { .. })
         | Err(RuntimeError::PullRequestStateRefresh(_))
-        | Err(RuntimeError::Jwt(_)) => false,
+        | Err(RuntimeError::Jwt(_))
+        | Err(RuntimeError::Reference(_)) => false,
     }
 }
 

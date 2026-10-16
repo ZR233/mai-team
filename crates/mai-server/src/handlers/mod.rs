@@ -6,6 +6,7 @@ pub(crate) mod git_accounts;
 pub(crate) mod github_app;
 pub(crate) mod projects;
 pub(crate) mod providers;
+pub(crate) mod references;
 pub(crate) mod state;
 pub(crate) mod tasks;
 pub(crate) mod threads;

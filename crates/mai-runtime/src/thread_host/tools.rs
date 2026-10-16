@@ -72,11 +72,8 @@ pub(crate) async fn assemble_thread_tools(
     runtime.container_id(agent_id).await?;
 
     let config = runtime.mai_config.read().await.clone();
-    let workspace = Arc::new(MaiThreadWorkspaceTools::new(
-        Arc::clone(&runtime),
-        agent_id,
-        &summary,
-    ));
+    let workspace =
+        Arc::new(MaiThreadWorkspaceTools::new(Arc::clone(&runtime), agent_id, &summary).await?);
     let git = native_git_tool_runtime(Arc::clone(&runtime), &agent).await?;
     let skill_catalog = skill_catalog(&runtime, &agent, &config).await?;
     *agent.skill_catalog.write().await = skill_catalog.clone();

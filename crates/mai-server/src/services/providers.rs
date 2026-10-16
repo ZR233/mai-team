@@ -408,6 +408,8 @@ pub(crate) async fn provider_test_store(
         mai_docker::DockerClient::new("unused-image"),
         store,
         mai_runtime::RuntimeConfig {
+            reference_application_observer: None,
+            references_policy_path: None,
             repo_root: dir.path().to_path_buf(),
             projects_root: dir.path().join("projects"),
             sessions_root: dir.path().join("sessions"),

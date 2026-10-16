@@ -102,6 +102,14 @@ impl PreparedAgentResource {
         self.summary.id
     }
 
+    /// 该 Agent 的父身份快照；根 Agent 为 `None`。
+    ///
+    /// 注册提交前用它做非阻塞的父退役检查：删除流程会先把整棵子树的节点打上退休标记，
+    /// 因此这里只需要读一个内存标记，不需要（也不能）去取父节点的 lifecycle 锁。
+    pub(crate) fn parent_id(&self) -> Option<AgentId> {
+        self.summary.parent_id
+    }
+
     pub(crate) fn include_canonical_runtime(&mut self) {
         self.lease.include_canonical_runtime();
     }

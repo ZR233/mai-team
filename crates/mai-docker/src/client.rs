@@ -15,6 +15,7 @@ use crate::image::{ImageRefreshFailure, ImageRefreshOutcome, floating_latest_ref
 pub struct DockerClient {
     pub(crate) binary: String,
     pub(crate) image: String,
+    pub(crate) snapshot_owner: Option<uuid::Uuid>,
     image_refreshes: Arc<Mutex<HashMap<String, Arc<ImageRefreshFlight>>>>,
 }
 
@@ -63,6 +64,7 @@ impl DockerClient {
         Self {
             binary: "docker".to_string(),
             image: image.into(),
+            snapshot_owner: None,
             image_refreshes: Arc::default(),
         }
     }
@@ -71,8 +73,15 @@ impl DockerClient {
         Self {
             binary: binary.into(),
             image: image.into(),
+            snapshot_owner: None,
             image_refreshes: Arc::default(),
         }
+    }
+
+    /// 为一个产品数据目录固定镜像资源归属，防止同 daemon 的其他实例互相回收。
+    pub fn with_snapshot_owner(mut self, owner: uuid::Uuid) -> Self {
+        self.snapshot_owner = Some(owner);
+        self
     }
 
     pub fn image(&self) -> &str {

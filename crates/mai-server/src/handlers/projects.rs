@@ -438,6 +438,8 @@ mod tests {
             DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
             Arc::clone(&store),
             RuntimeConfig {
+                reference_application_observer: None,
+                references_policy_path: None,
                 repo_root: dir.path().to_path_buf(),
                 projects_root: dir.path().join("projects"),
                 sessions_root: dir.path().join("sessions"),
@@ -472,7 +474,7 @@ mod tests {
     ) {
         let now = Utc::now();
         store
-            .save_agent(
+            .insert_agent(
                 &mai_protocol::AgentSummary {
                     id: maintainer_id,
                     parent_id: None,
@@ -504,7 +506,7 @@ mod tests {
             .await
             .expect("save maintainer");
         store
-            .save_project(&mai_protocol::ProjectSummary {
+            .insert_project(&mai_protocol::ProjectSummary {
                 id: project_id,
                 name: "owner/repo".to_string(),
                 status: ProjectStatus::Creating,

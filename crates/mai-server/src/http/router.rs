@@ -282,6 +282,38 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             post(handlers::projects::cancel_project),
         )
         .route(
+            "/reference-sources",
+            get(handlers::references::list_reference_sources)
+                .post(handlers::references::register_reference_source),
+        )
+        .route(
+            "/reference-sources/{id}",
+            get(handlers::references::get_reference_source)
+                .patch(handlers::references::patch_reference_source)
+                .delete(handlers::references::delete_reference_source),
+        )
+        .route(
+            "/reference-sources/{id}/verify",
+            post(handlers::references::verify_reference_source),
+        )
+        .route(
+            "/reference-source-policy",
+            get(handlers::references::get_reference_source_policy),
+        )
+        .route(
+            "/projects/{id}/references",
+            get(handlers::references::get_project_references)
+                .put(handlers::references::replace_project_references),
+        )
+        .route(
+            "/projects/{id}/references/apply",
+            post(handlers::references::apply_project_references),
+        )
+        .route(
+            "/projects/{id}/references/status",
+            get(handlers::references::project_reference_status),
+        )
+        .route(
             "/agents",
             get(handlers::agents::list_agents).post(handlers::agents::create_agent),
         )

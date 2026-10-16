@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Bot, GitBranch, Plus, RefreshCw, Save, Search, ShieldCheck, Trash2, Users } from "lucide-react"
+import { Bot, GitBranch, Library, Plus, RefreshCw, Save, Search, ShieldCheck, Trash2, Users } from "lucide-react"
 import { useEffect, useState } from "react"
 import { useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
@@ -22,8 +22,10 @@ import { agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { ReviewPanel } from "@/features/projects/review-panel"
 import { ThreadWorkspace } from "@/features/thread/thread-workspace"
 import { CreateProjectDialog } from "@/features/projects/create-project-dialog"
+import { ProjectReferencesPanel } from "@/features/references/project-references-panel"
+import { useReferenceNavigationGuard } from "@/features/references/use-reference-draft"
 
-type ProjectView = "agents" | "review" | "repository" | "skills"
+type ProjectView = "agents" | "review" | "repository" | "skills" | "references"
 
 export default function ProjectsPage() {
   const { projectId } = useParams()
@@ -37,6 +39,11 @@ export default function ProjectsPage() {
   const reviewPage = positivePage(search.get("review_page"))
   const detail = useQuery(projectQuery(selectedId))
   const [createOpen, setCreateOpen] = useState(false)
+  const referenceGuard = useReferenceNavigationGuard()
+  // 未保存的参考源码草稿按 projectId 保留；离开前确认，但不会把草稿套用到另一个项目。
+  const guardNavigate = (action: () => void) => {
+    if (referenceGuard.confirmLeave()) action()
+  }
 
   useEffect(() => {
     if (!projectId && selectedId) navigate(`/projects/${selectedId}`, { replace: true })
@@ -63,7 +70,7 @@ export default function ProjectsPage() {
 
   return (
     <div className="relative flex h-full min-h-0">
-      <ResourceSidebar title="Projects" items={items} selectedId={selectedId} onSelect={(id) => navigate(`/projects/${id}`)} onCreate={() => setCreateOpen(true)} />
+      <ResourceSidebar title="Projects" items={items} selectedId={selectedId} onSelect={(id) => guardNavigate(() => navigate(`/projects/${id}`))} onCreate={() => setCreateOpen(true)} />
       {!selectedId
         ? <ProjectPageState><EmptyState title="No projects yet" description="Connect a repository to create a maintainer and review workspace." action={<Button onClick={() => setCreateOpen(true)}><Plus data-icon="inline-start" /> New project</Button>} /></ProjectPageState>
         : detail.isLoading
@@ -71,7 +78,7 @@ export default function ProjectsPage() {
           : detail.error
             ? <ProjectPageState><ErrorState error={detail.error} retry={() => void detail.refetch()} /></ProjectPageState>
             : detail.data
-              ? <ProjectWorkspace detail={detail.data} view={view} selectedAgentId={selectedAgentId} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} reviewPage={reviewPage} setReviewPage={(page) => changeSearch({ review_page: page === 1 ? null : String(page) })} refresh={() => queryClient.invalidateQueries({ queryKey: queryKeys.project(selectedId) })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
+              ? <ProjectWorkspace detail={detail.data} view={view} selectedAgentId={selectedAgentId} setView={(next) => guardNavigate(() => changeSearch({ view: next }))} selectAgent={(id) => changeSearch({ agent: id })} reviewPage={reviewPage} setReviewPage={(page) => changeSearch({ review_page: page === 1 ? null : String(page) })} refresh={() => queryClient.invalidateQueries({ queryKey: queryKeys.project(selectedId) })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
               : null}
       <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={(project) => {
         setCreateOpen(false)
@@ -104,13 +111,14 @@ function ProjectWorkspace({ detail, view, selectedAgentId, setView, selectAgent,
         crumbs={[{ label: "Projects", href: "/projects" }, { label: detail.name }, { label: view.slice(0, 1).toUpperCase() + view.slice(1) }]}
         actions={<><StatusBadge status={detail.status} /><ProjectAutoReview project={detail} refresh={refresh} /></>}
       />
-      <div className="flex shrink-0 items-center border-b px-4 md:px-6">
-        <Tabs value={view} onValueChange={(value: string) => setView(value as ProjectView)}>
+      <div className="flex min-w-0 max-w-full shrink-0 items-center overflow-x-auto border-b px-4 md:px-6">
+        <Tabs className="shrink-0" value={view} onValueChange={(value: string) => setView(value as ProjectView)}>
           <TabsList variant="line" className="h-11">
             <TabsTrigger value="agents"><Users /> Agents</TabsTrigger>
             <TabsTrigger value="review"><ShieldCheck /> Review</TabsTrigger>
             <TabsTrigger value="repository"><GitBranch /> Repository</TabsTrigger>
             <TabsTrigger value="skills"><Search /> Skills</TabsTrigger>
+            <TabsTrigger value="references"><Library /> References</TabsTrigger>
           </TabsList>
         </Tabs>
       </div>
@@ -121,6 +129,7 @@ function ProjectWorkspace({ detail, view, selectedAgentId, setView, selectAgent,
       {view === "review" && <ReviewPanel key={detail.id} project={detail} page={reviewPage} onPageChange={setReviewPage} />}
       {view === "repository" && <RepositoryPanel project={detail} refresh={refresh} onDeleted={onDeleted} />}
       {view === "skills" && <SkillsPanel projectId={detail.id} />}
+      {view === "references" && <ProjectReferencesPanel projectId={detail.id} />}
     </section>
   )
 }

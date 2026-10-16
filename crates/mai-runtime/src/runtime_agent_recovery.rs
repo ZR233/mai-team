@@ -1,7 +1,11 @@
 use super::*;
 
 impl agents::AgentResourceRecoveryOps for AgentRuntime {
+    // 只停止执行环境并保留容器/binding 收据：恢复随后必须能按同一 binding 复用该环境，
+    // 不能被"先删容器"拖进悬空 binding，也不能退回基础镜像重建。
     async fn close_agent_resources(&self, agent_id: AgentId) -> Result<()> {
+        let admission = self.references.admissions.agent(agent_id);
+        let _lifecycle = admission.lifecycle.lock().await;
         self.close_agent(agent_id).await
     }
 

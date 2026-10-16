@@ -8,3 +8,10 @@ crates/mai-server/web/node_modules
 /.cargo/config.toml
 /.claude/worktrees
 /.worktrees
+
+# 真实隔离浏览器验收产物
+crates/mai-server/web/live-test-results/
+
+# Python 验收工具的解释器缓存
+__pycache__/
+*.py[cod]

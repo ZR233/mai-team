@@ -52,11 +52,13 @@ impl AgentRuntime {
                     .collect::<HashSet<_>>(),
             )
         };
-        Ok(self
+        let removed = self
             .deps
             .docker
             .cleanup_orphaned_managed_containers(&active_agent_ids, &active_project_ids)
-            .await?)
+            .await?;
+        self.references.reclaim_snapshot_resources().await?;
+        Ok(removed)
     }
 
     pub async fn get_agent(&self, agent_id: AgentId) -> Result<AgentDetail> {
@@ -594,7 +596,8 @@ pub(crate) fn project_thread_snapshot(
     let (workspace_mode, workspace_path) = match summary.workspace.as_ref() {
         Some(assignment) => {
             let mode = match assignment.mode {
-                pl_protocol::AgentWorkspaceMode::Worktree => {
+                pl_protocol::AgentWorkspaceMode::Worktree
+                | pl_protocol::AgentWorkspaceMode::Review => {
                     pl_protocol::ThreadWorkspaceMode::Worktree
                 }
                 pl_protocol::AgentWorkspaceMode::Unrestricted

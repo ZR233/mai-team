@@ -266,6 +266,21 @@ impl AgentRuntime {
         request: SpawnChildRequest,
     ) -> Result<SpawnedChild> {
         let child_id = child_agent_id(request.caller, &request.call_id);
+        // 非阻塞的父退役检查：父 Agent 一旦进入删除流程就不再接受新 child，复用既有 child 也
+        // 拒绝。这里只读内存标记，绝不取父节点的 lifecycle 锁——删除流程可能正在等父节点的
+        // lifecycle 锁（由在飞的 apply 持有），而 apply 在等当前 Turn 结束，当前 Turn 可能正是
+        // 在调用 spawn；任何在这里等待父锁的实现都会造成三方互等。
+        if self
+            .references
+            .admissions
+            .agent(request.caller)
+            .is_retired()
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "agent `{}` is being deleted; refusing to spawn a child agent",
+                request.caller
+            )));
+        }
         if let Some(existing) = self.existing_child(child_id, &request).await? {
             let sequence = self.resume_existing_child(existing, &request).await?;
             return Ok(SpawnedChild {
@@ -324,27 +339,27 @@ impl AgentRuntime {
 
     /// 以 leaf→root 顺序关闭 `target` 的整棵子树。
     ///
-    /// `Preserve` 保留产品记录与工作区（容器会停止，工作区卷可再次挂载）；`Cleanup` 额外删除
-    /// 工作区卷与产品记录。调用方必须已经在更上层建立持久化屏障。
+    /// `Preserve` 保留产品记录与工作区：只关闭 canonical Thread 并停止执行环境，容器、
+    /// binding、`container_id` 收据与工作区卷都留给后续 `ensure` 复用。
+    /// `Cleanup` 是明确授权的资源删除，在整棵树停止之后交给 `delete_agent` 统一处理——
+    /// child-first、每个节点在自己的生命周期锁内按精确容器 ID 清理容器与 sidecar，再回收
+    /// 工作区卷与产品记录。两种 disposition 都在 canonical Thread 关闭失败时保留原 owner，
+    /// 调用方可以用同一 `target` 重试。调用方必须已经在更上层建立持久化屏障。
     pub(crate) async fn close_agent_tree(
         self: &Arc<Self>,
         target: AgentId,
         disposition: AgentWorkspaceDisposition,
     ) -> Result<()> {
         let order = descendant_close_order(target, self.agent_descendants(target).await);
-        let cleanup = matches!(disposition, AgentWorkspaceDisposition::Cleanup);
         for agent_id in order {
             self.close_agent_keeping_workspace(agent_id).await?;
             let summary = self.agent(agent_id).await?.summary.read().await.clone();
             if summary.parent_id.is_some() && summary.review_run_id.is_none() {
                 self.reconcile_child_reports(agent_id).await?;
             }
-            if cleanup {
-                self.cleanup_agent_workspace(agent_id).await?;
-            }
         }
-        if cleanup {
-            // 记录、artifact 与删除事件由既有的产品清理路径统一处理。
+        if matches!(disposition, AgentWorkspaceDisposition::Cleanup) {
+            // 容器必须先于工作区卷删除：卷还被环境容器挂载时无法回收。
             self.delete_agent(target).await?;
         }
         Ok(())
@@ -413,7 +428,11 @@ impl AgentRuntime {
         Ok(Some(sequence))
     }
 
-    /// 关闭一个 Agent 的 canonical Thread 与容器资源，保留产品记录与工作区。
+    /// 关闭一个 Agent 的 canonical Thread，并只停止（不删除）它的执行环境。
+    ///
+    /// 容器、binding、`container_id` 收据与工作区都保留：下一次 `ensure` 会按同一 binding
+    /// 重新验证并复用同一环境，而不是退回基础镜像重建。关闭 canonical Thread 失败时原 owner
+    /// 仍在，调用方可以用同一 id 重试。
     async fn close_agent_keeping_workspace(&self, agent_id: AgentId) -> Result<()> {
         self.state.thread_subscriptions.invalidate(agent_id).await;
         self.close_thread(agent_id).await?;

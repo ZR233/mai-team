@@ -1,7 +1,66 @@
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
+
+use serde::Deserialize;
 
 use crate::args::validate_image;
 use crate::error::{DockerError, Result};
+
+/// 受管快照镜像的收据事实；用于服务重启后按 operation 找回 commit 结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotImageFacts {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl SnapshotImageFacts {
+    pub fn label(&self, key: &str) -> Option<&str> {
+        self.labels.get(key).map(String::as_str)
+    }
+}
+
+/// 解析 `docker image inspect` 输出中的第一个镜像。
+pub(crate) fn snapshot_image_facts_from_inspect(json: &str) -> Result<Option<SnapshotImageFacts>> {
+    let inspected = serde_json::from_str::<Vec<InspectImage>>(json)?;
+    Ok(inspected.into_iter().next().map(SnapshotImageFacts::from))
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectImage {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "RepoTags")]
+    repo_tags: Option<Vec<String>>,
+    #[serde(rename = "Config")]
+    config: Option<InspectImageConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectImageConfig {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+impl From<InspectImage> for SnapshotImageFacts {
+    fn from(value: InspectImage) -> Self {
+        Self {
+            id: value.id,
+            repo_tags: value
+                .repo_tags
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tag| !tag.is_empty() && tag != "<none>:<none>")
+                .collect(),
+            labels: value
+                .config
+                .and_then(|config| config.labels)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageRefreshOutcome {

@@ -42,34 +42,42 @@ impl MaiThreadWorkspaceTools {
     ///
     /// 调用方必须先确保 Agent 容器已经驻留：命令与文件后端都在容器内解析路径，容器不存在
     /// 时装配会以显式错误失败，而不是发布一个指向不存在的物理后端的 Thread。
-    pub(crate) fn new(
+    ///
+    /// 装配时**一次性**取得本 Thread 的冻结环境租约，并把它交给命令与文件后端；此后所有
+    /// exec/readlink/cp/spawn/stdin 与后台进程清理都只使用该租约的 container_id，因此本 turn
+    /// 不会因为环境换代而漂移到另一个容器。租约还提供本 generation 已应用的参考只读根。
+    pub(crate) async fn new(
         runtime: Arc<AgentRuntime>,
         agent_id: AgentId,
         summary: &AgentSummary,
-    ) -> Self {
+    ) -> Result<Self> {
+        let lease = runtime.environment_lease(agent_id).await?;
         let workspace = agent_workspace(summary);
         let access = match workspace.boundary() {
             WorkspaceBoundary::Confined => CommandAccess::WorkspaceOnly,
             WorkspaceBoundary::HostPermitted => CommandAccess::HostGranted,
         };
         let root = workspace.root().to_path_buf();
-        let container = Arc::new(MaiContainerBackend::new(Arc::clone(&runtime), agent_id));
+        let container = Arc::new(MaiContainerBackend::new(
+            Arc::clone(&runtime),
+            Arc::clone(&lease),
+        ));
         let files = Arc::new(MaiWorkspaceFileBackend::new(container, &workspace));
         let commands = Arc::new(MaiCommandBackend::new(
             Arc::clone(&runtime),
-            agent_id,
+            lease,
             root.clone(),
         ));
         let archive = Arc::new(MaiResourceStore::new(thread_resources_root(
             &runtime.artifact_files_root,
         )));
-        Self {
+        Ok(Self {
             workspace: ToolWorkspace::new(workspace),
             commands,
             archive,
             files,
             access,
-        }
+        })
     }
 }
 
@@ -152,6 +160,7 @@ fn workspace_from_assignment(assignment: &AgentWorkspaceAssignmentSnapshot) -> A
         ),
         AgentWorkspaceMode::Unrestricted => AgentWorkspace::local(root),
         AgentWorkspaceMode::Worktree => AgentWorkspace::worktree(project_root, root),
+        AgentWorkspaceMode::Review => AgentWorkspace::confined(root, WorkspaceMutability::ReadOnly),
     }
 }
 
@@ -181,7 +190,9 @@ pub(crate) fn child_workspace_assignment(
             Some(paths) => Some(normalize_writable_paths(&project_root, paths)?),
             None => None,
         },
-        AgentWorkspaceMode::Unrestricted | AgentWorkspaceMode::Worktree => {
+        AgentWorkspaceMode::Unrestricted
+        | AgentWorkspaceMode::Worktree
+        | AgentWorkspaceMode::Review => {
             if writable_paths.is_some_and(|paths| !paths.is_empty()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "role `{role}` uses an unrestricted workspace and does not accept writable paths"
@@ -196,6 +207,7 @@ pub(crate) fn child_workspace_assignment(
         root: project_root,
         writable_paths,
         worktree: None,
+        review_target: None,
     })
 }
 
@@ -239,6 +251,7 @@ mod tests {
             root: "/workspace/repo".to_string(),
             writable_paths: Some(vec!["/workspace/repo/src".to_string()]),
             worktree: None,
+            review_target: None,
         };
 
         let workspace = workspace_from_assignment(&assignment);
@@ -259,6 +272,7 @@ mod tests {
             root: "/workspace/repo".to_string(),
             writable_paths: None,
             worktree: None,
+            review_target: None,
         };
 
         let workspace = workspace_from_assignment(&assignment);

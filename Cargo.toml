@@ -2,6 +2,7 @@
 members = [
     "crates/mai-docker",
     "crates/mai-protocol",
+    "crates/mai-references",
     "crates/mai-relay",
     "crates/mai-relay-client",
     "crates/mai-runtime",
@@ -22,11 +23,11 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "https://github.com/ZR233/pure-lang.git", branch = "main", default-features = false, features = ["sqlite"] }
-pl-model = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
-pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
-pl-trace = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
-pl-tool = { git = "https://github.com/ZR233/pure-lang.git", branch = "main" }
+pl-core = { git = "https://github.com/ZR233/anywork.git", rev = "8fd235ac748901ff0709c2fa65bb2475e8edf48b", default-features = false, features = ["sqlite"] }
+pl-model = { git = "https://github.com/ZR233/anywork.git", rev = "8fd235ac748901ff0709c2fa65bb2475e8edf48b" }
+pl-protocol = { git = "https://github.com/ZR233/anywork.git", rev = "8fd235ac748901ff0709c2fa65bb2475e8edf48b" }
+pl-trace = { git = "https://github.com/ZR233/anywork.git", rev = "8fd235ac748901ff0709c2fa65bb2475e8edf48b" }
+pl-tool = { git = "https://github.com/ZR233/anywork.git", rev = "8fd235ac748901ff0709c2fa65bb2475e8edf48b" }
 
 schemars = "1"
 shell-words = "1"

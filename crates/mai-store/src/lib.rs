@@ -31,8 +31,18 @@ mod git_accounts;
 mod github_app;
 pub use github_app::GithubAppIdentity;
 mod logs;
+mod parent_saves;
 mod project_pull_request_states;
 mod projects;
+mod reference_schema;
+mod references;
+mod resource_deletion;
+pub use references::{
+    PersistedReferenceBinding, PersistedReferenceOperation, ReferenceApplyScope,
+    ReferenceResourceOwners,
+};
+mod migration;
+pub use migration::{ProductMigrationReport, check_product_database, migrate_product_database};
 mod records;
 mod relay;
 mod review_ci_watches;
@@ -74,6 +84,8 @@ const DEFAULT_RELAY_NODE_ID: &str = "mai-server";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("{code}: {message}")]
+    ReferenceConflict { code: &'static str, message: String },
     #[error("toasty error: {0}")]
     Toasty(#[from] toasty::Error),
     #[error("io error: {0}")]

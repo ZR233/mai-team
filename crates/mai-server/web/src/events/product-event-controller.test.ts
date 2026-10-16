@@ -70,6 +70,53 @@ describe("product event cache projection", () => {
 
     expect(client.getQueryState(queryKeys.providers)?.isInvalidated).toBe(false)
   })
+
+  it("invalidates only the affected project references for a references change", () => {
+    const client = new QueryClient()
+    const first = queryKeys.projectReferences("project-1")
+    const firstStatus = queryKeys.projectReferencesStatus("project-1")
+    const second = queryKeys.projectReferences("project-2")
+    client.setQueryData(first, { configuration: { revision: 0, bindings: [] } })
+    client.setQueryData(firstStatus, { state: "pending" })
+    client.setQueryData(second, { configuration: { revision: 0, bindings: [] } })
+
+    applyProductEvent(client, event("project_references_changed", { project_id: "project-1", revision: 2 }))
+
+    expect(client.getQueryState(first)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(firstStatus)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(second)?.isInvalidated).toBe(false)
+  })
+
+  it("invalidates the application status without touching the durable configuration", () => {
+    const client = new QueryClient()
+    const configuration = queryKeys.projectReferences("project-1")
+    const status = queryKeys.projectReferencesStatus("project-1")
+    client.setQueryData(configuration, { configuration: { revision: 1, bindings: [] } })
+    client.setQueryData(status, { state: "pending" })
+
+    applyProductEvent(client, event("agent_reference_application_changed", {
+      project_id: "project-1",
+      agent_id: "agent-1",
+      operation_id: "op-1",
+      state: "applied",
+    }))
+
+    expect(client.getQueryState(status)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(configuration)?.isInvalidated).toBe(false)
+  })
+
+  it("invalidates the registered source list for a source change", () => {
+    const client = new QueryClient()
+    const list = queryKeys.referenceSources
+    const projects = queryKeys.projects
+    client.setQueryData(list, [])
+    client.setQueryData(projects, [])
+
+    applyProductEvent(client, event("reference_source_changed", { source_id: "source-1", state: "ready" }))
+
+    expect(client.getQueryState(list)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(projects)?.isInvalidated).toBe(false)
+  })
 })
 
 function event(type: string, payload: Record<string, unknown>): ProductEventEnvelope {

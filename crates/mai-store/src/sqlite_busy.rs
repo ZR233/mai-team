@@ -41,6 +41,7 @@ pub fn is_retryable_sqlite_error(err: &StoreError) -> bool {
         | StoreError::Time(_)
         | StoreError::Parse(_)
         | StoreError::DataIntegrity(_)
-        | StoreError::InvalidConfig(_) => false,
+        | StoreError::InvalidConfig(_)
+        | StoreError::ReferenceConflict { .. } => false,
     }
 }

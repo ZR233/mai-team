@@ -37,6 +37,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let addr = config.bind_addr;
     let listener = bind_server_listener(addr).await?;
 
+    fs::create_dir_all(&paths.data_dir)?;
+    let _data_directory_lease = crate::maintenance::DataDirectoryLease::acquire(&paths.data_dir)?;
+
     let docker = DockerClient::new(config.images.agent_base_image.clone());
     let docker_version = docker.check_available().await?;
     info!("docker available: {docker_version}");
@@ -69,6 +72,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     );
 
     let runtime_config = RuntimeConfig {
+        reference_application_observer: None,
         repo_root: env::current_dir()?,
         projects_root: paths.projects_root.clone(),
         sessions_root: paths.data_dir.join("sessions"),
@@ -79,7 +83,15 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         git_binary: None,
         system_skills_root: Some(system_skills_root),
         system_agents_root: Some(system_agents_root),
+        // 参考源码策略文件由部署管理员维护：server 只接线路径，读取与校验由运行时域层完成。
+        references_policy_path: config.reference_policy.clone(),
     };
+    if let Some(policy_path) = config.reference_policy.as_deref() {
+        info!(
+            path = %policy_path.display(),
+            "reference source policy configured"
+        );
+    }
     info!(
         data_dir = %paths.data_dir.display(),
         cache_dir = %paths.cache_dir.display(),
@@ -113,13 +125,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     )
     .await?;
     relay.set_runtime(Arc::clone(&runtime)).await;
-    let cleaned = runtime.cleanup_orphaned_containers().await?;
-    if !cleaned.is_empty() {
-        info!(
-            count = cleaned.len(),
-            "removed orphaned mai-team containers"
-        );
-    }
     ensure_startup_chat_environment(&runtime).await?;
     let shutdown_runtime = Arc::clone(&runtime);
     let shutdown = CancellationToken::new();
@@ -326,6 +331,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_chat_finishes_background_startup_with_its_existing_environment() {
+        let dir = tempdir().expect("tempdir");
+        let store = Arc::new(
+            mai_store::MaiStore::open_in_data_dir(dir.path())
+                .await
+                .expect("store"),
+        );
+        mai_runtime::seed_default_provider_from_env(
+            &store,
+            Some("isolated-fixture".into()),
+            "http://127.0.0.1:1/v1".into(),
+            "gpt-5.5".into(),
+        )
+        .await
+        .expect("确定性配置");
+        let runtime = test_runtime(&dir, store).await;
+        ensure_startup_chat_environment(&runtime)
+            .await
+            .expect("启动");
+        let root_id = runtime.list_environments().await[0].root_agent_id;
+        let mut ready = false;
+        for _ in 0..100 {
+            ready = runtime.list_agents().await.iter().any(|agent| {
+                agent.id == root_id
+                    && agent.resource.state == mai_protocol::AgentResourceState::Ready
+            });
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            ready,
+            "工具装配已准备好的环境经后台重复 ensure 后必须仍为 Ready"
+        );
+        runtime.shutdown().await.expect("关闭");
+    }
+
+    #[tokio::test]
     async fn startup_ensures_default_chat_environment_with_default_image() {
         let dir = tempdir().expect("tempdir");
         let database_path = dir.path().join("runtime.sqlite3");
@@ -407,6 +451,7 @@ mod tests {
             DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(dir)),
             store,
             RuntimeConfig {
+                reference_application_observer: None,
                 repo_root: dir.path().to_path_buf(),
                 projects_root: dir.path().join("projects"),
                 sessions_root: dir.path().join("sessions"),
@@ -417,6 +462,7 @@ mod tests {
                 git_binary: None,
                 system_skills_root: None,
                 system_agents_root: None,
+                references_policy_path: None,
             },
         )
         .await
@@ -425,34 +471,7 @@ mod tests {
 
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {
         let path = dir.path().join("fake-docker.sh");
-        std::fs::write(
-            &path,
-            r#"#!/bin/sh
-case "$1" in
-  ps)
-    exit 0
-    ;;
-  create)
-    echo "created-container"
-    exit 0
-    ;;
-  start)
-    exit 0
-    ;;
-  exec)
-    exit 0
-    ;;
-  version)
-    echo "test-version"
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-"#,
-        )
-        .expect("write fake docker");
+        std::fs::write(&path, include_str!("test_docker.py")).expect("write fake docker");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -25,6 +25,11 @@ pub(crate) struct ServerConfig {
     pub(crate) provider_seed: ProviderSeedConfig,
     pub(crate) images: ImageConfig,
     pub(crate) relay: RelayMode,
+    /// 部署侧参考源码策略文件路径。
+    ///
+    /// 只接线路径，server 不读取文件内容（由运行时域层读取校验），也不会并入可写的
+    /// 产品 `config.toml`。优先级：`--reference-policy` 高于 `MAI_REFERENCE_POLICY`。
+    pub(crate) reference_policy: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -53,6 +58,9 @@ impl ServerConfig {
                     .unwrap_or_else(|| "ghcr.io/zr233/mai-team-sidecar:latest".to_string()),
             },
             relay: RelayMode::from_env(env),
+            reference_policy: cli
+                .reference_policy
+                .or_else(|| env.var("MAI_REFERENCE_POLICY").map(PathBuf::from)),
         })
     }
 }
@@ -85,14 +93,21 @@ mod tests {
 
     #[test]
     fn uses_defaults_without_process_env_mutation() {
-        let config = ServerConfig::from_sources(Cli { data_path: None }, &TestEnv::default())
-            .expect("config");
+        let config = ServerConfig::from_sources(
+            Cli {
+                data_path: None,
+                reference_policy: None,
+            },
+            &TestEnv::default(),
+        )
+        .expect("config");
 
         assert_eq!(
             config.bind_addr,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
         );
         assert_eq!(config.data_path, None);
+        assert_eq!(config.reference_policy, None);
         assert_eq!(config.provider_seed.api_key, None);
         assert_eq!(config.provider_seed.base_url, "https://api.openai.com/v1");
         assert_eq!(config.provider_seed.model, "gpt-5.5");
@@ -117,11 +132,16 @@ mod tests {
             .with("MAI_SIDECAR_IMAGE", "sidecar:test")
             .with("MAI_BIND_ADDR", "127.0.0.1:9000")
             .with("MAI_RELAY_ENABLED", "1")
-            .with("MAI_RELAY_TOKEN", "relay-token");
+            .with("MAI_RELAY_TOKEN", "relay-token")
+            .with(
+                "MAI_REFERENCE_POLICY",
+                "/etc/mai-team/reference-policy.toml",
+            );
 
         let config = ServerConfig::from_sources(
             Cli {
                 data_path: Some(PathBuf::from("/tmp/mai-data")),
+                reference_policy: None,
             },
             &env,
         )
@@ -134,15 +154,44 @@ mod tests {
         assert_eq!(config.provider_seed.model, "test-model");
         assert_eq!(config.images.agent_base_image, "agent:test");
         assert_eq!(config.images.sidecar_image, "sidecar:test");
+        assert_eq!(
+            config.reference_policy,
+            Some(PathBuf::from("/etc/mai-team/reference-policy.toml"))
+        );
         assert!(matches!(config.relay, RelayMode::Enabled(_)));
+    }
+
+    #[test]
+    fn cli_reference_policy_overrides_env() {
+        let env = TestEnv::default().with("MAI_REFERENCE_POLICY", "/etc/mai-team/env-policy.toml");
+
+        let config = ServerConfig::from_sources(
+            Cli {
+                data_path: None,
+                reference_policy: Some(PathBuf::from("/etc/mai-team/flag-policy.toml")),
+            },
+            &env,
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.reference_policy,
+            Some(PathBuf::from("/etc/mai-team/flag-policy.toml"))
+        );
     }
 
     #[test]
     fn reports_invalid_bind_addr() {
         let env = TestEnv::default().with("MAI_BIND_ADDR", "not an addr");
 
-        let error = ServerConfig::from_sources(Cli { data_path: None }, &env)
-            .expect_err("invalid bind addr");
+        let error = ServerConfig::from_sources(
+            Cli {
+                data_path: None,
+                reference_policy: None,
+            },
+            &env,
+        )
+        .expect_err("invalid bind addr");
 
         assert!(error.to_string().contains("invalid MAI_BIND_ADDR"));
     }

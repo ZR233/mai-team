@@ -32,6 +32,134 @@ async fn store() -> (TempDir, MaiStore) {
     (dir, store)
 }
 
+#[tokio::test]
+async fn parent_save_preserves_reference_identity() {
+    let (_dir, store) = store().await;
+    let agent = test_agent_summary(Uuid::new_v4(), None, Utc::now());
+    let project = test_project_summary(Uuid::new_v4(), agent.id);
+    store
+        .insert_agent(&agent, Some("保留会话"))
+        .await
+        .expect("创建 Agent");
+    store.insert_project(&project).await.expect("创建项目");
+    let connection = rusqlite::Connection::open(store.path()).expect("打开产品库");
+    // 引用存在时，父对象的普通保存必须是 UPDATE，不能通过删除重建改变身份。
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reference_project_guard BEFORE DELETE ON projects BEGIN
+           SELECT RAISE(ABORT, 'project reference restrict'); END;
+         CREATE TRIGGER reference_agent_guard BEFORE DELETE ON agents BEGIN
+           SELECT RAISE(ABORT, 'agent reference restrict'); END;",
+        )
+        .expect("安装外键语义守卫");
+    store
+        .save_project(&project)
+        .await
+        .expect("保存项目不能删除身份");
+    store
+        .save_agent(&agent, Some("保留会话"))
+        .await
+        .expect("保存 Agent 不能删除身份");
+    let snapshot = store.load_runtime_snapshot(0).await.expect("读取快照");
+    assert_eq!(
+        serde_json::to_value(&snapshot.projects).expect("项目 JSON"),
+        json!([project])
+    );
+    assert_eq!(
+        serde_json::to_value(&persisted_agent(&snapshot, agent.id).summary).expect("Agent JSON"),
+        json!(agent)
+    );
+}
+
+#[tokio::test]
+async fn reference_cas_intents_and_stale_agent_save_preserve_published_generation() {
+    use mai_protocol::{
+        AppliedReferenceSnapshot, ProjectReferenceBinding, ReplaceProjectReferencesRequest,
+    };
+    let (_dir, store) = store().await;
+    let mut agent = test_agent_summary(Uuid::new_v4(), None, Utc::now());
+    let project = test_project_summary(Uuid::new_v4(), agent.id);
+    agent.project_id = Some(project.id);
+    agent.container_id = Some("old-container".into());
+    store.insert_project(&project).await.expect("项目");
+    store.insert_agent(&agent, None).await.expect("Agent");
+    let bindings = vec![ProjectReferenceBinding {
+        id: Uuid::new_v4(),
+        source_id: Uuid::new_v4(),
+        alias: "linux".into(),
+        description: "停用条目".into(),
+        enabled: false,
+    }];
+    let snapshot = AppliedReferenceSnapshot {
+        project_id: project.id,
+        configuration_revision: 1,
+        fingerprint: "empty-fingerprint".into(),
+        references: Vec::new(),
+        observed_at: Utc::now(),
+    };
+    let request = ReplaceProjectReferencesRequest {
+        expected_revision: 0,
+        bindings: bindings.clone(),
+    };
+    let saved = store
+        .replace_project_reference_configuration(project.id, request.clone(), snapshot.clone())
+        .await
+        .expect("CAS 保存");
+    assert_eq!(
+        serde_json::to_value(saved).expect("JSON"),
+        json!({"revision":1,"bindings":bindings})
+    );
+    assert!(matches!(
+        store
+            .replace_project_reference_configuration(project.id, request, snapshot.clone())
+            .await,
+        Err(StoreError::ReferenceConflict {
+            code: "revision_conflict",
+            ..
+        })
+    ));
+    let operations = store.reference_operations().await.expect("持久化意图");
+    assert_eq!(operations.len(), 1);
+    let binding = crate::PersistedReferenceBinding {
+        agent_id: agent.id,
+        project_id: Some(project.id),
+        generation: Uuid::new_v4(),
+        container_id: "new-container".into(),
+        effective_image_id: "sha256:snapshot".into(),
+        applied_revision: 1,
+        fingerprint: snapshot.fingerprint.clone(),
+        snapshot,
+        updated_at: Utc::now(),
+    };
+    store
+        .publish_reference_binding(binding.clone())
+        .await
+        .expect("发布绑定");
+    store
+        .save_agent(&agent, None)
+        .await
+        .expect("迟到的旧摘要保存");
+    let restored = store.load_runtime_snapshot(0).await.expect("恢复");
+    agent.container_id = Some("new-container".into());
+    let actual = &persisted_agent(&restored, agent.id).summary;
+    let mut expected = serde_json::to_value(&agent).expect("JSON");
+    expected["updated_at"] = json!(actual.updated_at);
+    assert_eq!(serde_json::to_value(actual).expect("JSON"), expected);
+    assert_eq!(
+        serde_json::to_value(store.reference_binding(agent.id).await.expect("绑定")).expect("JSON"),
+        json!(binding)
+    );
+    store
+        .delete_agent(agent.id)
+        .await
+        .expect("删除自身绑定和收据");
+    assert!(store.reference_operations().await.expect("收据").is_empty());
+    store
+        .delete_project(project.id)
+        .await
+        .expect("删除项目引用元数据");
+}
+
 fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> ProjectSummary {
     let timestamp = Utc::now();
     ProjectSummary {
@@ -104,6 +232,7 @@ fn test_workspace_assignment() -> AgentWorkspaceAssignmentSnapshot {
         root: "/workspace".to_string(),
         writable_paths: Some(vec!["src".to_string()]),
         worktree: None,
+        review_target: None,
     }
 }
 
@@ -180,14 +309,14 @@ async fn agent_review_run_id_round_trips_and_plain_agents_stay_none() {
     let plain_agent_id = Uuid::new_v4();
 
     store
-        .save_agent(
+        .insert_agent(
             &test_agent_summary(review_agent_id, Some(review_run_id), timestamp),
             None,
         )
         .await
         .expect("save review thread agent");
     store
-        .save_agent(
+        .insert_agent(
             &test_agent_summary(plain_agent_id, None, timestamp),
             Some("prompt"),
         )
@@ -211,7 +340,7 @@ async fn agent_review_run_id_loading_rejects_invalid_persisted_value() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     store
-        .save_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
+        .insert_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
         .await
         .expect("save agent");
 
@@ -241,11 +370,11 @@ async fn agent_profile_and_workspace_round_trip_and_plain_agents_stay_none() {
     assigned_agent.workspace = Some(workspace.clone());
 
     store
-        .save_agent(&assigned_agent, None)
+        .insert_agent(&assigned_agent, None)
         .await
         .expect("save assigned agent");
     store
-        .save_agent(&test_agent_summary(plain_agent_id, None, timestamp), None)
+        .insert_agent(&test_agent_summary(plain_agent_id, None, timestamp), None)
         .await
         .expect("save plain agent");
 
@@ -260,16 +389,16 @@ async fn agent_profile_and_workspace_round_trip_and_plain_agents_stay_none() {
 }
 
 #[tokio::test]
-async fn deleted_agents_schedule_session_retirement_and_recreation_cancels_it() {
+async fn retired_agent_keeps_its_tombstone_and_rejects_stale_saves() {
     let (_dir, store) = store().await;
     let deleted = Uuid::new_v4();
     let active = Uuid::new_v4();
     let now = Utc::now();
     for id in [deleted, active] {
         store
-            .save_agent(&test_agent_summary(id, None, now), None)
+            .insert_agent(&test_agent_summary(id, None, now), None)
             .await
-            .expect("save agent");
+            .expect("create agent");
     }
     store.delete_agent(deleted).await.expect("delete agent");
     assert_eq!(
@@ -286,18 +415,44 @@ async fn deleted_agents_schedule_session_retirement_and_recreation_cancels_it() 
             .expect("not yet expired"),
         Vec::<AgentId>::new()
     );
-    store
+
+    // 迟到（stale）的旧摘要既不能复活父行，也不能清掉墓碑：普通保存只做 UPDATE。
+    let resurrection = store
         .save_agent(&test_agent_summary(deleted, None, now), None)
         .await
-        .expect("recreate agent");
+        .expect_err("a stale save must fail once the agent was deleted");
+    assert!(
+        matches!(&resurrection, StoreError::ReferenceConflict { code, .. } if *code == "parent_agent_missing"),
+        "expected parent_agent_missing, got {resurrection:?}"
+    );
+    assert!(
+        store
+            .load_runtime_snapshot(0)
+            .await
+            .expect("snapshot")
+            .agents
+            .iter()
+            .all(|agent| agent.summary.id != deleted),
+        "a stale save must not resurrect the deleted agent row"
+    );
     assert_eq!(
         store
             .expired_agent_sessions(now + chrono::TimeDelta::days(1), 100)
             .await
-            .expect("retirement cancelled"),
-        Vec::<AgentId>::new()
+            .expect("tombstone preserved"),
+        vec![deleted],
+        "a stale save must not clear the retirement tombstone"
     );
-    store.delete_agent(deleted).await.expect("delete again");
+
+    // 退休 ID 不能被重用：墓碑只由 PL 会话退休完成后清理。
+    let reuse = store
+        .insert_agent(&test_agent_summary(deleted, None, now), None)
+        .await
+        .expect_err("a retired id must not be reused");
+    assert!(
+        matches!(&reuse, StoreError::ReferenceConflict { code, .. } if *code == "agent_id_retired"),
+        "expected agent_id_retired, got {reuse:?}"
+    );
     store
         .complete_agent_session_retirement(deleted)
         .await
@@ -309,6 +464,273 @@ async fn deleted_agents_schedule_session_retirement_and_recreation_cancels_it() 
             .expect("retirement complete"),
         Vec::<AgentId>::new()
     );
+    store
+        .insert_agent(&test_agent_summary(deleted, None, now), None)
+        .await
+        .expect("the id can be reused once the session retirement completed");
+}
+
+/// 缺陷敏感：创建端口不是 UPSERT，已存在的 ID 必须显式失败；重复的普通保存仍然成功，
+/// 并且不会改写 `created_at`。
+#[tokio::test]
+async fn parent_insert_rejects_existing_ids() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    let agent = test_agent_summary(agent_id, None, Utc::now());
+    store
+        .insert_agent(&agent, None)
+        .await
+        .expect("create agent");
+    let duplicate = store
+        .insert_agent(&agent, None)
+        .await
+        .expect_err("creating the same agent id twice must fail");
+    assert!(
+        matches!(&duplicate, StoreError::ReferenceConflict { code, .. } if *code == "parent_agent_exists"),
+        "expected parent_agent_exists, got {duplicate:?}"
+    );
+
+    let mut updated = agent.clone();
+    updated.name = "renamed".to_string();
+    updated.updated_at = Utc::now();
+    store.save_agent(&updated, None).await.expect("plain save");
+    let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
+    let (name, created_at): (String, String) = connection
+        .query_row(
+            "SELECT name, created_at FROM agents WHERE id=?1",
+            rusqlite::params![agent_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read agent row");
+    assert_eq!("renamed", name);
+    assert_eq!(
+        agent.created_at.to_rfc3339(),
+        created_at,
+        "普通保存不得改写 created_at"
+    );
+}
+
+/// 缺陷敏感：删除之后的旧 save 既不能复活项目行，也不能顺手重建一份空的引用配置；
+/// 创建端口同样拒绝已存在的项目 ID。
+#[tokio::test]
+async fn deleted_project_is_not_resurrected_by_stale_saves() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let project = test_project_summary(project_id, Uuid::new_v4());
+    store
+        .insert_project(&project)
+        .await
+        .expect("create project");
+
+    let duplicate = store
+        .insert_project(&project)
+        .await
+        .expect_err("creating the same project id twice must fail");
+    assert!(
+        matches!(&duplicate, StoreError::ReferenceConflict { code, .. } if *code == "parent_project_exists"),
+        "expected parent_project_exists, got {duplicate:?}"
+    );
+
+    store
+        .delete_project(project_id)
+        .await
+        .expect("delete project");
+    let resurrection = store
+        .save_project(&project)
+        .await
+        .expect_err("a stale save must fail once the project was deleted");
+    assert!(
+        matches!(&resurrection, StoreError::ReferenceConflict { code, .. } if *code == "parent_project_missing"),
+        "expected parent_project_missing, got {resurrection:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(store.load_projects().await.expect("load projects")).expect("json"),
+        json!([]),
+        "a stale save must not resurrect the deleted project row"
+    );
+    let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
+    let configs: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM project_reference_configs WHERE project_id=?1",
+            rusqlite::params![project_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count reference configs");
+    assert_eq!(
+        0, configs,
+        "a stale save must not recreate an empty reference configuration"
+    );
+}
+
+/// 缺陷敏感：项目进入 `Deleting` 之后，迟到的旧摘要不能把状态改回 `Ready`；
+/// 而删除流程自身的推进（继续写 `Deleting`）不能被这条守卫挡住。
+#[tokio::test]
+async fn deleting_project_rejects_saves_that_flip_the_status_back() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let project = test_project_summary(project_id, Uuid::new_v4());
+    store
+        .insert_project(&project)
+        .await
+        .expect("create project");
+
+    let mut deleting = project.clone();
+    deleting.status = ProjectStatus::Deleting;
+    deleting.updated_at = Utc::now();
+    store.save_project(&deleting).await.expect("mark deleting");
+
+    let stale = store
+        .save_project(&project)
+        .await
+        .expect_err("a stale ready summary must not overwrite Deleting");
+    assert!(
+        matches!(&stale, StoreError::ReferenceConflict { code, .. } if *code == "parent_project_deleting"),
+        "expected parent_project_deleting, got {stale:?}"
+    );
+    let projects = store.load_projects().await.expect("load projects");
+    assert_eq!(
+        vec![ProjectStatus::Deleting],
+        projects
+            .iter()
+            .map(|project| project.status.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let mut still_deleting = deleting.clone();
+    still_deleting.last_error = Some("still deleting".to_string());
+    still_deleting.updated_at = Utc::now();
+    store
+        .save_project(&still_deleting)
+        .await
+        .expect("deleting progress save");
+    assert_eq!(
+        Some("still deleting".to_string()),
+        store
+            .load_projects()
+            .await
+            .expect("load projects")
+            .first()
+            .and_then(|project| project.last_error.clone())
+    );
+}
+
+/// 缺陷敏感：普通父保存只做 UPDATE，不得删除引用绑定/应用收据，也不得改写引用配置，
+/// 并且 `container_id` 投影仍然由 binding 拥有。
+#[tokio::test]
+async fn plain_parent_saves_preserve_reference_receipts() {
+    use mai_protocol::{
+        AppliedReferenceSnapshot, ProjectReferenceBinding, ReferenceApplyPolicy,
+        ReplaceProjectReferencesRequest,
+    };
+    let (_dir, store) = store().await;
+    let mut agent = test_agent_summary(Uuid::new_v4(), None, Utc::now());
+    let project = test_project_summary(Uuid::new_v4(), agent.id);
+    agent.project_id = Some(project.id);
+    agent.container_id = Some("stale-container".into());
+    store
+        .insert_project(&project)
+        .await
+        .expect("create project");
+    store
+        .insert_agent(&agent, None)
+        .await
+        .expect("create agent");
+
+    // 停用条目不要求参考源已就绪，足以验证普通保存不会动引用元数据。
+    let bindings = vec![ProjectReferenceBinding {
+        id: Uuid::new_v4(),
+        source_id: Uuid::new_v4(),
+        alias: "linux".into(),
+        description: "保留条目".into(),
+        enabled: false,
+    }];
+    let snapshot = AppliedReferenceSnapshot {
+        project_id: project.id,
+        configuration_revision: 1,
+        fingerprint: "parent-save-fingerprint".into(),
+        references: Vec::new(),
+        observed_at: Utc::now(),
+    };
+    let saved = store
+        .replace_project_reference_configuration(
+            project.id,
+            ReplaceProjectReferencesRequest {
+                expected_revision: 0,
+                bindings: bindings.clone(),
+            },
+            snapshot.clone(),
+        )
+        .await
+        .expect("save configuration");
+    assert_eq!(1, saved.revision);
+    let binding = crate::PersistedReferenceBinding {
+        agent_id: agent.id,
+        project_id: Some(project.id),
+        generation: Uuid::new_v4(),
+        container_id: "binding-container".into(),
+        effective_image_id: "sha256:snapshot".into(),
+        applied_revision: 1,
+        fingerprint: snapshot.fingerprint.clone(),
+        snapshot: snapshot.clone(),
+        updated_at: Utc::now(),
+    };
+    store
+        .publish_reference_binding(binding.clone())
+        .await
+        .expect("publish binding");
+    store
+        .enqueue_reference_application(
+            project.id,
+            snapshot.clone(),
+            ReferenceApplyPolicy::StopAndApply,
+            crate::ReferenceApplyScope::Unapplied,
+        )
+        .await
+        .expect("enqueue application");
+    assert_eq!(
+        1,
+        store.reference_operations().await.expect("receipts").len()
+    );
+
+    for _ in 0..3 {
+        store
+            .save_agent(&agent, None)
+            .await
+            .expect("plain agent save");
+        store
+            .save_project(&project)
+            .await
+            .expect("plain project save");
+    }
+
+    assert_eq!(
+        serde_json::to_value(store.reference_binding(agent.id).await.expect("binding"))
+            .expect("binding json"),
+        json!(binding),
+        "普通保存不得改写或删除引用绑定"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .project_reference_configuration(project.id)
+                .await
+                .expect("configuration")
+        )
+        .expect("configuration json"),
+        json!({"revision": 1, "bindings": bindings}),
+        "普通保存不得改写引用配置"
+    );
+    assert_eq!(
+        1,
+        store.reference_operations().await.expect("receipts").len(),
+        "普通保存不得删除在飞的应用收据"
+    );
+    let restored = store.load_runtime_snapshot(0).await.expect("snapshot");
+    assert_eq!(
+        Some("binding-container".to_string()),
+        persisted_agent(&restored, agent.id).summary.container_id,
+        "container_id 投影仍然由 binding 拥有"
+    );
 }
 
 #[tokio::test]
@@ -316,7 +738,7 @@ async fn agent_workspace_loading_rejects_invalid_persisted_json() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     store
-        .save_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
+        .insert_agent(&test_agent_summary(agent_id, None, Utc::now()), None)
         .await
         .expect("save agent");
 
@@ -345,6 +767,10 @@ async fn agent_workspace_loading_rejects_invalid_persisted_json() {
 async fn save_project_waits_for_temporary_sqlite_write_lock() {
     let (_dir, store) = store().await;
     let project = test_project_summary(Uuid::new_v4(), Uuid::new_v4());
+    store
+        .insert_project(&project)
+        .await
+        .expect("create project before holding the write lock");
     let path = store.path().to_path_buf();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -1240,7 +1666,7 @@ async fn delete_project_removes_review_runs() {
     let maintainer_agent_id = Uuid::new_v4();
     let timestamp = Utc::now();
     store
-        .save_project(&ProjectSummary {
+        .insert_project(&ProjectSummary {
             id: project_id,
             name: "owner/repo".to_string(),
             status: ProjectStatus::Ready,
@@ -1408,7 +1834,7 @@ async fn schema_version_mismatch_is_rejected_without_data_loss() {
             .to_string()
             .contains(&format!("仅支持 {}", crate::schema::SCHEMA_VERSION))
     );
-    assert!(error.to_string().contains("创建新数据目录"));
+    assert!(error.to_string().contains("mai-migrate-references"));
     let connection = rusqlite::Connection::open(db_path).expect("inspect preserved database");
     let preserved: i64 = connection
         .query_row(
@@ -4392,3 +4818,9 @@ fn test_review_job(
         finished_at: None,
     }
 }
+
+#[path = "reference_fence_tests.rs"]
+mod reference_fence_tests;
+
+#[path = "reference_transaction_tests.rs"]
+mod reference_transaction_tests;

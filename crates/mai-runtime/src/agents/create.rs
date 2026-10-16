@@ -44,7 +44,11 @@ pub(crate) trait AgentCreateOps: Send + Sync {
         model: Option<&str>,
     ) -> impl Future<Output = Result<pl_model::config::ResolvedModelRoute>> + Send;
 
-    fn save_agent(
+    /// 创建新的产品 Agent 行；ID 已存在或仍在退休流程里时必须显式失败。
+    ///
+    /// 创建与普通更新是两个端口：后续的状态更新走 `save_agent`（只 UPDATE），不会
+    /// 通过 UPSERT 复活已经删除的父行。
+    fn insert_agent_row(
         &self,
         summary: &AgentSummary,
         system_prompt: Option<&str>,
@@ -101,7 +105,9 @@ pub(crate) async fn create_agent_record(
         updated_at: created_at,
         usage: RuntimeUsageSnapshot::default(),
     };
-    ops.save_agent(&summary, system_prompt.as_deref()).await?;
+    // 创建只走 INSERT：ID 冲突或旧会话仍在退休流程时显式失败，不会覆盖已存在的父行。
+    ops.insert_agent_row(&summary, system_prompt.as_deref())
+        .await?;
     let agent = Arc::new(AgentRecord {
         summary: RwLock::new(summary.clone()),
         registration_pending: std::sync::atomic::AtomicBool::new(true),

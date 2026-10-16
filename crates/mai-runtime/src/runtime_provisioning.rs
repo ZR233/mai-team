@@ -86,6 +86,11 @@ impl AgentRuntime {
     }
 
     /// 统一收尾：注册成功后提交创建租约并公布事件，失败则回滚全部产品资源。
+    ///
+    /// `commit` 之前还有一道非阻塞的父退役检查：注册可能跨越"删除采样确认 → 提交"的窗口，
+    /// 命中时必须在提交前退出，让创建租约回滚刚装配好的 Thread 与产品资源，而不是留下一个
+    /// 父记录已被删除、谁也找不到的孤儿 child。检查只读内存标记，不取父节点的 lifecycle 锁，
+    /// 因此不会与"apply 等当前 Turn、当前 Turn 在 spawn"形成互等。
     async fn finish_agent_registration(
         self: &Arc<Self>,
         resource: runtime_agent_creation::PreparedAgentResource,
@@ -93,6 +98,20 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         match registered {
             Ok(_) => {
+                if let Some(parent_id) = resource.parent_id()
+                    && (self.references.admissions.agent(parent_id).is_retired()
+                        || self.agent(parent_id).await.is_err())
+                {
+                    let rejection = RuntimeError::InvalidInput(format!(
+                        "parent agent `{parent_id}` is being retired; refusing to register a new child"
+                    ));
+                    return match resource.rollback().await {
+                        Ok(()) => Err(rejection),
+                        Err(rollback_error) => Err(RuntimeError::InvalidInput(format!(
+                            "child registration rejected by parent retirement: {rejection}; creation rollback failed: {rollback_error}"
+                        ))),
+                    };
+                }
                 if let Ok(agent) = self.agent(resource.id()).await {
                     agent.registration_pending.store(false, Ordering::Release);
                 }
@@ -239,7 +258,19 @@ impl AgentRuntime {
         if summary.status != ProjectStatus::Ready
             || summary.clone_status != ProjectCloneStatus::Ready
         {
-            return Ok(source);
+            // 只有仍在创建中的项目可以按既有设计使用默认 source（例如克隆期间的维护者容器）。
+            // 项目正在删除或已经失败时绝不退回基础镜像/CloneFrom 默认路径：那会把"项目环境已经
+            // 不可用"伪装成一次正常创建，绕开删除与失败终态。（项目不存在时 `project()` 已经
+            // 显式失败，同样不会走到这里。）
+            return match summary.status {
+                ProjectStatus::Creating | ProjectStatus::Ready => Ok(source),
+                ProjectStatus::Deleting | ProjectStatus::Failed => {
+                    Err(RuntimeError::InvalidInput(format!(
+                        "project `{project_id}` is {} ({}), refusing to fall back to a default container source",
+                        summary.status, summary.clone_status
+                    )))
+                }
+            };
         }
         let workspace_volume =
             project_agent_workspace_volume(&summary.id.to_string(), &agent_id.to_string());

@@ -200,6 +200,9 @@ fn open_product_event_connection(path: &Path) -> Result<Connection> {
 
 fn event_agent_id(event: &MaiProductEventEnvelope) -> Option<AgentId> {
     match &event.kind {
+        MaiProductEventKind::AgentReferenceApplicationChanged { agent_id, .. } => Some(*agent_id),
+        MaiProductEventKind::ProjectReferencesChanged { .. }
+        | MaiProductEventKind::ReferenceSourceChanged { .. } => None,
         MaiProductEventKind::AgentCreated { agent }
         | MaiProductEventKind::AgentUpdated { agent } => Some(agent.id),
         MaiProductEventKind::AgentDeleted { agent_id }

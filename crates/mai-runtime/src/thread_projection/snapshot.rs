@@ -206,6 +206,7 @@ pub(crate) fn project_runtime(
         .into_iter()
         .collect();
     Ok(ThreadRuntimeSnapshot {
+        live_usage: None,
         thread_id: thread_id.to_owned(),
         model_route: None,
         usage: ThreadRuntimeUsage {

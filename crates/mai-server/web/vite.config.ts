@@ -33,6 +33,8 @@ export default defineConfig({
       "/provider-catalog": apiProxy(),
       "/providers": apiProxy({ spaNavigation: true }),
       "/projects": apiProxy({ spaNavigation: true }),
+      "/reference-source-policy": apiProxy(),
+      "/reference-sources": apiProxy(),
       "/relay": apiProxy(),
       "/runtime": apiProxy(),
       "/threads": apiProxy(),

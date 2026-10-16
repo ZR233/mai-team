@@ -5,6 +5,8 @@ import { Link } from "react-router-dom"
 import { toast } from "sonner"
 
 import { api, jsonBody } from "@/api/client"
+import type { ProjectReferenceBinding } from "@/api/reference-types"
+import { referenceSourcesQuery } from "@/api/queries"
 import type {
   GitAccountsResponse,
   GithubAppSettings,
@@ -28,6 +30,8 @@ import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import { ReferenceBindingsEditor } from "@/features/references/reference-bindings-editor"
+import { defaultReferenceLimits, validateBindings } from "@/features/references/reference-form"
 
 type SourceMode = "git_account" | "github_app"
 
@@ -41,6 +45,7 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: {
   const app = useQuery({ queryKey: queryKeys.githubApp, queryFn: () => api<GithubAppSettings>("/settings/github-app"), enabled: open })
   const installations = useQuery({ queryKey: [...queryKeys.githubApp, "installations"], queryFn: () => api<{ installations: GithubInstallationSummary[] }>("/github/installations"), enabled: open })
   const defaults = useQuery({ queryKey: ["runtime-defaults"], queryFn: () => api<RuntimeDefaults>("/runtime/defaults"), enabled: open, staleTime: Number.POSITIVE_INFINITY })
+  const referenceSources = useQuery({ ...referenceSourcesQuery(), enabled: open })
   const [mode, setMode] = useState<SourceMode>("git_account")
   const [sourceId, setSourceId] = useState("")
   const [repositoryName, setRepositoryName] = useState("")
@@ -50,6 +55,9 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: {
   const [image, setImage] = useState("")
   const [autoReview, setAutoReview] = useState(false)
   const [reviewerPrompt, setReviewerPrompt] = useState("")
+  const [referenceBindings, setReferenceBindings] = useState<ProjectReferenceBinding[]>([])
+
+  const referenceValidation = validateBindings(referenceBindings, defaultReferenceLimits)
 
   const sources = useMemo(
     () => mode === "git_account" ? accounts.data?.accounts ?? [] : installations.data?.installations ?? [],
@@ -99,6 +107,13 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: {
           docker_image: image.trim() || null,
           auto_review_enabled: autoReview,
           reviewer_extra_prompt: reviewerPrompt.trim() || null,
+          reference_bindings: referenceBindings.map((binding) => ({
+            id: binding.id,
+            source_id: binding.source_id,
+            alias: binding.alias.trim(),
+            description: binding.description.trim(),
+            enabled: binding.enabled,
+          })),
         }),
       })
     },
@@ -144,7 +159,27 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: {
         <Alert><AlertDescription><StatusBadge status={selected ? "ready" : "incomplete"} /> <span className="ml-2">{selected ? `${selected.full_name} is ready to provision.` : "Choose a repository to continue."}</span></AlertDescription></Alert>
       </FieldGroup>
     </div>}
-    <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button disabled={!selected || create.isPending || (mode === "github_app" && !selectedInstallation?.events.includes("pull_request"))} onClick={() => create.mutate()}>{create.isPending && <Spinner data-icon="inline-start" />} {create.isPending ? "Creating…" : "Create project"}</Button></DialogFooter>
+    <section className="flex flex-col gap-3 rounded-lg border p-4">
+      <div>
+        <h3 className="text-sm font-medium">Reference sources</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Bind verified read-only snapshots now so the first agent container starts with them. You can still edit them
+          later in the project’s References tab.
+        </p>
+      </div>
+      {referenceSources.isLoading
+        ? <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground"><Spinner /> Loading registered sources…</div>
+        : <ReferenceBindingsEditor
+          bindings={referenceBindings}
+          sources={referenceSources.data ?? []}
+          limits={defaultReferenceLimits}
+          validation={referenceValidation}
+          disabled={create.isPending}
+          emptyAction={<Button asChild variant="outline" size="sm"><Link to="/settings/reference-sources">Register a source</Link></Button>}
+          onChange={setReferenceBindings}
+        />}
+    </section>
+    <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button disabled={!selected || create.isPending || !referenceValidation.valid || (mode === "github_app" && !selectedInstallation?.events.includes("pull_request"))} onClick={() => create.mutate()}>{create.isPending && <Spinner data-icon="inline-start" />} {create.isPending ? "Creating…" : "Create project"}</Button></DialogFooter>
   </DialogContent></Dialog>
 }
 
