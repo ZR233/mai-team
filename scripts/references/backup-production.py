@@ -26,13 +26,24 @@ if resume:
     assert backup.parent == ROOT/'backups' and backup.name.startswith('shared-references-')
     assert (backup/'data-inventory.json').is_file() and not (backup/'integrity.json').exists()
     stamp = backup.name.removeprefix('shared-references-')
-with sqlite3.connect('file:' + str(ROOT / 'data/mai-team.sqlite3') + '?mode=ro', uri=True) as db:
+database = ROOT / 'data/mai-team.sqlite3'
+if resume:
+    # SQLite 的只读 WAL 读取仍可能触碰 SHM 时间戳；续备份检查只打开临时副本。
+    check_dir = backup/'resume-counts'
+    check_dir.mkdir(exist_ok=True, mode=0o700)
+    for suffix in ('', '-wal', '-shm'):
+        source = pathlib.Path(str(database)+suffix)
+        if source.exists():
+            shutil.copy2(source, check_dir/source.name)
+    database = check_dir/database.name
+with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
     schema = db.execute("select value from settings where key='toasty_schema_version'").fetchone()[0]
     assert schema == '37', '本工具只承担首次 37→38 迁移备份；38 的操作收据须另行纳入备份'
     agent_containers = dict(db.execute('select id,container_id from agents'))
     agents = set(agent_containers)
     projects = set(x[0] for x in db.execute('select id from projects'))
     counts = {t: db.execute('select count(*) from '+t).fetchone()[0] for t in ('projects','agents','product_events','project_review_runs')}
+db.close()
 ids = docker('ps', '-aq').split()
 containers = json.loads(docker('inspect', *ids)) if ids else []
 owned = []
