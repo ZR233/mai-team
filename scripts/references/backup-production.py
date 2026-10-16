@@ -15,8 +15,9 @@ def docker(*args):
 state = subprocess.check_output(['systemctl','show','mai-server.service','--property=ActiveState','--value'],text=True).strip()
 pid = subprocess.check_output(['systemctl','show','mai-server.service','--property=MainPID','--value'],text=True).strip()
 check_only = sys.argv[1:] == ['--check']
-resume = len(sys.argv) == 3 and sys.argv[1] == '--resume'
-assert not sys.argv[1:] or check_only or resume, '仅接受 --check、--resume <备份目录> 或不带参数执行备份'
+resources_only = len(sys.argv) == 3 and sys.argv[1] == '--resume-resources'
+resume = len(sys.argv) == 3 and sys.argv[1] in ('--resume', '--resume-resources')
+assert not sys.argv[1:] or check_only or resume, '仅接受 --check、--resume / --resume-resources <备份目录> 或不带参数执行备份'
 if not check_only:
     assert state in ('inactive','failed') and pid == '0', '必须先排空并完全停服'
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -113,7 +114,7 @@ def sha256_file(path):
             digest.update(chunk)
     return digest.hexdigest()
 
-def tree_inventory(path):
+def tree_inventory(path, *, content=True):
     digest = hashlib.sha256()
     files = size = 0
     for base, dirs, names in os.walk(path, followlinks=False):
@@ -121,7 +122,7 @@ def tree_inventory(path):
             item = pathlib.Path(base) / name
             st = item.lstat()
             target = os.readlink(item) if item.is_symlink() else None
-            record = [str(item.relative_to(path)), st.st_mode, st.st_uid, st.st_gid, 0 if stat.S_ISDIR(st.st_mode) else st.st_size, st.st_mtime_ns, target, sha256_file(item) if stat.S_ISREG(st.st_mode) else None]
+            record = [str(item.relative_to(path)), st.st_mode, st.st_uid, st.st_gid, 0 if stat.S_ISDIR(st.st_mode) else st.st_size, st.st_mtime_ns, target, sha256_file(item) if content and stat.S_ISREG(st.st_mode) else None]
             digest.update(json.dumps(record,ensure_ascii=False).encode()+b'\n')
             files += 1
             if stat.S_ISREG(st.st_mode): size += st.st_size
@@ -132,12 +133,21 @@ for source, destination in configuration_copies:
         assert tree_inventory(source) == tree_inventory(destination), '部署配置备份不一致：'+str(source)
     else:
         assert sha256_file(source) == sha256_file(destination), '服务 unit 备份不一致'
-data_inventory = tree_inventory(ROOT/'data')
-if resume:
-    assert data_inventory == json.loads((backup/'data-inventory.json').read_text()), '停服数据在备份中断后发生改变'
+if resources_only:
+    # 完整内容摘要已经持久化；保持停服，复核全部元数据及数据库三件套后只续资源阶段。
+    assert tree_inventory(ROOT/'data', content=False) == tree_inventory(backup/'data', content=False)
+    for suffix in ('', '-wal', '-shm'):
+        source = ROOT/'data'/('mai-team.sqlite3'+suffix)
+        if source.exists():
+            assert sha256_file(source) == sha256_file(backup/'data'/source.name)
+    data_inventory = json.loads((backup/'data-inventory.json').read_text())
 else:
-    assert data_inventory == tree_inventory(backup/'data'), '产品数据备份元数据不一致'
-(backup/'data-inventory.json').write_text(json.dumps(data_inventory,indent=2))
+    data_inventory = tree_inventory(ROOT/'data')
+    if resume:
+        assert data_inventory == json.loads((backup/'data-inventory.json').read_text()), '停服数据在备份中断后发生改变'
+    else:
+        assert data_inventory == tree_inventory(backup/'data'), '产品数据备份元数据不一致'
+    (backup/'data-inventory.json').write_text(json.dumps(data_inventory,indent=2))
 images = set(c['Image'] for c in owned)
 snapshots = {}
 for c in owned:
@@ -150,7 +160,8 @@ for c in owned:
     snapshots[c['Id']] = {'image_id':image,'tag':tag,'name':c['Name']}
     (backup/'snapshots.json').write_text(json.dumps(snapshots,indent=2))
 (backup/'images.json').write_text(json.dumps(sorted(images),indent=2))
-run(['docker','--host',SOCKET,'image','save','-o',str(backup/'images.tar'),*sorted(images)])
+if not resources_only or not (backup/'images.tar').exists():
+    run(['docker','--host',SOCKET,'image','save','-o',str(backup/'images.tar'),*sorted(images)])
 with tarfile.open(backup/'images.tar', 'r:') as archive:
     saved = json.load(archive.extractfile('manifest.json'))
     saved_ids = set()
@@ -158,6 +169,29 @@ with tarfile.open(backup/'images.tar', 'r:') as archive:
         saved_ids.add('sha256:'+hashlib.sha256(archive.extractfile(image['Config']).read()).hexdigest())
         for layer in image['Layers']:
             archive.getmember(layer)
+    if 'index.json' in archive.getnames():
+        # containerd image store 的镜像 ID 是 OCI descriptor 摘要，逐层核对实际 blob。
+        pending_descriptors = json.load(archive.extractfile('index.json'))['manifests']
+        verified = set()
+        while pending_descriptors:
+            descriptor = pending_descriptors.pop()
+            digest = descriptor['digest']
+            if digest in verified:
+                continue
+            algorithm, hexadecimal = digest.split(':', 1)
+            assert algorithm == 'sha256' and len(hexadecimal) == 64
+            member = archive.getmember('blobs/sha256/'+hexadecimal)
+            assert member.size == descriptor['size']
+            with archive.extractfile(member) as blob:
+                assert hashlib.file_digest(blob, 'sha256').hexdigest() == hexadecimal
+            verified.add(digest)
+            if descriptor['mediaType'].endswith('+json'):
+                document = json.load(archive.extractfile(member))
+                pending_descriptors.extend(document.get('manifests', []))
+                pending_descriptors.extend(document.get('layers', []))
+                if isinstance(document.get('config'), dict):
+                    pending_descriptors.append(document['config'])
+        saved_ids.update(verified)
     assert images <= saved_ids, '镜像归档没有覆盖全部恢复镜像'
 
 volumes = sorted(volume_names)
