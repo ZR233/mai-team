@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import urllib.request
 
@@ -35,6 +36,7 @@ report = {'exported_at': datetime.datetime.now(datetime.timezone.utc).isoformat(
           'backup': read(backup / 'backup-manifest.json'),
           'backup_integrity': read(backup / 'integrity.json'),
           'native_oci_verification': read(backup / 'archive-verification.json'),
+          'backup_image_load': read(evidence / 'backup-image-load.json'),
           'history_repair': {name: read(repair / (name + '.json')) for name in ('repair', 'sessions', 'verification')},
           'source': read(evidence / 'linux-source.json'),
           'mounts_after_resume': read(evidence / 'linux-mounts-after-resume.json'),
@@ -58,6 +60,13 @@ assert report['reference_status']['state'] == 'applied'
 assert report['reference_status']['counts']['failed'] == report['reference_status']['counts']['waiting'] == 0
 assert report['current_review_outcome']['terminal'], '等待恢复后的当前 head 审查终态'
 assert all(job['status'] != 'failed' for job in report['current_review_outcome']['timeline'][-1]['jobs'])
+with sqlite3.connect('file:' + str(root / 'data/mai-team.sqlite3') + '?mode=ro', uri=True) as db:
+    report['review_submission_receipts'] = []
+    for job in report['current_review_outcome']['timeline'][-1]['jobs']:
+        raw = db.execute('SELECT submission_receipt_json FROM project_review_jobs WHERE id=?', (job['id'],)).fetchone()[0]
+        if raw:
+            receipt = json.loads(raw)
+            report['review_submission_receipts'].append({key: receipt[key] for key in ('github_review_id', 'event', 'head_sha', 'html_url', 'submitted_at')})
 assert not report['history_repair']['verification']['missing_history_primary_keys']
 assert len(report['history_repair']['verification']['restored_session_checks']) == 5
 print(json.dumps(report, ensure_ascii=False, indent=2))
