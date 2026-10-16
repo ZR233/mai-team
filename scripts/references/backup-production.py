@@ -15,11 +15,17 @@ def docker(*args):
 state = subprocess.check_output(['systemctl','show','mai-server.service','--property=ActiveState','--value'],text=True).strip()
 pid = subprocess.check_output(['systemctl','show','mai-server.service','--property=MainPID','--value'],text=True).strip()
 check_only = sys.argv[1:] == ['--check']
-assert not sys.argv[1:] or check_only, '仅接受 --check 或不带参数执行备份'
+resume = len(sys.argv) == 3 and sys.argv[1] == '--resume'
+assert not sys.argv[1:] or check_only or resume, '仅接受 --check、--resume <备份目录> 或不带参数执行备份'
 if not check_only:
     assert state in ('inactive','failed') and pid == '0', '必须先排空并完全停服'
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 backup = ROOT / 'backups' / ('shared-references-' + stamp)
+if resume:
+    backup = pathlib.Path(sys.argv[2]).resolve()
+    assert backup.parent == ROOT/'backups' and backup.name.startswith('shared-references-')
+    assert (backup/'data-inventory.json').is_file() and not (backup/'integrity.json').exists()
+    stamp = backup.name.removeprefix('shared-references-')
 with sqlite3.connect('file:' + str(ROOT / 'data/mai-team.sqlite3') + '?mode=ro', uri=True) as db:
     schema = db.execute("select value from settings where key='toasty_schema_version'").fetchone()[0]
     assert schema == '37', '本工具只承担首次 37→38 迁移备份；38 的操作收据须另行纳入备份'
@@ -52,31 +58,43 @@ assert len(volume_metadata) == len(volume_names), '备份卷身份不完整'
 if check_only:
     print(json.dumps({'check':'ok','schema':schema,'agents':len(agents),'containers':len(owned),'volumes':len(volume_metadata),'counts':counts}))
     sys.exit(0)
-backup.mkdir(parents=True, mode=0o700)
-os.chmod(backup.parent, 0o700)
-(backup/'container-inventory.json').write_text(json.dumps(owned, indent=2))
-(backup/'selected-resources.json').write_text(json.dumps([c['Id'] for c in owned], indent=2))
-(backup/'counts.json').write_text(json.dumps(counts, indent=2))
-(backup/'service-unit.txt').write_text(subprocess.check_output(['systemctl','cat','mai-server.service'],text=True))
 configuration_copies = []
-for source in ('/etc/mai-server','/etc/systemd/system/mai-server.service','/etc/systemd/system/mai-server.service.d'):
-    if pathlib.Path(source).exists():
-        destination = backup / 'etc' / source.lstrip('/')
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        run(['cp','-a', source, str(destination)])
-        configuration_copies.append((pathlib.Path(source), destination))
-shutil.copy2(ROOT/'bin/mai-server', backup/'mai-server')
-review_settings = ROOT/'deployments/shared-references-original-review.json'
-if review_settings.exists():
-    shutil.copy2(review_settings, backup/'original-review-settings.json')
-held_queue = ROOT/'deployments/shared-references-held-queue.json'
-if held_queue.exists():
-    shutil.copy2(held_queue, backup/'held-queue.json')
-running = [c['Id'] for c in owned if c['State']['Running']]
-if running:
-    run(['docker','--host',SOCKET,'stop','--time','30',*running],stdout=subprocess.DEVNULL)
-resources_quiesced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-run(['cp','-a','--reflink=auto',str(ROOT/'data'),str(backup/'data')])
+if resume:
+    recorded = json.loads((backup/'container-inventory.json').read_text())
+    assert {c['Id'] for c in owned} == {c['Id'] for c in recorded}, '停服后的资源身份发生改变'
+    assert not any(c['State']['Running'] for c in owned), '恢复备份时容器必须保持停止'
+    assert json.loads((backup/'counts.json').read_text()) == counts
+    owned = recorded
+    resources_quiesced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for source in ('/etc/mai-server','/etc/systemd/system/mai-server.service','/etc/systemd/system/mai-server.service.d'):
+        if pathlib.Path(source).exists():
+            configuration_copies.append((pathlib.Path(source), backup/'etc'/source.lstrip('/')))
+else:
+    backup.mkdir(parents=True, mode=0o700)
+    os.chmod(backup.parent, 0o700)
+    (backup/'container-inventory.json').write_text(json.dumps(owned, indent=2))
+    (backup/'selected-resources.json').write_text(json.dumps([c['Id'] for c in owned], indent=2))
+    (backup/'counts.json').write_text(json.dumps(counts, indent=2))
+    (backup/'service-unit.txt').write_text(subprocess.check_output(['systemctl','cat','mai-server.service'],text=True))
+    configuration_copies = []
+    for source in ('/etc/mai-server','/etc/systemd/system/mai-server.service','/etc/systemd/system/mai-server.service.d'):
+        if pathlib.Path(source).exists():
+            destination = backup / 'etc' / source.lstrip('/')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            run(['cp','-a', source, str(destination)])
+            configuration_copies.append((pathlib.Path(source), destination))
+    shutil.copy2(ROOT/'bin/mai-server', backup/'mai-server')
+    review_settings = ROOT/'deployments/shared-references-original-review.json'
+    if review_settings.exists():
+        shutil.copy2(review_settings, backup/'original-review-settings.json')
+    held_queue = ROOT/'deployments/shared-references-held-queue.json'
+    if held_queue.exists():
+        shutil.copy2(held_queue, backup/'held-queue.json')
+    running = [c['Id'] for c in owned if c['State']['Running']]
+    if running:
+        run(['docker','--host',SOCKET,'stop','--time','30',*running],stdout=subprocess.DEVNULL)
+    resources_quiesced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    run(['cp','-a','--reflink=auto',str(ROOT/'data'),str(backup/'data')])
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as source:
@@ -104,13 +122,19 @@ for source, destination in configuration_copies:
     else:
         assert sha256_file(source) == sha256_file(destination), '服务 unit 备份不一致'
 data_inventory = tree_inventory(ROOT/'data')
-assert data_inventory == tree_inventory(backup/'data'), '产品数据备份元数据不一致'
+if resume:
+    assert data_inventory == json.loads((backup/'data-inventory.json').read_text()), '停服数据在备份中断后发生改变'
+else:
+    assert data_inventory == tree_inventory(backup/'data'), '产品数据备份元数据不一致'
 (backup/'data-inventory.json').write_text(json.dumps(data_inventory,indent=2))
 images = set(c['Image'] for c in owned)
 snapshots = {}
 for c in owned:
     tag = 'mai-team-rollback:' + stamp.lower() + '-' + c['Id'][:12]
-    image = docker('commit','--pause=false',c['Id'],tag).strip()
+    if not resume:
+        docker('commit',c['Id'],tag)
+    image = docker('image','inspect','--format','{{.Id}}',tag).strip()
+    assert image.startswith('sha256:') and len(image) == 71, '镜像 ID 必须来自 inspect 的结构化字段'
     images.add(image)
     snapshots[c['Id']] = {'image_id':image,'tag':tag,'name':c['Name']}
     (backup/'snapshots.json').write_text(json.dumps(snapshots,indent=2))
@@ -131,7 +155,8 @@ volume_integrity = {}
 for volume in volume_metadata:
     destination = backup/'volumes'/volume['Name']
     destination.parent.mkdir(parents=True,exist_ok=True)
-    run(['cp','-a','--reflink=auto',volume['Mountpoint'],str(destination)])
+    if not destination.exists():
+        run(['cp','-a','--reflink=auto',volume['Mountpoint'],str(destination)])
     inventory = tree_inventory(pathlib.Path(volume['Mountpoint']))
     assert inventory == tree_inventory(destination), '卷备份内容不一致：'+volume['Name']
     volume_integrity[volume['Name']] = inventory
