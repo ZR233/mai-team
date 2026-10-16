@@ -250,7 +250,7 @@ pub async fn run(
     collect(host, agent_id, probe, &input_id, watched).await
 }
 
-/// 等待该 Agent 出现一个**新的**终态 turn，并按 probe 的 call id 收集 trace。
+/// 按 probe 的 call id 找到原始 Turn，等待工具终态结果。
 ///
 /// 用于 `spawn_agent` 交付给 child 的初始消息：那条 turn 不是驱动发送的，没有驱动侧输入
 /// 身份，但工具调用 id 仍由 fixture 固定为 `call_<probe_id>_<序号>`，判定照样精确。
@@ -261,12 +261,28 @@ pub async fn collect_latest(
     limit: Duration,
 ) -> Result<ProbeOutcome> {
     let deadline = tokio::time::Instant::now() + limit;
+    let expected_call = format!("call_{}_0", probe.probe_id());
     loop {
         let detail = host.agent_detail(agent_id).await?;
-        if let Some(turn) = detail
-            .summary
-            .last_turn
-            .clone()
+        let history = host
+            .runtime
+            .thread_turns(agent_id.to_string(), None, 50)
+            .await?;
+        // 后台工具完成会投递 inbox 并触发新 Turn；不能随“最近终态”切走原调用。
+        let original = history.turns.iter().find(|entry| {
+            entry
+                .items
+                .iter()
+                .filter_map(|item| item.tool())
+                .any(|tool| {
+                    tool.invocation()
+                        .call_id()
+                        .unwrap_or_else(|| tool.invocation().tool_call_id())
+                        == expected_call
+                })
+        });
+        if let Some(turn) = original
+            .map(|entry| entry.turn.clone())
             .filter(|turn| turn.state.is_terminal())
         {
             let watched = TurnWatch {
@@ -282,8 +298,10 @@ pub async fn collect_latest(
                 watched,
             )
             .await?;
-            // child 的初始消息可能先产生别的终态 turn；只有看到本 probe 的 call id 才算收敛。
-            if outcome.all_observed() || tokio::time::Instant::now() >= deadline {
+            // Turn 终态和工具投影可能分次可见；调用开始不能代替工具终态结果。
+            if (outcome.all_observed() && outcome.calls.iter().all(|call| call.success.is_some()))
+                || tokio::time::Instant::now() >= deadline
+            {
                 return Ok(outcome);
             }
         }

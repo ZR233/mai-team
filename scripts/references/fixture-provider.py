@@ -49,7 +49,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 probe = json.loads(text.split(marker, 1)[1])
                 break
         # 自动 Reviewer 初始消息来自产品。留出发现并提交 probe 的窗口，不伪造其工具结果。
-        if probe is None and any(text.startswith('Run one automatic pull request review for project `') for text in texts[-1:]):
+        if probe is None and any(text.startswith('Run one automatic pull request review for project `') for text in texts):
             time.sleep(30)
         response_id = 'resp_' + uuid.uuid4().hex
         model = request.get('model', 'gpt-5.5')

@@ -9,7 +9,9 @@
 
 use std::time::Duration;
 
-use mai_protocol::{AgentId, AgentRole, AgentSummary, ProjectId, ThreadTurnPage, TurnId};
+use mai_protocol::{
+    AgentId, AgentResourceState, AgentRole, AgentSummary, ProjectId, ThreadTurnPage, TurnId,
+};
 use tokio::time::sleep;
 
 use crate::error::Result;
@@ -30,7 +32,7 @@ pub struct ReviewerProbe {
     pub disappeared: Option<String>,
 }
 
-/// 等待真实 Reviewer Agent 出现并且已经拿到执行环境。
+/// 等待真实 Reviewer 完成创建；容器身份先于 Ready 发布，不能据此提前提交输入。
 pub async fn wait_for_reviewer(
     host: &RuntimeHost,
     project_id: ProjectId,
@@ -39,7 +41,13 @@ pub async fn wait_for_reviewer(
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         if let Some(summary) = current_reviewer(host, project_id).await?
+            && summary.resource.state == AgentResourceState::Ready
             && host.container_id(summary.id).await?.is_some()
+            && host
+                .runtime
+                .thread_snapshot(summary.id.to_string())
+                .await
+                .is_ok()
         {
             return Ok(Some(summary));
         }

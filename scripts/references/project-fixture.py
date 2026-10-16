@@ -144,7 +144,7 @@ def build_repository(fixture_dir):
     git(['commit', '--message', 'fixture pull request head commit'], cwd=scratch, env=env)
     head_sha = git(['rev-parse', 'HEAD'], cwd=scratch)
 
-    git(['push', str(bare), f'{DEFAULT_BRANCH}:refs/heads/{DEFAULT_BRANCH}'], cwd=scratch, env=env)
+    git(['push', str(bare), f'{base_sha}:refs/heads/{DEFAULT_BRANCH}'], cwd=scratch, env=env)
     git(['push', str(bare), f'HEAD:refs/pull/{PR_NUMBER}/head'], cwd=scratch, env=env)
     git(['--git-dir', str(bare), 'symbolic-ref', 'HEAD', f'refs/heads/{DEFAULT_BRANCH}'])
     return bare, base_sha, head_sha
