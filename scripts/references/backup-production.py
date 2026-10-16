@@ -69,6 +69,9 @@ shutil.copy2(ROOT/'bin/mai-server', backup/'mai-server')
 review_settings = ROOT/'deployments/shared-references-original-review.json'
 if review_settings.exists():
     shutil.copy2(review_settings, backup/'original-review-settings.json')
+held_queue = ROOT/'deployments/shared-references-held-queue.json'
+if held_queue.exists():
+    shutil.copy2(held_queue, backup/'held-queue.json')
 running = [c['Id'] for c in owned if c['State']['Running']]
 if running:
     run(['docker','--host',SOCKET,'stop','--time','30',*running],stdout=subprocess.DEVNULL)
