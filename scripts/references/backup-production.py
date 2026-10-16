@@ -173,9 +173,15 @@ with tarfile.open(backup/'images.tar', 'r:') as archive:
         # containerd image store 的镜像 ID 是 OCI descriptor 摘要，逐层核对实际 blob。
         pending_descriptors = json.load(archive.extractfile('index.json'))['manifests']
         verified = set()
+        skipped_platforms = []
+        native_os, native_arch = docker('version','--format','{{.Server.Os}}/{{.Server.Arch}}').strip().split('/')
         while pending_descriptors:
             descriptor = pending_descriptors.pop()
             digest = descriptor['digest']
+            platform = descriptor.get('platform')
+            if platform and (platform['os'], platform['architecture']) != (native_os, native_arch):
+                skipped_platforms.append({'digest': digest, 'platform': platform})
+                continue
             if digest in verified:
                 continue
             algorithm, hexadecimal = digest.split(':', 1)
@@ -185,13 +191,22 @@ with tarfile.open(backup/'images.tar', 'r:') as archive:
             with archive.extractfile(member) as blob:
                 assert hashlib.file_digest(blob, 'sha256').hexdigest() == hexadecimal
             verified.add(digest)
-            if descriptor['mediaType'].endswith('+json'):
+            if descriptor['mediaType'] in (
+                'application/vnd.oci.image.index.v1+json',
+                'application/vnd.oci.image.manifest.v1+json',
+                'application/vnd.docker.distribution.manifest.list.v2+json',
+                'application/vnd.docker.distribution.manifest.v2+json',
+            ):
                 document = json.load(archive.extractfile(member))
-                pending_descriptors.extend(document.get('manifests', []))
+                children = document.get('manifests', [])
+                if children:
+                    assert any(not d.get('platform') or (d['platform']['os'], d['platform']['architecture']) == (native_os, native_arch) for d in children), '镜像索引不含当前宿主平台'
+                pending_descriptors.extend(children)
                 pending_descriptors.extend(document.get('layers', []))
                 if isinstance(document.get('config'), dict):
                     pending_descriptors.append(document['config'])
         saved_ids.update(verified)
+        (backup/'archive-verification.json').write_text(json.dumps({'platform': native_os+'/'+native_arch, 'verified_descriptors': len(verified), 'excluded_platform_descriptors': skipped_platforms, 'requested_images': len(images)}, indent=2))
     assert images <= saved_ids, '镜像归档没有覆盖全部恢复镜像'
 
 volumes = sorted(volume_names)
