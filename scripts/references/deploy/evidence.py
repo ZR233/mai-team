@@ -45,7 +45,7 @@ for agent in agents:
 with sqlite3.connect('file:' + str(root / 'data/mai-team.sqlite3') + '?mode=ro', uri=True) as db:
     report['counts'] = {table: db.execute('select count(*) from ' + table).fetchone()[0]
                         for table in ('projects', 'agents', 'product_events', 'project_review_runs')}
-    report['schema'] = db.execute('pragma user_version').fetchone()[0]
+    report['schema'] = db.execute("select value from settings where key='toasty_schema_version'").fetchone()[0]
 with urllib.request.urlopen(base + '/', timeout=15) as response:
     html = response.read().decode()
     assert response.status == 200
