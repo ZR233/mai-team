@@ -109,6 +109,7 @@ pub(super) async fn spawn_generation_command(
         result
             .map(|status| CommandExit {
                 exit_code: status.code(),
+                capture: None,
             })
             .map_err(|error| format!("等待容器命令退出失败：{error}"))
     })?;

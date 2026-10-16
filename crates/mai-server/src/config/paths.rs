@@ -13,7 +13,7 @@ pub(crate) struct ServerPaths {
 
 impl ServerPaths {
     pub(crate) fn from_data_path(current_dir: &Path, data_path: Option<PathBuf>) -> Self {
-        let data_dir = data_path.unwrap_or_else(|| current_dir.join(".mai-team"));
+        let data_dir = current_dir.join(data_path.unwrap_or_else(|| PathBuf::from(".mai-team")));
         Self {
             cache_dir: data_dir.join("cache"),
             projects_root: data_dir.join("projects"),
@@ -68,5 +68,16 @@ mod tests {
 
         assert_eq!(paths.data_dir, data_dir);
         assert_eq!(paths.cache_dir, PathBuf::from("/tmp/mai-data/cache"));
+    }
+
+    #[test]
+    fn resolves_relative_data_path_before_any_directory_owner_opens_it() {
+        use pretty_assertions::assert_eq;
+
+        let current_dir = PathBuf::from("/workspace/mai-team");
+        assert_eq!(
+            ServerPaths::from_data_path(&current_dir, Some(PathBuf::from("data"))),
+            ServerPaths::from_data_path(&current_dir, Some(current_dir.join("data"))),
+        );
     }
 }

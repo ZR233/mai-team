@@ -25,6 +25,8 @@ reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -35,5 +37,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-rusqlite.workspace = true
 tempfile.workspace = true

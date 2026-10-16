@@ -24,7 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build server
-        run: cargo build --locked -p mai-server --bin mai-server --release
+        run: cargo build --locked -p mai-server --bin mai-server --bin mai-migrate-pl-sessions -p mai-store --bin mai-migrate-references --release
 
       - name: Package server
         shell: bash
@@ -32,7 +32,10 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/release/mai-server dist/mai-server
-          tar -C dist -czf mai-server-x86_64-unknown-linux-gnu.tar.gz mai-server
+          cp target/release/mai-migrate-pl-sessions dist/mai-migrate-pl-sessions
+          cp target/release/mai-migrate-references dist/mai-migrate-references
+          (cd dist && sha256sum mai-server mai-migrate-pl-sessions mai-migrate-references > SHA256SUMS)
+          tar -C dist -czf mai-server-x86_64-unknown-linux-gnu.tar.gz mai-server mai-migrate-pl-sessions mai-migrate-references SHA256SUMS
           sha256sum mai-server-x86_64-unknown-linux-gnu.tar.gz > mai-server-x86_64-unknown-linux-gnu.tar.gz.sha256
 
       - name: Upload release assets

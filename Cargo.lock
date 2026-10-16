@@ -2180,6 +2180,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -2579,7 +2580,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "fs4",
  "futures",
@@ -2598,7 +2599,7 @@ dependencies = [
 [[package]]
 name = "pl-lsp"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "futures",
  "lsp-server",
@@ -2618,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "pl-model"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "base64 0.23.1",
  "eventsource-stream",
@@ -2643,7 +2644,7 @@ dependencies = [
 [[package]]
 name = "pl-output"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "serde",
 ]
@@ -2651,7 +2652,7 @@ dependencies = [
 [[package]]
 name = "pl-patch"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2659,7 +2660,7 @@ dependencies = [
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "schemars",
  "serde",
@@ -2672,7 +2673,7 @@ dependencies = [
 [[package]]
 name = "pl-remote-helper"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "libc",
  "pl-protocol",
@@ -2687,7 +2688,7 @@ dependencies = [
 [[package]]
 name = "pl-skill-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "gray_matter",
  "serde",
@@ -2697,7 +2698,7 @@ dependencies = [
 [[package]]
 name = "pl-tool"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "base64 0.23.1",
  "dunce",
@@ -2737,7 +2738,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965#b4213a1f33ac6a8c1e2b1c403a9b4fe9ead32965"
+source = "git+https://github.com/ZR233/anywork.git?rev=8fd235ac748901ff0709c2fa65bb2475e8edf48b#8fd235ac748901ff0709c2fa65bb2475e8edf48b"
 dependencies = [
  "pl-core",
  "serde",

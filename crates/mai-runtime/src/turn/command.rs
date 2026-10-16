@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 use mai_protocol::ToolOutputArtifactInfo;
 use mai_references::AgentEnvironmentLease;
 use pl_tool::command::{
-    CommandBackend, CommandCaptureStream, CommandOutputSizes, CommandOutputTarget,
-    CommandSpawnRequest, ManagedCommand, command_output_model_path,
+    CommandBackend, CommandCaptureOwnership, CommandCaptureStream, CommandOutputSizes,
+    CommandOutputTarget, CommandSpawnRequest, ManagedCommand, command_output_model_path,
 };
 use pl_tool::shell::shell_quote_word;
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use super::command_capture::CommandCaptureFiles;
 use super::container::{
     MaiToolOutputCapture, MaiToolOutputStreamSizes, ensure_lease_active,
     tool_output_artifact_file_path,
@@ -24,9 +24,6 @@ use crate::{AgentRuntime, Result, RuntimeError};
 /// 因此 [`MaiCommandBackend::capture_storage_cost`] 按两份计费。达到上限即取消命令并等待其真实
 /// 结束，已写字节保留、由 artifact 归档，按 typed 输出上限报告。
 pub(crate) const MAI_COMMAND_CAPTURE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
-
-/// 每个 chunk 在合并文件里的 framing 折算（`=== STDOUT ===\n` 与补齐换行）。
-const MAI_COMMAND_CAPTURE_FRAME_BYTES: u64 = 16;
 
 /// Mai 的容器工作区命令后端。
 ///
@@ -41,7 +38,7 @@ pub(crate) struct MaiCommandBackend {
     lease: Arc<AgentEnvironmentLease>,
     workspace_root: PathBuf,
     captures: Arc<Mutex<HashMap<PathBuf, MaiToolOutputCapture>>>,
-    output_write_lock: Arc<tokio::sync::Mutex<()>>,
+    capture_files: Arc<CommandCaptureFiles>,
 }
 
 impl MaiCommandBackend {
@@ -55,7 +52,7 @@ impl MaiCommandBackend {
             lease,
             workspace_root: workspace_root.into(),
             captures: Arc::new(Mutex::new(HashMap::new())),
-            output_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            capture_files: Arc::new(CommandCaptureFiles::default()),
         }
     }
 
@@ -172,24 +169,17 @@ impl CommandBackend for MaiCommandBackend {
         Some(MAI_COMMAND_CAPTURE_LIMIT_BYTES)
     }
 
-    /// 同一个 chunk 会落两份：合并输出文件（带 framing）与它自己的 per-stream 捕获。
-    ///
-    /// 因此按 `chunk_len × 份数 + framing` 计费，让 PL 的共享额度约束**磁盘总量**，而不是只约束
-    /// 其中一份；否则真实占用会是声明上限的两倍。
+    fn capture_ownership(&self) -> CommandCaptureOwnership {
+        CommandCaptureOwnership::Manager
+    }
+
     fn capture_storage_cost(
         &self,
         target: &CommandOutputTarget,
         stream: CommandCaptureStream,
-        chunk_len: usize,
+        chunk: &[u8],
     ) -> u64 {
-        let stream_capture = match stream {
-            CommandCaptureStream::Stdout => target.stdout_capture_file(),
-            CommandCaptureStream::Stderr => target.stderr_capture_file(),
-        };
-        let copies = if stream_capture.is_some() { 2 } else { 1 };
-        (chunk_len as u64)
-            .saturating_mul(copies)
-            .saturating_add(MAI_COMMAND_CAPTURE_FRAME_BYTES)
+        CommandCaptureFiles::storage_cost(target, stream, chunk)
     }
 
     async fn resolve_cwd(
@@ -272,14 +262,11 @@ impl CommandBackend for MaiCommandBackend {
         target: &CommandOutputTarget,
         command: &str,
         working_directory: &str,
+        capture_limit_bytes: u64,
     ) -> Result<u64> {
-        let _guard = self.output_write_lock.lock().await;
-        if let Some(parent) = target.capture_file().parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let header = format!("=== COMMAND ===\n{command}\n\n=== CWD ===\n{working_directory}\n\n");
-        tokio::fs::write(target.capture_file(), header.as_bytes()).await?;
-        Ok(header.len() as u64)
+        self.capture_files
+            .prepare_output(target, command, working_directory, capture_limit_bytes)
+            .await
     }
 
     async fn append_output_chunk(
@@ -288,34 +275,9 @@ impl CommandBackend for MaiCommandBackend {
         stream: CommandCaptureStream,
         chunk: &[u8],
     ) -> Result<u64> {
-        let _guard = self.output_write_lock.lock().await;
-        let mut combined = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(target.capture_file())
-            .await?;
-        let (label, stream_file) = match stream {
-            CommandCaptureStream::Stdout => ("STDOUT", target.stdout_capture_file()),
-            CommandCaptureStream::Stderr => ("STDERR", target.stderr_capture_file()),
-        };
-        combined
-            .write_all(format!("=== {label} ===\n").as_bytes())
-            .await?;
-        combined.write_all(chunk).await?;
-        if !chunk.ends_with(b"\n") {
-            combined.write_all(b"\n").await?;
-        }
-        if let Some(stream_file) = stream_file {
-            let mut capture = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(stream_file)
-                .await?;
-            capture.write_all(chunk).await?;
-            capture.flush().await?;
-        }
-        combined.flush().await?;
-        Ok(combined.metadata().await?.len())
+        self.capture_files
+            .append_output_chunk(target, stream, chunk)
+            .await
     }
 
     async fn repair_output_chunk(
@@ -325,32 +287,9 @@ impl CommandBackend for MaiCommandBackend {
         committed_len: u64,
         chunk: &[u8],
     ) -> Result<u64> {
-        // 先把可能写坏的部分截断回上次确认的偏移，再按正常 append 的 frame 重放一次，
-        // 因此重复 repair 得到相同字节而不是重复追加，命令本身不会被重跑。
-        // 这里只修复模型可见的合并输出片段；artifact 的 per-stream 文件仍只由成功 append 写入。
-        let _guard = self.output_write_lock.lock().await;
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(capture_file)
-            .await?;
-        file.set_len(committed_len).await?;
-        drop(file);
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(capture_file)
-            .await?;
-        let label = match stream {
-            CommandCaptureStream::Stdout => "STDOUT",
-            CommandCaptureStream::Stderr => "STDERR",
-        };
-        file.write_all(format!("=== {label} ===\n").as_bytes())
-            .await?;
-        file.write_all(chunk).await?;
-        if !chunk.ends_with(b"\n") {
-            file.write_all(b"\n").await?;
-        }
-        file.flush().await?;
-        Ok(file.metadata().await?.len())
+        self.capture_files
+            .repair_output_chunk(capture_file, stream, committed_len, chunk)
+            .await
     }
 
     async fn publish_output(&self, target: &CommandOutputTarget) -> Result<()> {

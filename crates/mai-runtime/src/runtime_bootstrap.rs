@@ -423,7 +423,7 @@ impl AgentRuntime {
         self.session_history
             .open(product_agent_id)
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+            .map_err(RuntimeError::from)
     }
 
     /// 由已解析完成的产品事实构造并发布一个 canonical [`thread_kernel::ThreadSpec`]。

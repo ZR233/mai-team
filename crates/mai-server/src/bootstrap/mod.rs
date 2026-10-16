@@ -37,6 +37,9 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let addr = config.bind_addr;
     let listener = bind_server_listener(addr).await?;
 
+    fs::create_dir_all(&paths.data_dir)?;
+    let _data_directory_lease = crate::maintenance::DataDirectoryLease::acquire(&paths.data_dir)?;
+
     let docker = DockerClient::new(config.images.agent_base_image.clone());
     let docker_version = docker.check_available().await?;
     info!("docker available: {docker_version}");
