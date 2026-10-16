@@ -11,13 +11,18 @@ project = '760ebfac-5002-4574-84e4-acb0cca4d3ac'
 commit = '7b20d05fd38de8e0be168956f6fd241d750c7d69'
 path = '/mnt/docker_nvme/mai-references/linux/' + commit + '/repo'
 digest = 'sha256:d3cbb76d09dcd270b8bfddbedaaeb3b30708b9e33321ac5316d7ed2038df930e'
+projection_file = root.parent/'shared-references-bind-projection.json'
+projection = json.loads(projection_file.read_text()) if projection_file.exists() else None
+if projection:
+    assert projection['published_path'] == path and projection['same_device_inode']
+    path = projection['host_path']
 
 def api(route, body=None, method=None):
     request = urllib.request.Request(base + route, data=None if body is None else json.dumps(body).encode(),
                                      method=method, headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(request, timeout=90) as response:
-        assert response.status in (200, 202)
-        return json.load(response)
+        assert response.status in (200, 202, 204)
+        return None if response.status == 204 else json.load(response)
 
 policy = api('/reference-source-policy')
 assert policy['allowed_roots'] == [str(pathlib.Path(path).parent)]
@@ -46,6 +51,11 @@ if not config['bindings']:
         'id': str(uuid.uuid4()), 'source_id': source['id'], 'alias': 'linux',
         'description': 'Linux 7.2.10 固定只读源码，供内核、驱动及生命周期参考；不能在此编译或修改。',
         'enabled': True}]}, 'PUT')
+if projection and len(config['bindings']) == 1 and config['bindings'][0]['source_id'] != source['id']:
+    old_binding = config['bindings'][0]
+    assert old_binding['source_id'] == projection['replaces_source_id'] and old_binding['alias'] == 'linux' and old_binding['enabled']
+    replacement = dict(old_binding, source_id=source['id'])
+    config = api(route, {'expected_revision': config['revision'], 'bindings': [replacement]}, 'PUT')
 assert len(config['bindings']) == 1
 binding = config['bindings'][0]
 assert binding['source_id'] == source['id'] and binding['alias'] == 'linux' and binding['enabled']
@@ -69,3 +79,9 @@ while True:
 print(json.dumps({'project_id': project, 'revision': config['revision'], 'source_id': source['id'],
                   'state': status['state'], 'counts': counts,
                   'completed_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+
+if projection and projection['replaces_source_id'] != source['id']:
+    stale = [s for s in api('/reference-sources') if s['id'] == projection['replaces_source_id']]
+    if stale:
+        assert stale[0]['host_path'] == projection['published_path']
+        api('/reference-sources/'+stale[0]['id'], method='DELETE')

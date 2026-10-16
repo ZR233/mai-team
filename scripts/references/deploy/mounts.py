@@ -6,6 +6,11 @@ os.umask(0o077)
 root = pathlib.Path('/mnt/docker_nvme/mai-team/deployments/shared-references-evidence')
 project = '760ebfac-5002-4574-84e4-acb0cca4d3ac'
 source = '/mnt/docker_nvme/mai-references/linux/7b20d05fd38de8e0be168956f6fd241d750c7d69/repo'
+projection_file = root.parent/'shared-references-bind-projection.json'
+if projection_file.exists():
+    projection = json.loads(projection_file.read_text())
+    assert projection['published_path'] == source and projection['same_device_inode']
+    source = projection['host_path']
 with urllib.request.urlopen('http://127.0.0.1:8080/projects/' + project + '/references/status') as response:
     status = json.load(response)
 assert status['state'] == 'applied' and status['counts']['waiting'] == status['counts']['failed'] == 0
