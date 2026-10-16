@@ -26,6 +26,8 @@ impl From<mai_runtime::RuntimeError> for ApiError {
     fn from(value: mai_runtime::RuntimeError) -> Self {
         use mai_runtime::RuntimeError::*;
         let status = match &value {
+            Reference(error) => StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             AgentNotFound(_)
             | TaskNotFound(_)
             | ProjectNotFound(_)
@@ -62,6 +64,7 @@ impl From<mai_store::StoreError> for ApiError {
     fn from(value: mai_store::StoreError) -> Self {
         use mai_store::StoreError::*;
         let status = match &value {
+            ReferenceConflict { .. } => StatusCode::CONFLICT,
             InvalidConfig(_) | Parse(_) => StatusCode::BAD_REQUEST,
             Toasty(_) | Io(_) | Json(_) | Sqlite(_) | Toml(_) | TomlSer(_) | Time(_)
             | DataIntegrity(_) => StatusCode::INTERNAL_SERVER_ERROR,

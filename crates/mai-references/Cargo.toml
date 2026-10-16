@@ -1,0 +1,29 @@
+[package]
+name = "mai-references"
+version = "0.1.11"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mai-docker = { path = "../mai-docker", version = "0.1.11" }
+pl-core.workspace = true
+toml.workspace = true
+mai-store = { path = "../mai-store", version = "0.1.11" }
+tracing.workspace = true
+chrono.workspace = true
+mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
+serde.workspace = true
+serde_json.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

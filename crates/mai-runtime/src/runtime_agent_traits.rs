@@ -5,20 +5,26 @@ impl agents::AgentCloseOps for AgentRuntime {
         AgentRuntime::agent(self, agent_id).await
     }
 
-    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
-        AgentRuntime::persist_agent(self, agent).await
-    }
-
-    async fn delete_agent_containers(
+    /// 只停止（不删除）执行环境，并撤销该 Agent 的固定环境租约。
+    ///
+    /// 容器、`agent_reference_bindings` 与工作区数据全部保留：后续 `ensure` 会按同一 binding
+    /// 重新核验并复用同一环境，而不是退回基础镜像重建。容器已经不存在时视为已完成，
+    /// 因此这里既不代以删除，也不代以重建。
+    async fn release_agent_environment(
         &self,
         agent_id: AgentId,
-        preferred_container_id: Option<String>,
+        container_id: Option<String>,
     ) -> Result<Vec<String>> {
-        Ok(self
-            .deps
-            .docker
-            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
-            .await?)
+        let drain = self.references.leases.remove(agent_id).await;
+        let stopped = match container_id {
+            Some(container_id) => {
+                self.deps.docker.stop_container(&container_id).await?;
+                vec![container_id]
+            }
+            None => Vec::new(),
+        };
+        drain?;
+        Ok(stopped)
     }
 }
 
@@ -29,6 +35,7 @@ impl agents::AgentPurgeOps for AgentRuntime {
 
     async fn delete_agent_from_store(&self, agent_id: AgentId) -> Result<()> {
         self.deps.store.delete_agent(agent_id).await?;
+        self.references.reclaim_snapshot_resources().await?;
         Ok(())
     }
 
@@ -48,6 +55,10 @@ impl agents::AgentPurgeOps for AgentRuntime {
 }
 
 impl agents::AgentDeleteOps for AgentRuntime {
+    fn agent_admission(&self, agent_id: AgentId) -> Arc<mai_references::AgentAdmission> {
+        self.references.admissions.agent(agent_id)
+    }
+
     async fn close_canonical_agent(&self, agent_id: AgentId) -> Result<()> {
         // 只撤销当前 agent 的订阅；typed close 语义由 `close_thread` 保留，关闭失败时
         // 驻留 owner 仍在，调用方可对同一 id 重试。
@@ -55,45 +66,106 @@ impl agents::AgentDeleteOps for AgentRuntime {
         self.close_thread(agent_id).await
     }
 
-    async fn close_product_agent_resources(&self, agent_id: AgentId) -> Result<()> {
-        AgentRuntime::close_agent(self, agent_id).await
+    /// 撤销并移除环境租约，使残存句柄立即失效；容器删除留给运行资源清理。
+    async fn revoke_agent_environment_lease(&self, agent_id: AgentId) -> Result<()> {
+        let drain = self.references.leases.remove(agent_id).await;
+        if drain.is_err()
+            && let Some(binding) = self.deps.store.reference_binding(agent_id).await?
+        {
+            self.deps
+                .docker
+                .stop_container(&binding.container_id)
+                .await?;
+        }
+        drain?;
+        Ok(())
     }
 
-    async fn cleanup_agent_workspace(&self, agent_id: AgentId) -> Result<()> {
+    /// 关闭 MCP sidecar、按精确容器 ID 删除环境容器，然后回收该 Agent 自己的工作区。
+    ///
+    /// 容器必须先于工作区卷删除：卷还被环境容器挂载时无法回收。任何一步失败都要向上传播，
+    /// 让删除停在可重试状态，不假装删除成功；sidecar 在 `shutdown` 内部按 ID 删除失败时，
+    /// 下面的 `delete_agent_containers` 仍会覆盖同一批容器，失败不会被吞掉。
+    async fn delete_agent_runtime_resources(&self, agent_id: AgentId) -> Result<()> {
+        let agent = AgentRuntime::agent(self, agent_id).await?;
+        let mcp = agent.mcp.write().await.take();
+        if let Some(mcp) = mcp {
+            mcp.shutdown().await;
+        }
+        let preferred_container_id = match self.deps.store.reference_binding(agent_id).await? {
+            Some(binding) => Some(binding.container_id),
+            None => agent.summary.read().await.container_id.clone(),
+        };
+        self.deps
+            .docker
+            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
+            .await?;
+        *agent.container.write().await = None;
         AgentRuntime::cleanup_agent_workspace(self, agent_id).await
     }
 }
 
 impl agents::AgentFileOps for AgentRuntime {
-    fn container_id(
+    async fn environment_lease(
         &self,
         agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<String>> + Send {
-        AgentRuntime::container_id(self, agent_id)
+    ) -> Result<Arc<mai_references::AgentEnvironmentLease>> {
+        AgentRuntime::environment_lease(self, agent_id).await
     }
 
     async fn copy_to_container(
         &self,
-        container_id: String,
+        lease: Arc<mai_references::AgentEnvironmentLease>,
         local_path: PathBuf,
         container_path: String,
     ) -> Result<()> {
+        let admission = self.references.admissions.agent(lease.agent_id());
+        let _lifecycle = admission.lifecycle.lock().await;
+        lease.ensure_active()?;
+        if admission.pending_revision().is_some() {
+            return Err(mai_references::ReferenceError::new(
+                ReferenceErrorCode::EnvironmentNotReady,
+                "环境等待应用，暂不接收上传",
+            )
+            .into());
+        }
+        let runtime = self
+            .self_ref
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| RuntimeError::InvalidInput("Runtime 已关闭".into()))?;
+        let backend = turn::container::MaiContainerBackend::new(runtime, Arc::clone(&lease));
+        let policy = turn::container::ContainerWritePolicy::references_denied("/");
+        let path = backend
+            .authorize_container_write(&policy, None, &container_path)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.message()))?;
         self.deps
             .docker
-            .copy_to_container(&container_id, &local_path, &container_path)
+            .copy_to_container(lease.container_id(), &local_path, &path)
             .await?;
         Ok(())
     }
 
     async fn copy_from_container_tar(
         &self,
-        container_id: String,
+        lease: Arc<mai_references::AgentEnvironmentLease>,
         container_path: String,
     ) -> Result<Vec<u8>> {
+        let admission = self.references.admissions.agent(lease.agent_id());
+        let _lifecycle = admission.lifecycle.lock().await;
+        lease.ensure_active()?;
+        if admission.pending_revision().is_some() {
+            return Err(mai_references::ReferenceError::new(
+                ReferenceErrorCode::EnvironmentNotReady,
+                "环境等待应用，暂不接收文件请求",
+            )
+            .into());
+        }
         Ok(self
             .deps
             .docker
-            .copy_from_container_tar(&container_id, &container_path)
+            .copy_from_container_tar(lease.container_id(), &container_path)
             .await?)
     }
 }
@@ -189,8 +261,12 @@ impl agents::AgentCreateOps for AgentRuntime {
             .await
     }
 
-    async fn save_agent(&self, summary: &AgentSummary, system_prompt: Option<&str>) -> Result<()> {
-        self.deps.store.save_agent(summary, system_prompt).await?;
+    async fn insert_agent_row(
+        &self,
+        summary: &AgentSummary,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        self.deps.store.insert_agent(summary, system_prompt).await?;
         Ok(())
     }
 
@@ -201,117 +277,22 @@ impl agents::AgentCreateOps for AgentRuntime {
 }
 
 impl agents::AgentContainerOps for AgentRuntime {
+    fn environment_admission(&self, agent_id: AgentId) -> Arc<mai_references::AgentAdmission> {
+        self.references.admissions.agent(agent_id)
+    }
     async fn start_agent_container(
         &self,
         request: agents::AgentContainerStartRequest,
     ) -> Result<ContainerHandle> {
-        match request.source {
-            agents::ContainerSource::FreshImage => Ok(self
-                .deps
-                .docker
-                .ensure_agent_container_from_image(
-                    &request.agent_id.to_string(),
-                    request.preferred_container_id.as_deref(),
-                    &request.docker_image,
-                )
-                .await?),
-            agents::ContainerSource::ProjectReviewWorkspace { .. } => {
-                Err(RuntimeError::InvalidInput(
-                    "project review workspace source must be resolved before container startup"
-                        .to_string(),
-                ))
-            }
-            agents::ContainerSource::ProjectWorkspace {
-                workspace_volume,
-                repo_path,
-                repository_view,
-            } => {
-                if repo_path != projects::workspace::AGENT_WORKSPACE_REPO_PATH {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "unsupported project repo path `{repo_path}`"
-                    )));
-                }
-                self.ensure_agent_workspace_volume(
-                    request.agent_id,
-                    workspace_volume.as_str(),
-                    None,
-                )
-                .await?;
-                let mounts = match repository_view {
-                    Some(view) => {
-                        if view.container_path
-                            != projects::review::context::PROJECT_REPOSITORY_CONTAINER_PATH
-                        {
-                            return Err(RuntimeError::InvalidInput(format!(
-                                "unsupported project repository view path `{}`",
-                                view.container_path
-                            )));
-                        }
-                        vec![ContainerVolumeMount::read_only_subpath(
-                            view.volume,
-                            view.container_path,
-                            view.volume_subpath,
-                        )?]
-                    }
-                    None => Vec::new(),
-                };
-                Ok(self
-                    .deps
-                    .docker
-                    .ensure_agent_container_from_image_with_workspace_and_mounts(
-                        &request.agent_id.to_string(),
-                        request.preferred_container_id.as_deref(),
-                        &request.docker_image,
-                        Some(&workspace_volume),
-                        &mounts,
-                    )
-                    .await?)
-            }
-            agents::ContainerSource::CloneFrom {
-                parent_container_id,
-                docker_image,
-                workspace_volume,
-            } => {
-                if request.preferred_container_id.is_some() && workspace_volume.is_none() {
-                    Ok(self
-                        .deps
-                        .docker
-                        .ensure_agent_container_from_image(
-                            &request.agent_id.to_string(),
-                            request.preferred_container_id.as_deref(),
-                            &docker_image,
-                        )
-                        .await?)
-                } else {
-                    if let Some(workspace_volume) = workspace_volume.as_deref() {
-                        self.ensure_agent_workspace_volume(
-                            request.agent_id,
-                            workspace_volume,
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(self
-                        .deps
-                        .docker
-                        .create_agent_container_from_parent_with_workspace_and_mounts(
-                            &request.agent_id.to_string(),
-                            &parent_container_id,
-                            workspace_volume.as_deref(),
-                            &[],
-                        )
-                        .await?)
-                }
-            }
-        }
+        self.start_reference_environment(request).await
     }
 
     async fn remove_agent_container(&self, agent_id: AgentId, container_id: String) {
-        let _ = self
-            .deps
-            .docker
-            .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-            .await;
+        if let Err(error) = self.references.leases.remove(agent_id).await {
+            tracing::error!(%agent_id, %error, "MCP 装配失败后 generation 未收敛，保持阻塞");
+        }
+        self.references.admissions.agent(agent_id).block(0);
+        let _ = self.deps.docker.stop_container(&container_id).await;
     }
 
     async fn agent_mcp_runtime_config(
@@ -345,11 +326,17 @@ impl agents::AgentContainerOps for AgentRuntime {
         container_id: String,
         config: crate::mcp::ContainerMcpSettings,
     ) -> Result<crate::mcp::ContainerMcpRuntime> {
+        let lease = self.references.leases.acquire(agent_id).await?;
+        let mounts = mai_references::reference_mounts(lease.references())?;
         crate::mcp::ContainerMcpRuntime::start(
             self.deps.docker.clone(),
-            agent_id,
-            container_id,
-            &self.sidecar_image,
+            mai_docker::AgentMcpSidecarPlan::new(
+                agent_id.to_string(),
+                lease.generation(),
+                container_id,
+                &self.sidecar_image,
+                mounts,
+            )?,
             config,
         )
         .await

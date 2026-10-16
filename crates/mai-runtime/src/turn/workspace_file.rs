@@ -1,6 +1,7 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mai_references::AgentEnvironmentLease;
 use pl_protocol::PureError;
 use pl_tool::container::{ContainerBackend, ContainerExecRequest};
 use pl_tool::shell::shell_quote_word;
@@ -12,12 +13,18 @@ use pl_tool::workspace_file::{
     WorkspaceFileWriteRequest,
 };
 
-use super::container::MaiContainerBackend;
+use super::container::{
+    ContainerWritePolicy, MaiContainerBackend, normalize_container_path, path_is_within,
+};
 
 /// 将 PL 统一文件工具协议绑定到 Mai 容器和冻结 workspace receipt。
 ///
 /// PL 的容器 backend 负责传输；Mai 在产品边界实施虚拟容器路径和 directory
 /// writablePaths，避免宿主路径策略被错误套用到容器路径。
+///
+/// 读根 = 原读取根 ∪ 本 generation 已应用的各 `/references/<alias>`；写范围保持原样，但整个
+/// `/references` 命名空间优先拒写。写/删除与 `docker cp` 上传都走
+/// [`MaiContainerBackend::authorize_container_write`] 的同一套规范化 + 容器内解析两次校验。
 #[derive(Debug, Clone)]
 pub(crate) struct MaiWorkspaceFileBackend {
     backend: Arc<MaiContainerBackend>,
@@ -27,10 +34,13 @@ pub(crate) struct MaiWorkspaceFileBackend {
 
 impl MaiWorkspaceFileBackend {
     pub(crate) fn new(backend: Arc<MaiContainerBackend>, workspace: &AgentWorkspace) -> Self {
-        let read_roots = match workspace.boundary() {
+        let mut read_roots = match workspace.boundary() {
             WorkspaceBoundary::HostPermitted => vec![PathBuf::from("/")],
             WorkspaceBoundary::Confined => vec![workspace.root().to_path_buf()],
         };
+        // 参考源是**额外只读根**：只加读取，不改写范围，也不改变 reviewer 的只读语义。
+        // 只取租约里的 applied 快照，不重新查项目配置，因此读根与实际挂载的 generation 一致。
+        read_roots.extend(reference_read_roots(backend.lease()));
         let writable_roots = match (workspace.boundary(), workspace.writable_paths()) {
             (WorkspaceBoundary::HostPermitted, None) => vec![PathBuf::from("/")],
             (_, Some(paths)) => paths.to_vec(),
@@ -39,35 +49,37 @@ impl MaiWorkspaceFileBackend {
         Self {
             backend: backend.clone(),
             inner: ContainerWorkspaceFileBackend::new(backend),
-            policy: WorkspaceFilePolicy {
-                default_cwd: workspace.root().to_path_buf(),
+            policy: WorkspaceFilePolicy::new(
+                workspace.root().to_path_buf(),
                 read_roots,
                 writable_roots,
-            },
+            ),
         }
     }
 
+    /// 读路径：先按读根判规范化后的容器路径，再在容器内解析 readlink 并判解析后的最终路径。
+    ///
+    /// 参考源只是额外读根，因此 reviewer 的只读语义、原读取范围都不变。
     async fn resolve_read(&self, path: &str, cwd: Option<&str>) -> pl_protocol::Result<String> {
-        self.resolve_path(path, cwd, &self.policy.read_roots, "read_file")
-            .await
+        let lexical = self.policy.resolve_read(path, cwd, "read_file")?;
+        let resolved = self.resolve_in_container(&lexical, "read_file").await?;
+        self.policy
+            .authorize_read(Path::new(&resolved), "read_file")
     }
 
+    /// 写路径检查：规范化词法路径与容器内解析后的最终路径各判一次，`/references` 优先于写许可。
     async fn resolve_write(&self, path: &str, cwd: Option<&str>) -> pl_protocol::Result<String> {
-        self.resolve_path(path, cwd, &self.policy.writable_roots, "apply_patch")
+        self.backend
+            .authorize_container_write(&self.policy.write_policy, cwd, path)
             .await
+            .map_err(|refusal| file_error("apply_patch", refusal.message()))
     }
 
-    async fn resolve_path(
-        &self,
-        path: &str,
-        cwd: Option<&str>,
-        allowed_roots: &[PathBuf],
-        tool: &str,
-    ) -> pl_protocol::Result<String> {
-        let lexical = self.policy.resolve(path, cwd, allowed_roots, tool)?;
+    /// 在容器内解析一个已归一化容器路径的最终形态；解析失败显式报错，不降级成未校验路径。
+    async fn resolve_in_container(&self, lexical: &str, tool: &str) -> pl_protocol::Result<String> {
         let command = format!(
             "resolved=$(readlink -f -- {path}) || exit 2; printf '%s' \"$resolved\"",
-            path = shell_quote_word(&lexical),
+            path = shell_quote_word(lexical),
         );
         let output = self
             .backend
@@ -88,19 +100,21 @@ impl MaiWorkspaceFileBackend {
                 format!("container path `{lexical}` cannot be resolved"),
             ));
         }
-        if allowed_roots
-            .iter()
-            .any(|root| path_is_within(&resolved, root))
-        {
-            return Ok(resolved.to_string_lossy().into_owned());
-        }
-        Err(file_error(
-            tool,
-            format!(
-                "container path `{lexical}` resolves outside the frozen Agent workspace receipt"
-            ),
-        ))
+        Ok(resolved.to_string_lossy().into_owned())
     }
+}
+
+/// 本 generation 已应用的参考源在容器内的只读路径。
+///
+/// 只来自租约持有的 applied 快照：同一 Thread 的读根与实际挂载的 generation 必须一致，
+/// 不能按 agent 重新查一个已经换代的环境。
+fn reference_read_roots(lease: &AgentEnvironmentLease) -> Vec<PathBuf> {
+    lease
+        .references()
+        .references
+        .iter()
+        .map(|reference| PathBuf::from(&reference.container_path))
+        .collect()
 }
 
 impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
@@ -200,71 +214,48 @@ impl WorkspaceFileBackend for MaiWorkspaceFileBackend {
 struct WorkspaceFilePolicy {
     default_cwd: PathBuf,
     read_roots: Vec<PathBuf>,
-    writable_roots: Vec<PathBuf>,
+    /// 写许可：`/references` 整个命名空间优先拒写，其余沿用冻结后的原写范围。
+    write_policy: ContainerWritePolicy,
 }
 
 impl WorkspaceFilePolicy {
-    fn resolve(
+    fn new(default_cwd: PathBuf, read_roots: Vec<PathBuf>, writable_roots: Vec<PathBuf>) -> Self {
+        Self {
+            write_policy: ContainerWritePolicy::within(default_cwd.clone(), writable_roots),
+            default_cwd,
+            read_roots,
+        }
+    }
+
+    /// 读路径的规范化与读根判定；解析后的最终路径由调用方再判一次。
+    fn resolve_read(
         &self,
         path: &str,
         cwd: Option<&str>,
-        allowed_roots: &[PathBuf],
         tool: &str,
     ) -> pl_protocol::Result<String> {
-        let candidate = normalized_container_path(&self.default_cwd, cwd, path)
+        let candidate = normalize_container_path(&self.default_cwd, cwd, path)
             .map_err(|error| file_error(tool, error))?;
-        if allowed_roots
+        self.authorize_read(&candidate, tool)
+    }
+
+    /// 读许可判定：按路径组件边界比较，不做字符串前缀比较。
+    fn authorize_read(&self, path: &Path, tool: &str) -> pl_protocol::Result<String> {
+        if self
+            .read_roots
             .iter()
-            .any(|root| path_is_within(&candidate, root))
+            .any(|root| path_is_within(path, root))
         {
-            return Ok(candidate.to_string_lossy().into_owned());
+            return Ok(path.to_string_lossy().into_owned());
         }
         Err(file_error(
             tool,
             format!(
                 "container path `{}` is outside the frozen Agent workspace receipt",
-                candidate.display()
+                path.display()
             ),
         ))
     }
-}
-
-fn normalized_container_path(
-    default_cwd: &Path,
-    cwd: Option<&str>,
-    path: &str,
-) -> std::result::Result<PathBuf, String> {
-    if path.is_empty() || path.contains('\0') || path.contains('\\') {
-        return Err("container path is empty or contains an invalid separator".to_string());
-    }
-    let cwd = match cwd {
-        Some(cwd) if Path::new(cwd).is_absolute() => PathBuf::from(cwd),
-        Some(cwd) => default_cwd.join(cwd),
-        None => default_cwd.to_path_buf(),
-    };
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        cwd.join(path)
-    };
-    let mut normalized = PathBuf::from("/");
-    for component in candidate.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(part) => normalized.push(part),
-            Component::ParentDir => {
-                return Err("container path must not contain parent traversal".to_string());
-            }
-            Component::Prefix(_) => {
-                return Err("container path must use POSIX syntax".to_string());
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    path == root || path.strip_prefix(root).is_ok()
 }
 
 fn file_error(tool: &str, error: impl std::fmt::Display) -> PureError {
@@ -277,17 +268,19 @@ fn file_error(tool: &str, error: impl std::fmt::Display) -> PureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::container::ContainerWriteRefusal;
     use pretty_assertions::assert_eq;
 
     fn policy() -> WorkspaceFilePolicy {
-        WorkspaceFilePolicy {
-            default_cwd: PathBuf::from("/workspace/repo"),
-            read_roots: vec![
+        WorkspaceFilePolicy::new(
+            PathBuf::from("/workspace/repo"),
+            vec![
                 PathBuf::from("/workspace/repo"),
                 PathBuf::from("/project/repo"),
+                PathBuf::from("/references/linux"),
             ],
-            writable_roots: vec![PathBuf::from("/workspace/repo/crates/runtime")],
-        }
+            vec![PathBuf::from("/workspace/repo/crates/runtime")],
+        )
     }
 
     #[test]
@@ -295,24 +288,21 @@ mod tests {
         let policy = policy();
         assert_eq!(
             policy
-                .resolve(
+                .resolve_read(
                     "/project/repo/.agents/skills/review/SKILL.md",
                     None,
-                    &policy.read_roots,
                     "read_file",
                 )
                 .unwrap(),
             "/project/repo/.agents/skills/review/SKILL.md"
         );
-        assert!(
+        assert_eq!(
+            Err(ContainerWriteRefusal::OutsideWritableRoot {
+                path: "/project/repo/.agents/skills/review/SKILL.md".to_string(),
+            }),
             policy
-                .resolve(
-                    "/project/repo/.agents/skills/review/SKILL.md",
-                    None,
-                    &policy.writable_roots,
-                    "apply_patch",
-                )
-                .is_err()
+                .write_policy
+                .authorize(Path::new("/project/repo/.agents/skills/review/SKILL.md"))
         );
     }
 
@@ -320,36 +310,64 @@ mod tests {
     fn frozen_directory_write_scope_rejects_escape() {
         let policy = policy();
         assert_eq!(
+            Ok(()),
             policy
-                .resolve(
-                    "crates/runtime/src/lib.rs",
-                    None,
-                    &policy.writable_roots,
-                    "apply_patch",
-                )
+                .write_policy
+                .authorize(Path::new("/workspace/repo/crates/runtime/src/lib.rs"))
+        );
+        assert!(normalize_container_path(&policy.default_cwd, None, "../Cargo.toml").is_err());
+        assert_eq!(
+            Err(ContainerWriteRefusal::OutsideWritableRoot {
+                path: "/workspace/repo/Cargo.toml".to_string(),
+            }),
+            policy
+                .write_policy
+                .authorize(Path::new("/workspace/repo/Cargo.toml"))
+        );
+        assert!(
+            policy
+                .resolve_read("/etc/passwd", None, "read_file")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reference_namespace_is_readable_and_never_writable() {
+        let policy = policy();
+        assert_eq!(
+            policy
+                .resolve_read("/references/linux/kernel/irq/manage.c", None, "read_file")
                 .unwrap(),
-            "/workspace/repo/crates/runtime/src/lib.rs"
+            "/references/linux/kernel/irq/manage.c"
         );
-        assert!(
-            policy
-                .resolve("../Cargo.toml", None, &policy.writable_roots, "apply_patch",)
-                .is_err()
+        // 拒写范围优先于任何写许可：即使 Agent 的写根放大到 `/`，引用命名空间也不可写。
+        let host_permitted =
+            WorkspaceFilePolicy::new(PathBuf::from("/"), Vec::new(), vec![PathBuf::from("/")]);
+        assert_eq!(
+            Err(ContainerWriteRefusal::ReferenceReadOnly {
+                path: "/references/linux/kernel/irq/manage.c".to_string(),
+            }),
+            host_permitted
+                .write_policy
+                .authorize(Path::new("/references/linux/kernel/irq/manage.c"))
         );
-        assert!(
-            policy
-                .resolve(
-                    "/workspace/repo/Cargo.toml",
-                    None,
-                    &policy.writable_roots,
-                    "apply_patch",
-                )
-                .is_err()
-        );
-        assert!(
-            policy
-                .resolve("/etc/passwd", None, &policy.read_roots, "read_file")
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn reserved_namespace_boundary_is_compared_by_components() {
+        // `/references-evil` 与 `/references` 共享字符串前缀，但不是保留命名空间内的路径。
+        assert!(!path_is_within(
+            Path::new("/references-evil/repo"),
+            Path::new("/references")
+        ));
+        assert!(path_is_within(
+            Path::new("/references/linux"),
+            Path::new("/references")
+        ));
+        assert!(path_is_within(
+            Path::new("/references"),
+            Path::new("/references")
+        ));
     }
 
     #[test]

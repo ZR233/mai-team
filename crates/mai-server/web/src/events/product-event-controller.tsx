@@ -89,6 +89,17 @@ export function applyProductEvent(queryClient: QueryClient, event: ProductEventE
         case "mcp_server_status_changed":
           queryClient.invalidateQueries({ queryKey: queryKeys.mcpServers })
           break
+        // 参考源码只失效相关查询：项目配置/状态与源清单。草稿在 React 之外按 projectId 拥有，
+        // 这些失效不会重建或覆盖用户未保存的编辑。
+        case "project_references_changed":
+          queryClient.invalidateQueries({ queryKey: queryKeys.projectReferences(String(event.project_id)) })
+          break
+        case "agent_reference_application_changed":
+          queryClient.invalidateQueries({ queryKey: queryKeys.projectReferencesStatus(String(event.project_id)) })
+          break
+        case "reference_source_changed":
+          queryClient.invalidateQueries({ queryKey: queryKeys.referenceSources })
+          break
         case "github_webhook_received":
         case "operation_failed":
         case "artifact_created":
@@ -103,4 +114,5 @@ export const PRODUCT_EVENT_NAMES = [
   "task_deleted", "project_created", "project_updated", "project_deleted",
   "github_webhook_received", "project_review_queued", "project_review_discovery_updated", "operation_failed", "plan_updated",
   "artifact_created", "mcp_server_status_changed",
+  "project_references_changed", "agent_reference_application_changed", "reference_source_changed",
 ] as const

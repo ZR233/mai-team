@@ -1,4 +1,5 @@
 pub(crate) mod command;
+mod command_process;
 pub(crate) mod container;
 pub(crate) mod core_adapter;
 pub(crate) mod product_tool_schemas;

@@ -10,11 +10,19 @@ use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{HOST_NETWORK, validate_image};
-use crate::capture::{await_capture_task, capture_stream};
+use crate::capture::{
+    CaptureSession, await_capture_task, capture_stream, captured_exec_process_id,
+    captured_exec_result, captured_exec_shell_args, terminate_captured_exec,
+};
 use crate::client::DockerClient;
 use crate::error::{DockerError, Result};
-use crate::mount::{ContainerVolumeMount, validate_additional_mounts};
+use crate::mount::{ContainerVolumeMount, validate_volume_mounts};
 use crate::naming::MANAGED_LABEL;
+
+use crate::capture::{
+    ContainerTerminationOutcome, ExecCaptureFailure, ExecCaptureStream, ExecTerminationOutcome,
+    MAX_EXEC_CAPTURE_BYTES,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecOutput {
@@ -37,6 +45,13 @@ pub struct CapturedExecOutput {
     pub stderr_bytes: u64,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// 捕获为什么提前结束；`None` 表示两个流都读到了正常结尾。
+    ///
+    /// 容量终止（[`ExecCaptureFailure::OutputLimitExceeded`]）表示命令按本命令的
+    /// 落盘上限被有意停下，已受理的字节仍在捕获文件里；可靠保存故障走 `Err`，
+    /// 两者不能互相冒充。`stdout_truncated`／`stderr_truncated` 只是内存观察视图的
+    /// 截断事实，不代表命令被取消。
+    pub capture_failure: Option<ExecCaptureFailure>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -153,10 +168,38 @@ impl DockerClient {
         capture: ExecCaptureOptions<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<CapturedExecOutput> {
+        self.exec_shell_env_captured_with_limit(
+            container_id,
+            command,
+            opts,
+            capture,
+            cancellation_token,
+            MAX_EXEC_CAPTURE_BYTES,
+        )
+        .await
+    }
+
+    /// 与 [`Self::exec_shell_env_captured_with_cancel`] 相同，但允许注入单命令落盘上限。
+    ///
+    /// 生产路径固定使用 [`MAX_EXEC_CAPTURE_BYTES`]；只有测试会传更小的上限，用来驱动
+    /// 真实的"超限终止并等待"路径，而不必真的写满 64 MiB。
+    pub(crate) async fn exec_shell_env_captured_with_limit(
+        &self,
+        container_id: &str,
+        command: &str,
+        opts: &ShellExecOptions<'_>,
+        capture: ExecCaptureOptions<'_>,
+        cancellation_token: &CancellationToken,
+        capture_limit_bytes: u64,
+    ) -> Result<CapturedExecOutput> {
         let shell_command = shell_command_with_timeout(
             command,
             ShellCommandTimeout::from_optional_seconds(opts.timeout_secs),
         );
+        // 命令用固定生命周期启动器包住，容器内会留下 PID 台账：超限或取消时才能终止
+        // 容器内真实的进程组，而不是只丢下观察者继续说"已经停下了"。
+        let process_id = captured_exec_process_id();
+        let pid_file = managed_exec_pid_file(&process_id)?;
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
         if let Some(cwd) = opts.cwd {
@@ -166,63 +209,115 @@ impl DockerClient {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
-        cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
+        cmd.arg(container_id);
+        cmd.arg("/bin/sh");
+        cmd.args(captured_exec_shell_args(&pid_file, &shell_command));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn()?;
+        let host_pid = child.id();
         let stdout = child.stdout.take().ok_or_else(|| {
             DockerError::CommandFailed("docker exec stdout pipe unavailable".to_string())
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             DockerError::CommandFailed("docker exec stderr pipe unavailable".to_string())
         })?;
+        // stdout 与 stderr 共享同一个落盘额度：计费在写盘之前，超限的字节不落盘。
+        let session = CaptureSession::new(capture_limit_bytes);
         let stdout_task = capture_stream(
             stdout,
             capture.stdout_path.to_path_buf(),
             capture.output_bytes_cap,
+            ExecCaptureStream::Stdout,
+            session.clone(),
         );
         let stderr_task = capture_stream(
             stderr,
             capture.stderr_path.to_path_buf(),
             capture.output_bytes_cap,
+            ExecCaptureStream::Stderr,
+            session.clone(),
         );
+        let capture_stopped = session.capture_stopped();
 
         let wait =
             wait_child_with_optional_timeout(&mut child, opts.timeout_secs, "docker exec command");
-        let status = tokio::select! {
-            status = wait => status,
+        let selection = tokio::select! {
+            status = wait => CapturedExecSelection::Exited(status),
             _ = cancellation_token.cancelled() => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                return Err(DockerError::Cancelled);
+                CapturedExecSelection::Cancelled
+            }
+            _ = capture_stopped.cancelled() => {
+                CapturedExecSelection::CaptureStopped
             }
         };
-        let status = match status {
-            Ok(status) => status,
-            Err(err) => {
+
+        match selection {
+            CapturedExecSelection::Exited(status) => {
+                let status = match status {
+                    Ok(status) => status,
+                    Err(err) => {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        return Err(err);
+                    }
+                };
+                let stdout_capture = await_capture_task(stdout_task).await?;
+                let stderr_capture = await_capture_task(stderr_task).await?;
+                // 捕获故障优先于"命令自己退出了"：容量终止与保存故障都必须如实上报。
+                let failure = session.fault().map(|failure| {
+                    failure.with_termination(ExecTerminationOutcome {
+                        docker_exec_exited: true,
+                        container_termination: ContainerTerminationOutcome::NotNeeded,
+                    })
+                });
+                captured_exec_result(status, stdout_capture, stderr_capture, failure)
+            }
+            CapturedExecSelection::Cancelled => {
+                // 取消也必须真实停下：先终止容器内进程组，再终止宿主 docker 进程组并等待。
+                let _ = terminate_captured_exec(
+                    &self.binary,
+                    container_id,
+                    &pid_file,
+                    host_pid,
+                    &mut child,
+                )
+                .await;
                 stdout_task.abort();
                 stderr_task.abort();
-                return Err(err);
+                Err(DockerError::Cancelled)
             }
-        };
-        let stdout_capture = await_capture_task(stdout_task).await?;
-        let stderr_capture = await_capture_task(stderr_task).await?;
-        Ok(CapturedExecOutput {
-            output: ExecOutput {
-                status: status.code().unwrap_or(-1),
-                stdout: stdout_capture.text,
-                stderr: stderr_capture.text,
-            },
-            stdout_bytes: stdout_capture.total_bytes,
-            stderr_bytes: stderr_capture.total_bytes,
-            stdout_truncated: stdout_capture.truncated,
-            stderr_truncated: stderr_capture.truncated,
-        })
+            CapturedExecSelection::CaptureStopped => {
+                let termination = terminate_captured_exec(
+                    &self.binary,
+                    container_id,
+                    &pid_file,
+                    host_pid,
+                    &mut child,
+                )
+                .await;
+                let stdout_capture = await_capture_task(stdout_task).await?;
+                let stderr_capture = await_capture_task(stderr_task).await?;
+                let failure = session
+                    .fault()
+                    .map(|failure| failure.with_termination(termination.outcome));
+                captured_exec_result(
+                    termination.status.ok_or_else(|| {
+                        DockerError::CommandFailed(
+                            "output capture stopped but docker exec exit was not confirmed".into(),
+                        )
+                    })?,
+                    stdout_capture,
+                    stderr_capture,
+                    failure,
+                )
+            }
+        }
     }
 
     pub async fn exec_shell_env_with_cancel(
@@ -268,7 +363,7 @@ impl DockerClient {
 
     pub async fn run_sidecar_shell_env(&self, params: &SidecarParams<'_>) -> Result<ExecOutput> {
         let image = validate_image(params.image)?;
-        validate_additional_mounts(params.mounts)?;
+        validate_volume_mounts(params.mounts)?;
         let shell_command = shell_command_with_timeout(
             params.command,
             ShellCommandTimeout::from_optional_seconds(params.timeout_secs),
@@ -383,20 +478,29 @@ impl DockerClient {
         container_id: &str,
         process_id: &str,
         host_pid: Option<u32>,
-    ) {
-        if let Ok(pid_file) = managed_exec_pid_file(process_id) {
-            let _ = timeout(
-                Duration::from_secs(5),
-                self.exec_shell(
-                    container_id,
-                    &managed_exec_kill_command(&pid_file),
-                    Some("/"),
-                    None,
-                ),
-            )
-            .await;
-        }
+    ) -> Result<()> {
+        let pid_file = managed_exec_pid_file(process_id)?;
+        let stopped = timeout(
+            Duration::from_secs(5),
+            self.exec_shell(
+                container_id,
+                &managed_exec_kill_command(&pid_file),
+                Some("/"),
+                None,
+            ),
+        )
+        .await;
+        // 不论容器侧是否可用都必须回收本次宿主 CLI；容器侧失败继续向上报告，阻止换代提交。
         terminate_spawned_exec(host_pid).await;
+        match stopped {
+            Ok(Ok(output)) if output.status == 0 => Ok(()),
+            Ok(Ok(output)) => Err(DockerError::CommandFailed(format!(
+                "容器命令停止失败：{}",
+                output.stderr
+            ))),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(DockerError::CommandFailed("容器命令停止超时".into())),
+        }
     }
 
     /// 在 Drop 等同步兜底路径触发容器内清理，并终止宿主 Docker CLI 进程树。
@@ -432,7 +536,7 @@ impl DockerClient {
 
     pub fn spawn_sidecar(&self, params: &SidecarParams<'_>) -> Result<Child> {
         let image = validate_image(params.image)?;
-        validate_additional_mounts(params.mounts)?;
+        validate_volume_mounts(params.mounts)?;
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
@@ -461,11 +565,18 @@ impl DockerClient {
     }
 }
 
-const MANAGED_EXEC_LAUNCHER: &str = r#"pid_file=$1
+pub(crate) const MANAGED_EXEC_LAUNCHER: &str = r#"pid_file=$1
 shift
 printf '%s\n' "$$" > "$pid_file" || exit 125
 trap 'rm -f "$pid_file"' 0
 "$@""#;
+
+/// 捕获路径的等待结果。
+enum CapturedExecSelection {
+    Exited(Result<std::process::ExitStatus>),
+    Cancelled,
+    CaptureStopped,
+}
 
 fn managed_exec_shell_args(pid_file: &str, command: &str) -> Vec<String> {
     vec![
@@ -569,10 +680,26 @@ fn managed_exec_pid_file(process_id: &str) -> Result<String> {
     Ok(format!("/tmp/mai-{process_id}.pid"))
 }
 
-fn managed_exec_kill_command(pid_file: &str) -> String {
+pub(crate) fn managed_exec_kill_command(pid_file: &str) -> String {
     let pid_file = shell_quote_word(pid_file);
+    // timeout、shell 和后台作业可能建立新的进程组；只 kill 记录的负 PGID 会漏掉它们。
+    // 先 STOP 父进程冻结 fork，再沿 Linux children 台账递归冻结并终止，最后才终止父进程。
     format!(
-        "if test -r {pid_file}; then pid=$(cat {pid_file}); kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; sleep 1; kill -KILL -- \"-$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; rm -f {pid_file}; fi"
+        r#"stop_tree() {{
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  kill -STOP "$1" 2>/dev/null || return 0
+  if test -r "/proc/$1/task/$1/children"; then
+    for child in $(cat "/proc/$1/task/$1/children"); do stop_tree "$child" || return 1; done
+  elif kill -0 "$1" 2>/dev/null; then
+    return 1
+  fi
+  kill -KILL "$1" 2>/dev/null || ! kill -0 "$1" 2>/dev/null
+}}
+if test -r {pid_file}; then
+  pid=$(cat {pid_file}) || exit 1
+  stop_tree "$pid" || exit 1
+  rm -f {pid_file}
+fi"#
     )
 }
 
@@ -784,6 +911,188 @@ mod tests {
             .await;
 
         assert_timed_out(result);
+    }
+
+    #[tokio::test]
+    async fn captured_exec_under_the_limit_keeps_every_byte_and_reports_no_failure() {
+        // 启动器包裹之后，正常路径仍必须原样返回全部输出。
+        let dir = tempfile_dir();
+        let stdout_path = dir.join("stdout.txt");
+        let stderr_path = dir.join("stderr.txt");
+        let script =
+            fake_docker_script("printf 'hello '\nprintf 'world'\nprintf 'partial' >&2\nexit 0\n");
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let output = client
+            .exec_shell_captured_with_cancel(
+                "container",
+                "printf 'hello world'",
+                None,
+                Some(30),
+                ExecCaptureOptions {
+                    stdout_path: &stdout_path,
+                    stderr_path: &stderr_path,
+                    output_bytes_cap: 1024,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("captured exec");
+
+        assert_eq!(output.capture_failure, None);
+        assert_eq!(output.output.status, 0);
+        assert_eq!(output.output.stdout, "hello world");
+        assert_eq!(output.output.stderr, "partial");
+        assert_eq!(output.stdout_bytes, 11);
+        assert_eq!(output.stderr_bytes, 7);
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+        assert_eq!(
+            fs::read_to_string(&stdout_path).expect("stdout capture"),
+            "hello world"
+        );
+        assert_eq!(
+            fs::read_to_string(&stderr_path).expect("stderr capture"),
+            "partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_exec_limit_is_typed_and_bounds_real_capture_bytes() {
+        let dir = tempfile_dir();
+        let stdout_path = dir.join("stdout.txt");
+        let stderr_path = dir.join("stderr.txt");
+        let calls = dir.join("calls.txt");
+        // 主体命令持续输出（只用 shell 内建，不依赖 yes 等外部命令）；
+        // 容器内终止命令（argv 里带 PID 台账检查）直接成功退出。
+        let script = fake_docker_script(&format!(
+            "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n  *\"test -r /tmp/mai-capture-\"*) exit 0 ;;\nesac\nwhile :; do printf '0123456789abcdef'; done\n",
+            shell_quote_word(&calls.display().to_string())
+        ));
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let output = client
+            .exec_shell_env_captured_with_limit(
+                "container",
+                "yes",
+                &ShellExecOptions::default(),
+                ExecCaptureOptions {
+                    stdout_path: &stdout_path,
+                    stderr_path: &stderr_path,
+                    output_bytes_cap: 64,
+                },
+                &CancellationToken::new(),
+                8 * 1024,
+            )
+            .await
+            .expect("captured exec with limit");
+
+        let failure = output
+            .capture_failure
+            .expect("容量终止必须是 typed 结果，而不是保存故障");
+        assert!(!failure.is_storage_fault());
+        let limit = failure.output_limit_exceeded().expect("limit payload");
+        assert_eq!(limit.limit_bytes, 8 * 1024);
+        assert!(limit.charged_bytes <= limit.limit_bytes);
+        assert!(limit.refused_bytes > 0);
+        assert!(
+            limit.termination.docker_exec_exited,
+            "返回前必须确认宿主 docker exec 已退出"
+        );
+        assert_eq!(
+            limit.termination.container_termination,
+            ContainerTerminationOutcome::Issued,
+            "容器内 PID 台账的终止命令必须成功下发"
+        );
+        assert_ne!(output.output.status, 0, "被终止的命令不可能是 0 退出码");
+        assert!(output.stdout_truncated, "观察视图按 output_bytes_cap 截断");
+
+        let written = fs::metadata(&stdout_path).expect("stdout capture").len();
+        assert!(
+            written <= limit.limit_bytes,
+            "真实落盘字节 {written} 不得超过共享额度 {}",
+            limit.limit_bytes
+        );
+        assert_eq!(output.stdout_bytes, written);
+
+        let calls = fs::read_to_string(&calls).expect("recorded argv");
+        assert!(
+            calls.contains("mai-managed-exec"),
+            "捕获路径必须通过 PID 台账启动器运行：{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.contains("test -r /tmp/mai-capture-")),
+            "必须向容器下发进程组终止命令：{calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_exec_storage_fault_fails_loudly_instead_of_looking_like_a_limit() {
+        let dir = tempfile_dir();
+        // stdout 捕获路径是目录：创建捕获文件必然失败，必须报保存故障而不是容量终止。
+        let stdout_path = dir.join("stdout-directory");
+        fs::create_dir_all(&stdout_path).expect("mkdir stdout path");
+        let stderr_path = dir.join("stderr.txt");
+        let script = fake_docker_script(
+            "case \"$*\" in\n  *\"test -r /tmp/mai-capture-\"*) exit 0 ;;\nesac\nexec sleep 30\n",
+        );
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let error = client
+            .exec_shell_env_captured_with_limit(
+                "container",
+                "sleep 30",
+                &ShellExecOptions::default(),
+                ExecCaptureOptions {
+                    stdout_path: &stdout_path,
+                    stderr_path: &stderr_path,
+                    output_bytes_cap: 64,
+                },
+                &CancellationToken::new(),
+                64 * 1024,
+            )
+            .await
+            .expect_err("保存故障必须是错误，不能被当成成功的容量终止");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("stdout output capture failed"),
+            "错误必须指明是哪个流的保存故障：{message}"
+        );
+        assert!(
+            !message.contains("capture limit"),
+            "保存故障不得冒充容量终止：{message}"
+        );
+    }
+
+    #[test]
+    fn captured_exec_wrapper_matches_direct_login_shell_contract() {
+        // 用本地 /bin/sh 执行捕获路径的 argv，证明加启动器不改变命令语义与退出码。
+        for command in [
+            r#"value="alpha beta"; printf '<%s>\n' "$value""#,
+            "cat <<'EOF'\nfirst 'quoted' line\nsecond line\nEOF",
+            "printf 'to stdout'; printf 'to stderr' >&2; exit 3",
+            r#"printf '%s\n' "$(printf command-substitution)""#,
+        ] {
+            let pid_file = std::env::temp_dir()
+                .join(format!("mai-capture-wrapper-{}.pid", unique_test_path_id()));
+            let args = captured_exec_shell_args(&pid_file.display().to_string(), command);
+            let direct = std::process::Command::new("/bin/sh")
+                .args(["-lc", command])
+                .output()
+                .expect("run direct command");
+            let wrapped = std::process::Command::new("/bin/sh")
+                .args(&args)
+                .output()
+                .expect("run wrapped command");
+
+            assert_eq!(wrapped.status.code(), direct.status.code(), "{command}");
+            assert_eq!(wrapped.stdout, direct.stdout, "{command}");
+            assert_eq!(wrapped.stderr, direct.stderr, "{command}");
+            assert!(!pid_file.exists(), "PID 台账必须被清理：{command}");
+        }
     }
 
     #[tokio::test]
@@ -1030,7 +1339,8 @@ printf '%s\n' "$(printf command-substitution)""#;
 
         client
             .terminate_managed_exec(&container_id, &process_id, host_pid)
-            .await;
+            .await
+            .expect("managed exec termination");
         let status = timeout(Duration::from_secs(5), child.wait())
             .await
             .expect("docker exec must terminate")

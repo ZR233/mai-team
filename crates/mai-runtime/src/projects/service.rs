@@ -79,7 +79,19 @@ pub(crate) trait ProjectCreateOps: Send + Sync {
         &self,
         request: ProjectMaintainerAgentRequest,
     ) -> impl Future<Output = Result<AgentSummary>> + Send;
-    fn save_project(&self, project: &ProjectSummary) -> impl Future<Output = Result<()>> + Send;
+    /// 创建新的项目行；ID 已存在时必须显式失败。
+    ///
+    /// 创建与更新是两个端口：`create_project` 走这里，后续的状态更新走 `save_project`
+    /// （只 UPDATE），旧的 `save_project` 不会复活已经删除的项目行。
+    fn insert_project_row(
+        &self,
+        project: &ProjectSummary,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn save_initial_references(
+        &self,
+        project_id: ProjectId,
+        bindings: Vec<mai_protocol::ProjectReferenceBinding>,
+    ) -> impl Future<Output = Result<()>> + Send;
     fn insert_project(&self, project: ProjectSummary) -> impl Future<Output = ()> + Send;
     fn publish_project_event(&self, event: MaiProductEventKind) -> impl Future<Output = ()> + Send;
     fn start_project_workspace(
@@ -237,7 +249,10 @@ pub(crate) async fn create_project(
         last_review_outcome: None,
         review_last_error: None,
     };
-    ops.save_project(&project).await?;
+    // 首次持久化走创建端口：ID 冲突时显式失败，不做 UPSERT。
+    ops.insert_project_row(&project).await?;
+    ops.save_initial_references(project_id, request.reference_bindings)
+        .await?;
     ops.insert_project(project.clone()).await;
     ops.publish_project_event(MaiProductEventKind::ProjectCreated {
         project: project.clone(),
@@ -383,17 +398,65 @@ pub(crate) async fn delete_project(
         })
         .await;
     }
+    // 明确授权的资源删除：只要还有 Agent、sidecar 或工作区没释放干净，就不能继续删除项目记录，
+    // 否则仍然存在的容器与卷会失去唯一能找到它们的父记录。失败时项目保持 `Deleting`，调用方
+    // 可以用同一个 id 重试；已经删除过的 Agent 视为幂等完成，不算失败。
+    let mut failures = Vec::new();
+    let mut first_failure = None;
     for agent_id in root_agents {
-        let _ = ops.delete_agent(agent_id).await;
+        match ops.delete_agent(agent_id).await {
+            Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
+            Err(error) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    agent_id = %agent_id,
+                    "failed to delete project agent resources during project deletion: {error}"
+                );
+                failures.push(format!("agent `{agent_id}`: {error}"));
+                if first_failure.is_none() {
+                    first_failure = Some(RuntimeError::InvalidInput(format!(
+                        "project `{project_id}` agent `{agent_id}` resource deletion failed: {error}"
+                    )));
+                }
+            }
+        }
     }
-    let _ = ops.delete_project_sidecar(project_id).await;
-    let _ = ops.delete_project_workspace(project_id).await;
+    if let Err(error) = ops.delete_project_sidecar(project_id).await {
+        tracing::error!(
+            project_id = %project_id,
+            "failed to delete project sidecar container during project deletion: {error}"
+        );
+        failures.push(format!("project sidecar: {error}"));
+        first_failure.get_or_insert(error);
+    }
+    if let Err(error) = ops.delete_project_workspace(project_id).await {
+        tracing::error!(
+            project_id = %project_id,
+            "failed to delete project workspace during project deletion: {error}"
+        );
+        failures.push(format!("project workspace: {error}"));
+        first_failure.get_or_insert(error);
+    }
+    if let Some(error) = first_failure {
+        tracing::error!(
+            project_id = %project_id,
+            failures = %failures.join("; "),
+            "project deletion stopped before removing product records"
+        );
+        return Err(error);
+    }
     ops.delete_project_from_store(project_id).await?;
     ops.remove_project_from_memory(project_id).await;
     ops.remove_project_skill_lock(project_id).await;
     ops.publish_project_event(MaiProductEventKind::ProjectDeleted { project_id })
         .await;
-    let _ = std::fs::remove_dir_all(ops.project_skill_cache_dir(project_id));
+    if let Err(error) = std::fs::remove_dir_all(ops.project_skill_cache_dir(project_id)) {
+        // 项目记录已经删除；本地技能缓存目录只是尽力清理，失败只记录，不代表项目删除失败。
+        tracing::warn!(
+            project_id = %project_id,
+            "failed to remove project skill cache directory after project deletion: {error}"
+        );
+    }
     Ok(())
 }
 
@@ -419,7 +482,14 @@ pub(crate) async fn cancel_project(
     ops.save_project(&updated).await?;
     ops.publish_project_event(MaiProductEventKind::ProjectUpdated { project: updated })
         .await;
-    let _ = ops.delete_project_sidecar(project_id).await;
+    if let Err(error) = ops.delete_project_sidecar(project_id).await {
+        // 项目已经进入 Failed 终态，但 sidecar 容器仍在：如实上报，重试同一取消请求即可继续清理。
+        tracing::error!(
+            project_id = %project_id,
+            "failed to delete project sidecar container after cancelling project: {error}"
+        );
+        return Err(error);
+    }
     Ok(())
 }
 

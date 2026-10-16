@@ -94,7 +94,7 @@ impl AgentRuntime {
             updated_at: created_at,
             usage: RuntimeUsageSnapshot::default(),
         };
-        self.deps.store.save_agent(&summary, None).await?;
+        self.deps.store.insert_agent(&summary, None).await?;
         let agent = Arc::new(AgentRecord {
             summary: RwLock::new(summary.clone()),
             registration_pending: std::sync::atomic::AtomicBool::new(true),

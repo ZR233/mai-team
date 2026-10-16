@@ -2,29 +2,43 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mai_protocol::{AgentId, ToolOutputArtifactInfo};
+use mai_protocol::ToolOutputArtifactInfo;
+use mai_references::AgentEnvironmentLease;
 use pl_tool::command::{
-    CommandBackend, CommandCaptureStream, CommandExit, CommandIo, CommandOutputSizes,
-    CommandOutputTarget, CommandReader, CommandSpawnRequest, CommandWriter, ManagedCommand,
-    command_output_model_path,
+    CommandBackend, CommandCaptureStream, CommandOutputSizes, CommandOutputTarget,
+    CommandSpawnRequest, ManagedCommand, command_output_model_path,
 };
 use pl_tool::shell::shell_quote_word;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use super::container::{
-    MaiToolOutputCapture, MaiToolOutputStreamSizes, tool_output_artifact_file_path,
+    MaiToolOutputCapture, MaiToolOutputStreamSizes, ensure_lease_active,
+    tool_output_artifact_file_path,
 };
 use crate::{AgentRuntime, Result, RuntimeError};
+
+/// Mai 每个命令的落盘捕获硬上限。
+///
+/// 上限约束的是**真实磁盘占用**，不是单一流的字节数：合并输出文件与 per-stream 捕获各写一份，
+/// 因此 [`MaiCommandBackend::capture_storage_cost`] 按两份计费。达到上限即取消命令并等待其真实
+/// 结束，已写字节保留、由 artifact 归档，按 typed 输出上限报告。
+pub(crate) const MAI_COMMAND_CAPTURE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 每个 chunk 在合并文件里的 framing 折算（`=== STDOUT ===\n` 与补齐换行）。
+const MAI_COMMAND_CAPTURE_FRAME_BYTES: u64 = 16;
 
 /// Mai 的容器工作区命令后端。
 ///
 /// PL 统一管理进程表、stdin、超时和输出截断；该类型只负责把命令映射到
-/// 当前 Agent 容器，并把完整输出同步回容器 workspace 与 Mai artifact。
+/// 本 Thread 冻结环境租约的容器，并把完整输出同步回容器 workspace 与 Mai artifact。
+///
+/// 装配租约之后**不再**按 agent 重新查容器：同一个 turn 内的 spawn、cwd 解析、输出发布与后台进程
+/// 清理都用同一个 container_id，因此环境换代不会把旧调用漂移到新环境。
 #[derive(Clone)]
 pub(crate) struct MaiCommandBackend {
     runtime: Arc<AgentRuntime>,
-    agent_id: AgentId,
+    lease: Arc<AgentEnvironmentLease>,
     workspace_root: PathBuf,
     captures: Arc<Mutex<HashMap<PathBuf, MaiToolOutputCapture>>>,
     output_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -33,20 +47,22 @@ pub(crate) struct MaiCommandBackend {
 impl MaiCommandBackend {
     pub(crate) fn new(
         runtime: Arc<AgentRuntime>,
-        agent_id: AgentId,
+        lease: Arc<AgentEnvironmentLease>,
         workspace_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             runtime,
-            agent_id,
+            lease,
             workspace_root: workspace_root.into(),
             captures: Arc::new(Mutex::new(HashMap::new())),
             output_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    async fn current_container_id(&self) -> Result<String> {
-        self.runtime.container_id(self.agent_id).await
+    /// 本 generation 的容器 ID；租约已撤销时 fail closed，不重新按 agent 解析容器。
+    fn container_id(&self) -> Result<String> {
+        ensure_lease_active(&self.lease)?;
+        Ok(self.lease.container_id().to_string())
     }
 
     fn workspace_path(&self, path: &Path) -> Result<PathBuf> {
@@ -58,7 +74,7 @@ impl MaiCommandBackend {
         candidate: &Path,
         allow_workspace_escape: bool,
     ) -> Result<PathBuf> {
-        let container_id = self.current_container_id().await?;
+        let container_id = self.container_id()?;
         let candidate = candidate.to_str().ok_or_else(|| {
             RuntimeError::InvalidInput("exec cwd must be valid UTF-8".to_string())
         })?;
@@ -136,7 +152,9 @@ fn resolve_workspace_path(workspace_root: &Path, path: &Path) -> Result<PathBuf>
 impl std::fmt::Debug for MaiCommandBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MaiCommandBackend")
-            .field("agent_id", &self.agent_id)
+            .field("agent_id", &self.lease.agent_id())
+            .field("container_id", &self.lease.container_id())
+            .field("generation", &self.lease.generation())
             .field("workspace_root", &self.workspace_root)
             .finish_non_exhaustive()
     }
@@ -144,6 +162,35 @@ impl std::fmt::Debug for MaiCommandBackend {
 
 impl CommandBackend for MaiCommandBackend {
     type Error = RuntimeError;
+
+    /// Mai 显式声明的单命令落盘上限（比 PL 默认值更宽），由本后端自己负责如实计费。
+    fn model_output_bytes_cap(&self) -> Option<u64> {
+        Some(32 * 1024)
+    }
+
+    fn capture_limit_bytes(&self) -> Option<u64> {
+        Some(MAI_COMMAND_CAPTURE_LIMIT_BYTES)
+    }
+
+    /// 同一个 chunk 会落两份：合并输出文件（带 framing）与它自己的 per-stream 捕获。
+    ///
+    /// 因此按 `chunk_len × 份数 + framing` 计费，让 PL 的共享额度约束**磁盘总量**，而不是只约束
+    /// 其中一份；否则真实占用会是声明上限的两倍。
+    fn capture_storage_cost(
+        &self,
+        target: &CommandOutputTarget,
+        stream: CommandCaptureStream,
+        chunk_len: usize,
+    ) -> u64 {
+        let stream_capture = match stream {
+            CommandCaptureStream::Stdout => target.stdout_capture_file(),
+            CommandCaptureStream::Stderr => target.stderr_capture_file(),
+        };
+        let copies = if stream_capture.is_some() { 2 } else { 1 };
+        (chunk_len as u64)
+            .saturating_mul(copies)
+            .saturating_add(MAI_COMMAND_CAPTURE_FRAME_BYTES)
+    }
 
     async fn resolve_cwd(
         &self,
@@ -181,7 +228,7 @@ impl CommandBackend for MaiCommandBackend {
         call_id: &str,
         command: &str,
     ) -> Result<CommandOutputTarget> {
-        let namespace = self.agent_id.to_string();
+        let namespace = self.lease.agent_id().to_string();
         let stdout_id = Uuid::new_v4().to_string();
         let stderr_id = Uuid::new_v4().to_string();
         let capture = MaiToolOutputCapture::prepare(
@@ -212,57 +259,12 @@ impl CommandBackend for MaiCommandBackend {
     }
 
     async fn spawn(&self, request: CommandSpawnRequest) -> Result<ManagedCommand> {
-        let container_id = self.current_container_id().await?;
-        let mut child = self
-            .runtime
-            .deps
-            .docker
-            .spawn_managed_exec(
-                &container_id,
-                &request.process_id,
-                &request.command,
-                Some(&request.cwd),
-            )
-            .map_err(RuntimeError::from)?;
-        let host_pid = child.id();
-        let io = CommandIo {
-            stdin: child
-                .stdin
-                .take()
-                .map(|value| Box::pin(value) as CommandWriter),
-            stdout: child
-                .stdout
-                .take()
-                .map(|value| Box::pin(value) as CommandReader),
-            stderr: child
-                .stderr
-                .take()
-                .map(|value| Box::pin(value) as CommandReader),
-        };
-        let runtime = self.runtime.clone();
-        let process_id = request.process_id.clone();
-        Ok(ManagedCommand::new(
-            host_pid,
-            io,
-            move |cancellation| async move {
-                let result = tokio::select! {
-                    result = child.wait() => result,
-                    _ = cancellation.cancelled() => {
-                        runtime
-                            .deps
-                            .docker
-                            .terminate_managed_exec(&container_id, &process_id, host_pid)
-                            .await;
-                        child.wait().await
-                    }
-                };
-                result
-                    .map(|status| CommandExit {
-                        exit_code: status.code(),
-                    })
-                    .map_err(|error| format!("failed to wait for container command: {error}"))
-            },
-        ))
+        super::command_process::spawn_generation_command(
+            self.runtime.deps.docker.clone(),
+            Arc::clone(&self.lease),
+            request,
+        )
+        .await
     }
 
     async fn prepare_output(
@@ -352,7 +354,7 @@ impl CommandBackend for MaiCommandBackend {
     }
 
     async fn publish_output(&self, target: &CommandOutputTarget) -> Result<()> {
-        let container_id = self.current_container_id().await?;
+        let container_id = self.container_id()?;
         let output_path = self.container_output_path(target.model_file())?;
         self.runtime
             .deps
@@ -377,7 +379,7 @@ impl CommandBackend for MaiCommandBackend {
         };
         let artifacts: Vec<ToolOutputArtifactInfo> = capture
             .collect_artifacts(
-                self.agent_id,
+                self.lease.agent_id(),
                 MaiToolOutputStreamSizes {
                     stdout_bytes: sizes.stdout_bytes,
                     stderr_bytes: sizes.stderr_bytes,

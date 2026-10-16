@@ -382,7 +382,19 @@ pub(crate) async fn run_project_review_once(
             failure,
         })
         .await;
-    let _ = ops.delete_agent(reviewer_id).await;
+    match ops.delete_agent(reviewer_id).await {
+        Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
+        Err(cleanup_error) => {
+            // 审查结论已经落库；reviewer 资源回收失败只上报，不改变本次审查结果。
+            // durable 清理任务会按同一 reviewer 重试（`execute_project_review_cleanup_task`）。
+            tracing::warn!(
+                project_id = %project_id,
+                run_id = %run_id,
+                reviewer_id = %reviewer_id,
+                "failed to delete reviewer agent after the review cycle: {cleanup_error}"
+            );
+        }
+    }
     ops.set_project_review_state(
         project_id,
         ProjectReviewStatus::Idle,
@@ -416,7 +428,17 @@ async fn finish_spawned_reviewer_error(
             failure: None,
         })
         .await;
-    let _ = ops.delete_agent(reviewer_id).await;
+    match ops.delete_agent(reviewer_id).await {
+        Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
+        Err(cleanup_error) => {
+            tracing::warn!(
+                project_id = %project_id,
+                run_id = %run_id,
+                reviewer_id = %reviewer_id,
+                "failed to delete reviewer agent after recording the review failure: {cleanup_error}"
+            );
+        }
+    }
     let _ = ops
         .set_project_review_state(
             project_id,

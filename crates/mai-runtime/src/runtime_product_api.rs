@@ -287,6 +287,14 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateProjectRequest,
     ) -> Result<ProjectSummary> {
+        let configuration = ProjectReferenceConfiguration {
+            revision: u64::from(!request.reference_bindings.is_empty()),
+            bindings: request.reference_bindings.clone(),
+        };
+        self.references
+            .catalog
+            .snapshot(Uuid::nil(), &configuration)
+            .await?;
         projects::service::create_project(self, request).await
     }
 

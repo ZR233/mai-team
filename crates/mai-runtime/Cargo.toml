@@ -12,6 +12,7 @@ dirs.workspace = true
 fnv.workspace = true
 futures.workspace = true
 jsonwebtoken.workspace = true
+mai-references = { path = "../mai-references", version = "0.1.11" }
 mai-docker = { path = "../mai-docker", version = "0.1.11" }
 mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 mai-store = { path = "../mai-store", version = "0.1.11" }

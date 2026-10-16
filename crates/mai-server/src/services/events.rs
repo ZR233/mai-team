@@ -142,13 +142,25 @@ fn event_name(event: &MaiProductEventEnvelope) -> &'static str {
         mai_protocol::MaiProductEventKind::OperationFailed { .. } => "operation_failed",
         mai_protocol::MaiProductEventKind::PlanUpdated { .. } => "plan_updated",
         mai_protocol::MaiProductEventKind::ArtifactCreated { .. } => "artifact_created",
+        mai_protocol::MaiProductEventKind::ProjectReferencesChanged { .. } => {
+            "project_references_changed"
+        }
+        mai_protocol::MaiProductEventKind::AgentReferenceApplicationChanged { .. } => {
+            "agent_reference_application_changed"
+        }
+        mai_protocol::MaiProductEventKind::ReferenceSourceChanged { .. } => {
+            "reference_source_changed"
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentId, MaiProductEventEnvelope, MaiProductEventKind, ProjectId, TaskId};
+    use mai_protocol::{
+        AgentId, MaiProductEventEnvelope, MaiProductEventKind, ProjectId,
+        ReferenceApplicationState, SourceState, TaskId,
+    };
     use pretty_assertions::assert_eq;
     use std::time::Duration;
 
@@ -247,5 +259,37 @@ mod tests {
         });
 
         assert_eq!(event_name(&event), "plan_updated");
+    }
+
+    #[test]
+    fn project_references_changed_event_name() {
+        let event = make_event(MaiProductEventKind::ProjectReferencesChanged {
+            project_id: ProjectId::new_v4(),
+            revision: 3,
+        });
+
+        assert_eq!(event_name(&event), "project_references_changed");
+    }
+
+    #[test]
+    fn agent_reference_application_changed_event_name() {
+        let event = make_event(MaiProductEventKind::AgentReferenceApplicationChanged {
+            project_id: ProjectId::new_v4(),
+            agent_id: AgentId::new_v4(),
+            revision: 3,
+            state: ReferenceApplicationState::Pending,
+        });
+
+        assert_eq!(event_name(&event), "agent_reference_application_changed");
+    }
+
+    #[test]
+    fn reference_source_changed_event_name() {
+        let event = make_event(MaiProductEventKind::ReferenceSourceChanged {
+            source_id: uuid::Uuid::new_v4(),
+            state: SourceState::Ready,
+        });
+
+        assert_eq!(event_name(&event), "reference_source_changed");
     }
 }

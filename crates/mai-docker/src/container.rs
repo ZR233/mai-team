@@ -4,23 +4,18 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::args::{
-    ContainerCreateOptions, create_agent_container_args_with_workspace,
-    create_agent_mcp_sidecar_container_args, create_project_sidecar_container_args, validate_image,
-};
+use crate::WorkspaceMountPlan;
+use crate::args::{ContainerCreateOptions, create_project_sidecar_container_args, validate_image};
 use crate::client::{DockerClient, stderr_or_stdout};
+use crate::environment::{AgentEnvironmentPlan, ExistingEnvironment};
 use crate::error::{DockerError, Result};
 use crate::inspect::{
     ManagedContainer, ManagedVolume, managed_containers_from_inspect, managed_volumes_from_inspect,
 };
-use crate::mount::{ContainerVolumeMount, validate_additional_mounts};
-use crate::naming::{
-    MANAGED_LABEL, agent_container_name, agent_label, agent_mcp_sidecar_container_name,
-    agent_workspace_volume, project_sidecar_container_name, snapshot_image_name,
-};
+use crate::mount::{ContainerMount, validate_additional_mounts};
+use crate::naming::{MANAGED_LABEL, project_sidecar_container_name, snapshot_image_name};
 use crate::selection::{
-    agent_container_delete_ids, agent_mcp_sidecar_container_delete_ids,
-    find_reusable_agent_container, find_reusable_project_sidecar_container, orphaned_container_ids,
+    agent_container_delete_ids, find_reusable_project_sidecar_container, orphaned_container_ids,
     project_sidecar_container_delete_ids,
 };
 
@@ -240,29 +235,55 @@ impl DockerClient {
         preferred_container_id: Option<&str>,
         image: &str,
         workspace_volume: Option<&str>,
-        mounts: &[ContainerVolumeMount],
+        mounts: &[ContainerMount],
     ) -> Result<ContainerHandle> {
+        let plan = self
+            .legacy_environment_plan(
+                agent_id,
+                preferred_container_id,
+                image,
+                workspace_volume,
+                mounts,
+            )
+            .await?;
+
+        // 复用与否完全由实际配置核对决定：非空挂载不会隐式删除旧容器，
+        // 空挂载也不会跳过核对。
+        match self.inspect_environment(&plan).await? {
+            ExistingEnvironment::Matching(verified) => {
+                self.prepare_verified_container(&verified).await
+            }
+            ExistingEnvironment::Absent => self.create_environment(&plan, &[]).await,
+            ExistingEnvironment::ReconfigurationRequired(diff) => {
+                Err(DockerError::EnvironmentReconfigurationRequired(diff))
+            }
+        }
+    }
+
+    /// 为不带 generation 的既有调用点构造计划（兼容路径）。
+    ///
+    /// 该路径不发布 generation，因此不会创建/收养带 generation 的候选；需要换代的
+    /// 调用方必须走显式 apply 流程。
+    async fn legacy_environment_plan(
+        &self,
+        agent_id: &str,
+        preferred_container_id: Option<&str>,
+        image: &str,
+        workspace_volume: Option<&str>,
+        mounts: &[ContainerMount],
+    ) -> Result<AgentEnvironmentPlan> {
         let image = validate_image(image)?;
         validate_additional_mounts(mounts)?;
-        if mounts.is_empty() {
-            if let Some(container) = self
-                .reusable_agent_container(agent_id, preferred_container_id)
-                .await?
-            {
-                return self.prepare_existing_container(container).await;
-            }
-        } else {
-            self.delete_agent_containers(agent_id, preferred_container_id)
-                .await?;
-        }
-
-        self.create_agent_container_from_image_with_workspace_and_mounts(
-            agent_id,
-            image,
-            workspace_volume,
-            mounts,
-        )
-        .await
+        let workspace = match workspace_volume {
+            Some(volume) => WorkspaceMountPlan::new(volume, None::<String>)?,
+            None => WorkspaceMountPlan::agent_default(agent_id)?,
+        };
+        let effective_image_id = self.image_id(image).await?;
+        AgentEnvironmentPlan::builder(agent_id, image, workspace)
+            .effective_image_id(effective_image_id)
+            .published_container_id(preferred_container_id)
+            .mounts(mounts.iter().cloned())
+            .build()
     }
 
     pub async fn create_agent_container(&self, agent_id: &str) -> Result<ContainerHandle> {
@@ -308,7 +329,7 @@ impl DockerClient {
         agent_id: &str,
         parent_container_id: &str,
         workspace_volume: Option<&str>,
-        mounts: &[ContainerVolumeMount],
+        mounts: &[ContainerMount],
     ) -> Result<ContainerHandle> {
         validate_additional_mounts(mounts)?;
         let image = snapshot_image_name(agent_id);
@@ -354,51 +375,12 @@ impl DockerClient {
         agent_id: &str,
         image: &str,
         workspace_volume: Option<&str>,
-        mounts: &[ContainerVolumeMount],
+        mounts: &[ContainerMount],
     ) -> Result<ContainerHandle> {
-        let image = validate_image(image)?;
-        validate_additional_mounts(mounts)?;
-        let name = agent_container_name(agent_id);
-        let label = agent_label(agent_id);
-        let default_workspace_volume;
-        let workspace_volume = match workspace_volume {
-            Some(value) => value,
-            None => {
-                default_workspace_volume = agent_workspace_volume(agent_id);
-                &default_workspace_volume
-            }
-        };
-        let args = create_agent_container_args_with_workspace(
-            &name,
-            &label,
-            image,
-            workspace_volume,
-            mounts,
-        );
-        let create = Command::new(&self.binary)
-            .args(args.iter().map(String::as_str))
-            .output()
+        let plan = self
+            .legacy_environment_plan(agent_id, None, image, workspace_volume, mounts)
             .await?;
-        if !create.status.success() {
-            return Err(DockerError::CommandFailed(stderr_or_stdout(&create)));
-        }
-        let id = String::from_utf8(create.stdout)?.trim().to_string();
-
-        if let Err(err) = self.start_container(&id).await {
-            let _ = self.delete_container(&id).await;
-            return Err(err);
-        }
-
-        if let Err(err) = self.ensure_workspace(&id).await {
-            let _ = self.delete_container(&id).await;
-            return Err(err);
-        }
-
-        Ok(ContainerHandle {
-            id,
-            name,
-            image: image.to_string(),
-        })
+        self.create_environment(&plan, &[]).await
     }
 
     pub async fn ensure_project_sidecar_container(
@@ -463,43 +445,10 @@ impl DockerClient {
         })
     }
 
-    pub async fn create_agent_mcp_sidecar_container(
-        &self,
-        agent_id: &str,
-        source_container_id: &str,
-        image: &str,
-    ) -> Result<ContainerHandle> {
-        let image = validate_image(image)?;
-        let containers = self.list_managed_containers().await?;
-        for id in agent_mcp_sidecar_container_delete_ids(&containers, agent_id) {
-            self.delete_container(&id).await?;
-        }
-        let name = agent_mcp_sidecar_container_name(agent_id);
-        let args =
-            create_agent_mcp_sidecar_container_args(&name, agent_id, image, source_container_id);
-        let create = Command::new(&self.binary)
-            .args(args.iter().map(String::as_str))
-            .output()
-            .await?;
-        if !create.status.success() {
-            return Err(DockerError::CommandFailed(stderr_or_stdout(&create)));
-        }
-        let id = String::from_utf8(create.stdout)?.trim().to_string();
-        if let Err(err) = self.start_container(&id).await {
-            let _ = self.delete_container(&id).await;
-            return Err(err);
-        }
-        if let Err(err) = self.ensure_workspace(&id).await {
-            let _ = self.delete_container(&id).await;
-            return Err(err);
-        }
-        Ok(ContainerHandle {
-            id,
-            name,
-            image: image.to_string(),
-        })
-    }
-
+    /// 删除该 Agent 的全部受管容器。
+    ///
+    /// 仅用于 Agent 删除；环境换代必须使用 `remove_containers_exact` 之类的定向清理，
+    /// 否则会误删新 generation 的候选容器。
     pub async fn delete_agent_containers(
         &self,
         agent_id: &str,
@@ -608,15 +557,6 @@ impl DockerClient {
         Ok(())
     }
 
-    async fn reusable_agent_container(
-        &self,
-        agent_id: &str,
-        preferred_container_id: Option<&str>,
-    ) -> Result<Option<ManagedContainer>> {
-        let containers = self.list_managed_containers().await?;
-        Ok(find_reusable_agent_container(&containers, agent_id, preferred_container_id).cloned())
-    }
-
     async fn reusable_project_sidecar_container(
         &self,
         project_id: &str,
@@ -663,7 +603,7 @@ impl DockerClient {
         Ok(())
     }
 
-    async fn ensure_workspace(&self, container_id: &str) -> Result<()> {
+    pub(crate) async fn ensure_workspace(&self, container_id: &str) -> Result<()> {
         let mkdir = self
             .exec_shell(container_id, "mkdir -p /workspace", Some("/"), Some(10))
             .await?;
@@ -677,7 +617,7 @@ impl DockerClient {
     }
 }
 
-fn is_missing_container_error(message: &str) -> bool {
+pub(crate) fn is_missing_container_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no such container")
         || message.contains("no such object")

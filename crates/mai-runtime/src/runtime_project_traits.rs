@@ -153,8 +153,27 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
         Ok(created.summary)
     }
 
-    async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
-        self.deps.store.save_project(project).await?;
+    async fn insert_project_row(&self, project: &ProjectSummary) -> Result<()> {
+        self.deps.store.insert_project(project).await?;
+        Ok(())
+    }
+
+    async fn save_initial_references(
+        &self,
+        project_id: ProjectId,
+        bindings: Vec<ProjectReferenceBinding>,
+    ) -> Result<()> {
+        if !bindings.is_empty() {
+            self.references
+                .replace(
+                    project_id,
+                    ReplaceProjectReferencesRequest {
+                        expected_revision: 0,
+                        bindings,
+                    },
+                )
+                .await?;
+        }
         Ok(())
     }
 

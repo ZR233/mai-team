@@ -6,6 +6,12 @@ use pl_tool::shell::shell_quote_word;
 use crate::projects::workspace::{git_shell_credential_prelude, git_shell_retry_function};
 
 impl AgentRuntime {
+    /// 发布一次克隆结果。
+    ///
+    /// 两个顺序保证：
+    /// 1. 项目已经进入 `Deleting` 时直接拒绝：删除终态不允许被迟到的克隆结果改写（store 的
+    ///    UPDATE 守卫也会拒绝把 `Deleting` 改回其它状态，这里提前给出明确错误）。
+    /// 2. 先写库、再替换内存投影：数据库拒绝（状态守卫、行已删除等）时内存不能显示成功。
     pub(super) async fn set_project_clone_result(
         &self,
         project_id: ProjectId,
@@ -14,15 +20,22 @@ impl AgentRuntime {
         last_error: Option<String>,
     ) -> Result<ProjectSummary> {
         let project = self.project(project_id).await?;
+        if project.summary.read().await.status == ProjectStatus::Deleting {
+            return Err(RuntimeError::InvalidInput(format!(
+                "project `{project_id}` is being deleted; the clone result is discarded"
+            )));
+        }
         let updated = {
-            let mut summary = project.summary.write().await;
-            summary.status = status;
-            summary.clone_status = clone_status;
-            summary.last_error = last_error;
-            summary.updated_at = now();
-            summary.clone()
+            let summary = project.summary.read().await;
+            let mut updated = summary.clone();
+            updated.status = status;
+            updated.clone_status = clone_status;
+            updated.last_error = last_error;
+            updated.updated_at = now();
+            updated
         };
         self.deps.store.save_project(&updated).await?;
+        *project.summary.write().await = updated.clone();
         self.events
             .publish(MaiProductEventKind::ProjectUpdated {
                 project: updated.clone(),

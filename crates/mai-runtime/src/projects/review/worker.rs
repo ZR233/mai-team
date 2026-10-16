@@ -20,8 +20,8 @@ use super::project_review_retry_backoff;
 use super::runs::FinishReviewRun;
 use super::singleton::{ProjectReviewRepairReason, repair_project_review_singleton};
 use super::state::ReviewStateUpdate;
-use crate::Result;
 use crate::state::{ProjectRecord, ProjectReviewWorker};
+use crate::{Result, RuntimeError};
 
 /// Provides project review worker lifecycle side effects while keeping the
 /// background loop independent of the full runtime facade.
@@ -403,22 +403,48 @@ pub(crate) async fn stop_project_review_loop(
     let _ = ops
         .cancel_active_project_review_runs(project_id, None, run_list_limit)
         .await;
+    // reviewer 是明确授权的删除对象；本函数没有 Result，所以既要留下日志，也要把失败写进
+    // 项目可见的 review 终态，不能静默当作清理成功。已经删除过的 reviewer 视为幂等完成。
+    let mut reviewer_cleanup_failures = Vec::new();
     for reviewer_id in reviewer_ids {
         if let Ok(Some(turn_id)) = ops.agent_current_turn(reviewer_id).await {
             let _ = ops.cancel_agent_turn(reviewer_id, turn_id).await;
         }
-        let _ = ops.delete_agent(reviewer_id).await;
+        match ops.delete_agent(reviewer_id).await {
+            Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
+            Err(error) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    reviewer_id = %reviewer_id,
+                    "failed to delete reviewer agent while stopping project review loop: {error}"
+                );
+                reviewer_cleanup_failures.push(format!("reviewer `{reviewer_id}`: {error}"));
+            }
+        }
     }
-    let _ = ops
+    let cleanup_error = (!reviewer_cleanup_failures.is_empty()).then(|| {
+        format!(
+            "reviewer agent cleanup failed: {}",
+            reviewer_cleanup_failures.join("; ")
+        )
+    });
+    if let Err(error) = ops
         .set_project_review_state(
             project_id,
             ProjectReviewStatus::Disabled,
             ReviewStateUpdate {
                 force_disabled: true,
+                error: cleanup_error,
                 ..Default::default()
             },
         )
-        .await;
+        .await
+    {
+        tracing::error!(
+            project_id = %project_id,
+            "failed to record the stopped project review state: {error}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -791,6 +817,7 @@ mod tests {
         finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
         cancelled_turns: Arc<Mutex<Vec<(Uuid, TurnId)>>>,
         deleted_agents: Arc<Mutex<Vec<Uuid>>>,
+        delete_agent_errors: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeWorkerOps {
@@ -815,6 +842,7 @@ mod tests {
                 finished_runs: Arc::new(Mutex::new(Vec::new())),
                 cancelled_turns: Arc::new(Mutex::new(Vec::new())),
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
+                delete_agent_errors: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -831,6 +859,10 @@ mod tests {
 
         async fn push_cache_ready_error(&self, error: impl Into<String>) {
             self.cache_ready_errors.lock().await.push(error.into());
+        }
+
+        async fn push_delete_agent_error(&self, error: impl Into<String>) {
+            self.delete_agent_errors.lock().await.push(error.into());
         }
 
         async fn set_auto_reviewers(&self, reviewers: Vec<mai_protocol::AgentSummary>) {
@@ -1472,6 +1504,13 @@ mod tests {
         }
 
         async fn delete_agent(&self, agent_id: Uuid) -> crate::Result<()> {
+            let failure = {
+                let mut errors = self.delete_agent_errors.lock().await;
+                (!errors.is_empty()).then(|| errors.remove(0))
+            };
+            if let Some(failure) = failure {
+                return Err(crate::RuntimeError::InvalidInput(failure));
+            }
             self.deleted_agents.lock().await.push(agent_id);
             self.auto_reviewers
                 .lock()
@@ -2363,6 +2402,43 @@ mod tests {
             *ops.cancelled_turns.lock().await
         );
         assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+    }
+
+    /// 缺陷敏感：reviewer 删除失败必须留下项目可见的失败终态，不能静默当作清理成功；
+    /// 失败的 reviewer 既不能出现在“已删除”记录里，也不能从项目 Agent 列表中消失。
+    #[tokio::test]
+    async fn stop_project_review_loop_reports_reviewer_cleanup_failure() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
+        let reviewer_id = reviewer.id;
+        ops.set_auto_reviewers(vec![reviewer]).await;
+        ops.push_delete_agent_error("docker rm -f failed").await;
+
+        super::stop_project_review_loop(ops.clone(), project_id, 10).await;
+
+        let summary = ops.project.summary.read().await.clone();
+        assert_eq!(ProjectReviewStatus::Disabled, summary.review_status);
+        assert_eq!(None, summary.current_reviewer_agent_id);
+        let error = summary
+            .review_last_error
+            .expect("reviewer cleanup failure must stay visible on the project");
+        assert!(error.contains("reviewer agent cleanup failed"), "{error}");
+        assert!(error.contains(&reviewer_id.to_string()), "{error}");
+        assert!(
+            ops.deleted_agents.lock().await.is_empty(),
+            "删除失败不能报告成已经删除"
+        );
+        assert_eq!(
+            vec![reviewer_id],
+            ops.project_auto_reviewer_agents(project_id)
+                .await
+                .iter()
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

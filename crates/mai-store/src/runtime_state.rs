@@ -3,6 +3,33 @@ use crate::records::*;
 use crate::*;
 
 impl MaiStore {
+    /// 创建一条新的产品 Agent 行。
+    ///
+    /// 只负责创建：ID 已存在或该 ID 仍在退休流程里都显式失败；普通更新必须走
+    /// [`MaiStore::save_agent`]，那条路径不会复活已删除的父行。
+    pub async fn insert_agent(
+        &self,
+        summary: &AgentSummary,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async {
+            self.insert_agent_once(summary, system_prompt).await
+        })
+        .await
+    }
+
+    async fn insert_agent_once(
+        &self,
+        summary: &AgentSummary,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        crate::parent_saves::insert_agent_row(self, summary, system_prompt).await
+    }
+
+    /// 更新一条已经存在的产品 Agent 行。
+    ///
+    /// 目标行不存在（例如已经被删除）时显式失败：普通保存既不会复活父行，也不会清掉
+    /// `retired_agent_sessions` 的墓碑。
     pub async fn save_agent(
         &self,
         summary: &AgentSummary,
@@ -19,47 +46,7 @@ impl MaiStore {
         summary: &AgentSummary,
         system_prompt: Option<&str>,
     ) -> Result<()> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        delete_agent_row_in_tx(&mut tx, summary.id).await?;
-        Query::<List<RetiredAgentSessionRecord>>::filter(
-            RetiredAgentSessionRecord::fields()
-                .agent_id()
-                .eq(summary.id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        toasty::create!(AgentRecordRow {
-            id: summary.id.to_string(),
-            parent_id: summary.parent_id.map(|id| id.to_string()),
-            task_id: summary.task_id.map(|id| id.to_string()),
-            project_id: summary.project_id.map(|id| id.to_string()),
-            role: summary.role.map(|r| r.to_string()),
-            profile_id: summary.profile_id.clone(),
-            workspace_json: summary
-                .workspace
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
-            review_run_id: summary.review_run_id.map(|id| id.to_string()),
-            name: summary.name.clone(),
-            resource_state: summary.resource.state.to_string(),
-            resource_error: summary.resource.error.clone(),
-            container_id: summary.container_id.clone(),
-            docker_image: summary.docker_image.clone(),
-            provider_id: summary.provider_id.clone(),
-            provider_name: summary.provider_name.clone(),
-            model: summary.model.clone(),
-            reasoning_effort: summary.reasoning_effort.clone(),
-            created_at: summary.created_at.to_rfc3339(),
-            updated_at: summary.updated_at.to_rfc3339(),
-            system_prompt: system_prompt.map(str::to_string),
-        })
-        .exec(&mut tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        crate::parent_saves::save_agent_row(self, summary, system_prompt).await
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -68,39 +55,7 @@ impl MaiStore {
     }
 
     async fn delete_agent_once(&self, agent_id: AgentId) -> Result<()> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        delete_agent_row_in_tx(&mut tx, agent_id).await?;
-        Query::<List<RetiredAgentSessionRecord>>::filter(
-            RetiredAgentSessionRecord::fields()
-                .agent_id()
-                .eq(agent_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        toasty::create!(RetiredAgentSessionRecord {
-            agent_id: agent_id.to_string(),
-            retired_at: Utc::now().to_rfc3339(),
-        })
-        .exec(&mut tx)
-        .await?;
-        Query::<List<AgentLogRecord>>::filter(
-            AgentLogRecord::fields().agent_id().eq(agent_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        Query::<List<ToolTraceRecord>>::filter(
-            ToolTraceRecord::fields()
-                .agent_id()
-                .eq(agent_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        crate::resource_deletion::delete_agent(self, agent_id).await
     }
 
     /// 查询已到期且没有重新创建产品 Agent 的会话身份；不读取 PL 数据库。
@@ -180,15 +135,4 @@ impl MaiStore {
             next_sequence,
         })
     }
-}
-
-pub(crate) async fn delete_agent_row_in_tx(
-    tx: &mut toasty::Transaction<'_>,
-    agent_id: AgentId,
-) -> Result<()> {
-    Query::<List<AgentRecordRow>>::filter(AgentRecordRow::fields().id().eq(agent_id.to_string()))
-        .delete()
-        .exec(tx)
-        .await?;
-    Ok(())
 }

@@ -68,7 +68,7 @@ impl MaiStore {
             })?;
             if version.as_deref() != Some(SCHEMA_VERSION) {
                 return Err(StoreError::InvalidConfig(format!(
-                    "数据库 schema 为 {}，mai-server 仅支持 {SCHEMA_VERSION}；旧运行数据不再兼容，请先备份并创建新数据目录",
+                    "数据库 schema 为 {}，mai-server 仅支持 {SCHEMA_VERSION}；请停服后使用 mai-migrate-references check/migrate 备份并迁移，保留原数据目录",
                     version.as_deref().unwrap_or("未标记")
                 )));
             }
@@ -77,6 +77,9 @@ impl MaiStore {
         let mut db = build_db(&path).await?;
         if was_empty {
             db.push_schema().await?;
+            crate::reference_schema::create_reference_schema(&crate::parent_saves::connection(
+                &path,
+            )?)?;
             set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
         }
 

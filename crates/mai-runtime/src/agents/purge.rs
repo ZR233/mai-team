@@ -22,19 +22,27 @@ pub(crate) trait AgentPurgeOps: Send + Sync {
     fn publish_agent_deleted(&self, agent_id: AgentId) -> impl Future<Output = ()> + Send;
 }
 
-pub(crate) async fn purge_agent_tree(ops: &impl AgentPurgeOps, root_id: AgentId) -> Result<()> {
-    let summaries = ops.agent_summaries().await;
-    let targets = descendant_delete_order(root_id, &summaries)?;
-    for agent_id in targets {
-        ops.delete_agent_artifacts(agent_id).await?;
-        ops.delete_agent_from_store(agent_id).await?;
-        ops.remove_agent_from_memory(agent_id).await;
-        ops.publish_agent_deleted(agent_id).await;
-    }
+/// 删除单个 Agent 的产品记录：先删产物，再持久化删除，随后移除内存投影并发布事件。
+///
+/// 调用方负责在此之前释放该 Agent 的运行资源与租约；本函数不接触 Docker、工作区或
+/// canonical Thread，只清理明确归属产品的记录，因此天然幂等。
+pub(crate) async fn purge_agent_records(ops: &impl AgentPurgeOps, agent_id: AgentId) -> Result<()> {
+    ops.delete_agent_artifacts(agent_id).await?;
+    ops.delete_agent_from_store(agent_id).await?;
+    ops.remove_agent_from_memory(agent_id).await;
+    ops.publish_agent_deleted(agent_id).await;
     Ok(())
 }
 
-fn descendant_delete_order(root_id: AgentId, summaries: &[AgentSummary]) -> Result<Vec<AgentId>> {
+/// 子先于父的删除顺序：同一个 `root_id` 子树里的每个 Agent 恰好出现一次。
+///
+/// 整棵树必须按这份顺序逐个节点处理，每个节点在自己的生命周期锁内完成资源释放与记录
+/// 删除，因此这里只推导顺序，不自己遍历删除。
+/// `root_id` 不在当前快照里时显式失败，不做猜测。
+pub(crate) fn descendant_delete_order(
+    root_id: AgentId,
+    summaries: &[AgentSummary],
+) -> Result<Vec<AgentId>> {
     if !summaries.iter().any(|summary| summary.id == root_id) {
         return Err(RuntimeError::AgentNotFound(root_id));
     }
@@ -160,7 +168,9 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        purge_agent_tree(&ops, agent_id).await.expect("purge agent");
+        purge_agent_records(&ops, agent_id)
+            .await
+            .expect("purge agent");
 
         assert!(!namespace.exists());
         assert_eq!(

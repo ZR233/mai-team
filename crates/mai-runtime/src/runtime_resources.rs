@@ -82,17 +82,10 @@ impl AgentRuntime {
     }
 
     pub(super) async fn container_id(&self, agent_id: AgentId) -> Result<String> {
-        let agent = self.agent(agent_id).await?;
-        if let Some(container_id) = agent
-            .container
-            .read()
-            .await
-            .as_ref()
-            .map(|container| container.id.clone())
-            && agent.mcp.read().await.is_some()
-        {
-            return Ok(container_id);
+        if let Ok(lease) = self.references.leases.acquire(agent_id).await {
+            return Ok(lease.container_id().to_string());
         }
+        let agent = self.agent(agent_id).await?;
         let project_id = agent.summary.read().await.project_id;
         let source = self
             .agent_container_source_for_project(

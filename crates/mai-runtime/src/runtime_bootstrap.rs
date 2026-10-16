@@ -36,6 +36,7 @@ impl AgentRuntime {
         self.review_discovery_scheduler.shutdown().await?;
         self.review_ci_watch_scheduler.shutdown().await?;
 
+        self.references.shutdown().await;
         let thread_failures = self.thread_kernel.shutdown().await;
         if !thread_failures.is_empty() {
             let detail = thread_failures
@@ -78,6 +79,7 @@ impl AgentRuntime {
         config: RuntimeConfig,
         github_backend: Option<Arc<dyn GithubAppBackend>>,
     ) -> Result<Arc<Self>> {
+        let docker = docker.with_snapshot_owner(mai_references::reference_snapshot_owner(&store)?);
         let skills = SkillCatalogService::new_with_system_root(
             &config.repo_root,
             config.system_skills_root.as_ref(),
@@ -137,7 +139,7 @@ impl AgentRuntime {
                         == Some(project_id)
                 })
                 .count();
-            if project_agents == 0 {
+            if project_agents == 0 && summary.status != ProjectStatus::Deleting {
                 summary.status = ProjectStatus::Failed;
                 summary.clone_status = ProjectCloneStatus::Failed;
                 summary.last_error = Some("maintainer agent is missing".to_string());
@@ -179,7 +181,25 @@ impl AgentRuntime {
         let mai_config = Arc::new(RwLock::new(config::load_or_initialize(&store).await?));
         let sessions_root = config.sessions_root.clone();
 
+        let reference_policy = config
+            .references_policy_path
+            .as_deref()
+            .map(mai_references::load_reference_deployment_policy)
+            .transpose()?;
+        if reference_policy.is_some() {
+            docker.probe_capabilities().await?;
+        }
+        let reference_catalog =
+            mai_references::ReferenceCatalog::new(Arc::clone(&store), reference_policy);
+        let references = mai_references::ReferenceApplications::new(
+            Arc::clone(&store),
+            docker.clone(),
+            reference_catalog,
+            config.reference_application_observer.clone(),
+        );
+        references.restore_admission().await?;
         let runtime = Arc::new(Self {
+            references,
             self_ref: OnceLock::new(),
             deps: RuntimeDeps {
                 docker,
@@ -216,6 +236,15 @@ impl AgentRuntime {
             .self_ref
             .set(Arc::downgrade(&runtime))
             .expect("a new runtime has no prior self reference");
+        runtime.start_reference_services().await?;
+        // 收据恢复先保护仍被引用的资源；孤儿清理必须在任何审查 worker 启动之前完成。
+        let cleaned = runtime.cleanup_orphaned_containers().await?;
+        if !cleaned.is_empty() {
+            tracing::info!(
+                count = cleaned.len(),
+                "removed orphaned mai-team containers before review startup"
+            );
+        }
         runtime.reconcile_project_workspaces().await?;
         runtime.restore_project_repositories().await;
         runtime
@@ -430,6 +459,16 @@ impl AgentRuntime {
                 None
             }
         };
+        // 初次创建环境在锁外完成；装配和发布 Thread 再与换代串行，避免
+        // activation 看见「尚未驻留」后，旧 generation 的工具才发布。
+        if route.is_some() {
+            self.environment_lease(summary.id).await?;
+        }
+        let admission = self.references.admissions.agent(summary.id);
+        let _lifecycle = admission.lifecycle.lock().await;
+        if route.is_some() {
+            self.references.leases.acquire(summary.id).await?;
+        }
         let tools = if route.is_some() {
             thread_host::assemble_thread_tools(ThreadToolRequest {
                 runtime: Arc::clone(self),
@@ -441,11 +480,17 @@ impl AgentRuntime {
             thread_host::ThreadToolAssembly::default()
         };
         let spec = thread_kernel::ThreadSpec {
+            admission: self.references.admissions.agent(summary.id).gate.clone(),
             id: thread_id,
             checkpoint,
             route,
             hosted_tools: tools.hosted_tools,
-            context_preparation: None,
+            context_preparation: Some(pl_core::thread::context_preparation::ContextPreparer::new(
+                crate::runtime_reference_context::ReferenceContextPreparer::new(
+                    summary.id,
+                    Arc::clone(&self.references),
+                ),
+            )),
             initial_context: seed.context,
             initial_extensions: seed.extensions,
             registrations: tools.registrations,

@@ -36,18 +36,10 @@ pub(crate) struct ContainerMcpRuntime {
 impl ContainerMcpRuntime {
     pub(crate) async fn start(
         docker: DockerClient,
-        agent_id: mai_protocol::AgentId,
-        agent_container_id: String,
-        sidecar_image: &str,
+        plan: mai_docker::AgentMcpSidecarPlan,
         settings: ContainerMcpSettings,
     ) -> Result<Self> {
-        let sidecar = docker
-            .create_agent_mcp_sidecar_container(
-                &agent_id.to_string(),
-                &agent_container_id,
-                sidecar_image,
-            )
-            .await?;
+        let sidecar = docker.ensure_agent_mcp_sidecar_environment(&plan).await?;
         let handle = McpRuntime::new(McpConnector::default()).handle();
         let runtime = Self {
             docker,
@@ -315,6 +307,18 @@ mod tests {
             bearer_token: None,
             tool_effect: None,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_mcp_reconcile_and_status_finish_without_a_peer() {
+        let handle = McpRuntime::new(McpConnector::default()).handle();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            handle.reconcile(BTreeMap::new()).await.expect("空配置");
+            assert!(handle.snapshots().await.is_empty());
+            handle.shutdown().await.expect("关闭");
+        })
+        .await
+        .expect("空 MCP 不应阻塞装配");
     }
 
     #[test]

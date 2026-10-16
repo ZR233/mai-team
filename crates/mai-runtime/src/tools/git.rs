@@ -3,17 +3,20 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
+use mai_docker::project_agent_workspace_volume;
+#[cfg(test)]
+use mai_protocol::AgentId;
+use mai_protocol::ProjectId;
 #[cfg(test)]
 use mai_protocol::ProjectSummary;
-use mai_protocol::{AgentId, ProjectId};
 use pl_core::tool::opaque::{Registration, ToolAuthorization};
+#[cfg(test)]
 use pl_tool::execution::{ExecutionBackend, ExecutionOutput, ExecutionRequest};
+#[cfg(test)]
+use pl_tool::git::GIT_TOKEN_ENV;
 use pl_tool::git::{
-    GIT_TOKEN_ENV, GitCredential, GitCredentialProvider, GitCredentialRequest, GitPolicy,
-    GitWorkspaceConfig,
+    GitCredential, GitCredentialProvider, GitCredentialRequest, GitPolicy, GitWorkspaceConfig,
 };
-use pl_tool::shell::shell_quote_word;
 #[cfg(test)]
 use serde_json::Value;
 use serde_json::json;
@@ -23,6 +26,7 @@ use tokio::process::Command;
 use crate::github::github_clone_url;
 use crate::projects;
 use crate::state::AgentRecord;
+use crate::tools::git_execution::MaiGitExecutionBackend;
 use crate::{AgentRuntime, Result, RuntimeError};
 
 #[cfg(test)]
@@ -154,6 +158,9 @@ pub(crate) async fn native_git_tool_runtime(
     let project_summary = project.summary.read().await.clone();
     let workspace_volume =
         project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
+    // Git 工具与命令/文件工具一样冻结本 Thread 的环境 generation：装配时取一次租约，
+    // 运行前确认它仍然有效，运行中被撤销则清理本次 sidecar（见 `git_execution`）。
+    let lease = runtime.environment_lease(summary.id).await?;
     let mut workspace_info = BTreeMap::new();
     workspace_info.insert("project_id".to_string(), json!(project_id));
     workspace_info.insert("workspace_volume".to_string(), json!(workspace_volume));
@@ -167,13 +174,14 @@ pub(crate) async fn native_git_tool_runtime(
         remote_url: Some(remote_url),
         workspace_info,
     };
-    let backend = Arc::new(MaiGitExecutionBackend {
-        docker: runtime.deps.docker.clone(),
-        sidecar_image: runtime.sidecar_image.clone(),
+    let backend = Arc::new(MaiGitExecutionBackend::new(
+        runtime.deps.docker.clone(),
+        runtime.sidecar_image.clone(),
         workspace_volume,
-        repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string(),
-        agent_id: summary.id,
-    });
+        projects::workspace::AGENT_WORKSPACE_REPO_PATH,
+        summary.id,
+        lease,
+    ));
     let credential_provider = Arc::new(MaiGitCredentialProvider::Project {
         runtime,
         project_id,
@@ -285,39 +293,6 @@ impl ExecutionBackend for ProjectGitExecutionBackend {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct MaiGitExecutionBackend {
-    docker: DockerClient,
-    sidecar_image: String,
-    workspace_volume: String,
-    repo_path: String,
-    agent_id: AgentId,
-}
-
-impl fmt::Debug for MaiGitExecutionBackend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MaiGitExecutionBackend")
-            .field("agent_id", &self.agent_id)
-            .finish()
-    }
-}
-
-impl ExecutionBackend for MaiGitExecutionBackend {
-    type Error = RuntimeError;
-
-    async fn run(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
-        run_sidecar_git_output(
-            &self.docker,
-            &self.sidecar_image,
-            &self.workspace_volume,
-            &self.repo_path,
-            self.agent_id,
-            request,
-        )
-        .await
-    }
-}
-
 #[cfg(test)]
 async fn run_host_git_request(request: ExecutionRequest) -> Result<ExecutionOutput> {
     let mut command = Command::new(&request.program);
@@ -354,91 +329,6 @@ fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Pat
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
         .env_remove(GIT_TOKEN_ENV);
-}
-
-async fn run_sidecar_git_output(
-    docker: &DockerClient,
-    sidecar_image: &str,
-    workspace_volume: &str,
-    repo_path: &str,
-    agent_id: AgentId,
-    request: ExecutionRequest,
-) -> Result<ExecutionOutput> {
-    let token = request.env.get(GIT_TOKEN_ENV).map(String::as_str);
-    // mai 负责 sidecar 物理执行环境，因此不复用宿主侧的 `GIT_ASKPASS` 路径：
-    // 凭据存在时在容器内生成临时 askpass 脚本，并只透传 token 本身。
-    let credential = match token {
-        Some(_) => SidecarGitCredential::EnvToken,
-        None => SidecarGitCredential::Disabled,
-    };
-    let command = sidecar_git_command(repo_path, &request.program, &request.args, credential);
-    let env = token
-        .map(|token| vec![(GIT_TOKEN_ENV.to_string(), token.to_string())])
-        .unwrap_or_default();
-    let timeout_secs = request.timeout.map(|timeout| timeout.as_secs());
-    let sidecar_name = format!("mai-tool-git-{agent_id}-{}", uuid::Uuid::new_v4());
-    let output = docker
-        .run_sidecar_shell_env(&SidecarParams {
-            name: &sidecar_name,
-            image: sidecar_image,
-            command: &command,
-            args: &[],
-            cwd: Some(repo_path),
-            env: &env,
-            workspace_volume: Some(workspace_volume),
-            mounts: &[],
-            timeout_secs,
-        })
-        .await?;
-    Ok(ExecutionOutput {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
-/// sidecar 内 git 命令的凭据注入模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidecarGitCredential {
-    Disabled,
-    EnvToken,
-}
-
-/// 构造在 sidecar 容器内执行的 git 命令。
-///
-/// 只复用 pl-tool 公开的 askpass 脚本文本，命令编排属于 mai 的 sidecar 传输层：
-/// 固定关闭 hooks、声明 safe.directory 并清空 credential.helper，参数由 pl-tool 已校验。
-fn sidecar_git_command(
-    repo_path: &str,
-    program: &std::path::Path,
-    args: &[String],
-    credential: SidecarGitCredential,
-) -> String {
-    let mut parts = vec![
-        shell_quote_word(&program.to_string_lossy()),
-        "-c".to_string(),
-        shell_quote_word("core.hooksPath=/dev/null"),
-        "-c".to_string(),
-        shell_quote_word(&format!("safe.directory={repo_path}")),
-        "-c".to_string(),
-        shell_quote_word("credential.helper="),
-    ];
-    parts.extend(args.iter().map(|arg| shell_quote_word(arg)));
-    let git_command = parts.join(" ");
-    match credential {
-        SidecarGitCredential::Disabled => git_command,
-        SidecarGitCredential::EnvToken => format!(
-            "askpass=/tmp/mai-git-askpass-$$.sh\n\
-             trap 'rm -f \"$askpass\"' EXIT\n\
-             cat > \"$askpass\" <<'MAI_GIT_ASKPASS'\n\
-             {}MAI_GIT_ASKPASS\n\
-             chmod 700 \"$askpass\"\n\
-             export GIT_ASKPASS=\"$askpass\"\n\
-             export GIT_TERMINAL_PROMPT=0\n\
-             {git_command}",
-            pl_tool::git::git_askpass_script()
-        ),
-    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ use tokio::sync::Notify;
 /// `route` 由产品层负责解析；已持久化 Thread 的模型配置不可用时为 `None`，
 /// 仍可恢复历史并等待后续模型替换。新 Thread 必须提供可用路由。
 pub struct ThreadSpec {
+    pub admission: pl_core::thread::admission::TurnAdmissionGate,
     pub id: String,
     pub checkpoint: Option<ThreadCheckpoint>,
     pub route: Option<ResolvedModelRoute>,
@@ -367,13 +368,19 @@ impl ThreadKernel {
             let model =
                 ThreadModel::new(ModelRuntime::from_route(route)?, route.reasoning_config())
                     .with_hosted_tools(spec.hosted_tools);
-            ThreadHandle::resume(
+            ThreadHandle::resume_with_turn_admission_gate(
                 spec.id.clone(),
-                ModelFactory::new(model).open_session().await?,
+                Some(ModelFactory::new(model).open_session().await?),
                 spec.checkpoint,
+                spec.admission.clone(),
             )?
         } else {
-            ThreadHandle::resume_without_model(spec.id.clone(), spec.checkpoint)?
+            ThreadHandle::resume_with_turn_admission_gate(
+                spec.id.clone(),
+                None,
+                spec.checkpoint,
+                spec.admission.clone(),
+            )?
         };
 
         let thread_id = spec.id.clone();

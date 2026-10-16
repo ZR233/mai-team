@@ -16,6 +16,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { StatusDot } from "@/components/status"
+import { useReferenceNavigationGuard } from "@/features/references/use-reference-draft"
 
 const navigation = [
   { to: "/chat", label: "Chat", icon: MessageCircle },
@@ -28,6 +29,8 @@ const navigation = [
 export function AppSidebar() {
   const { pathname } = useLocation()
   const { setOpenMobile } = useSidebar()
+  // 存在未保存的参考源码草稿时确认离开；草稿本身按项目保留，不会被丢弃或串到别的项目。
+  const { confirmLeave } = useReferenceNavigationGuard()
 
   return (
     <Sidebar collapsible="icon">
@@ -54,7 +57,16 @@ export function AppSidebar() {
               {navigation.map(({ to, label, icon: Icon }) => (
                 <SidebarMenuItem key={to}>
                   <SidebarMenuButton asChild isActive={pathname === to || pathname.startsWith(`${to}/`)} tooltip={label}>
-                    <NavLink to={to} onClick={() => setOpenMobile(false)}>
+                    <NavLink
+                      to={to}
+                      onClick={(event) => {
+                        if (!confirmLeave()) {
+                          event.preventDefault()
+                          return
+                        }
+                        setOpenMobile(false)
+                      }}
+                    >
                       <Icon />
                       <span>{label}</span>
                     </NavLink>

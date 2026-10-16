@@ -1,7 +1,99 @@
 use std::collections::HashSet;
 
+use uuid::Uuid;
+
+use crate::error::{DockerError, Result};
 use crate::inspect::ManagedContainer;
 use crate::naming::{AGENT_MCP_SIDECAR_KIND, PROJECT_SIDECAR_KIND};
+
+/// 定向删除时对“ID 已经不存在”的处理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerRemovalPolicy {
+    /// 未知 ID 视为错误；用于必须完成删除的清理步骤。
+    RequireManaged,
+    /// 已消失的 ID 视为已完成；用于崩溃后重试同一次清理。
+    TolerateMissing,
+}
+
+/// 定位某个计划对应的候选 Agent 容器。
+///
+/// 指定 generation 时只接受同一 generation 的容器；未指定 generation 时优先已发布
+/// 的容器 ID，其次任意属于该 Agent 的非 sidecar 容器。sidecar 永远不是候选。
+pub(crate) fn find_environment_candidate<'a>(
+    containers: &'a [ManagedContainer],
+    agent_id: &str,
+    generation: Option<Uuid>,
+    published_container_id: Option<&str>,
+) -> Option<&'a ManagedContainer> {
+    let Some(generation) = generation else {
+        // 未指定 generation 时沿用既有选择语义（优先已发布 ID，其次标签回退）。
+        return find_reusable_agent_container(containers, agent_id, published_container_id);
+    };
+
+    let matches_generation =
+        |container: &ManagedContainer| container.generation == Some(generation);
+    let published = published_container_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(published) = published
+        && let Some(container) = containers.iter().find(|container| {
+            !container.sidecar
+                && matches_generation(container)
+                && container.matches_identifier(published)
+        })
+    {
+        return Some(container);
+    }
+    containers.iter().find(|container| {
+        !container.sidecar
+            && container.agent_id.as_deref() == Some(agent_id)
+            && matches_generation(container)
+    })
+}
+
+/// 把精确 ID 解析成实际存在的受管容器 ID。
+///
+/// 未出现在受管列表中的 ID 一律不删除：既避免删掉非本项目的容器，也避免把名字前缀
+/// 当成授权。受保护 ID（旧候选、旧快照来源）同样拒绝。
+pub(crate) fn exact_container_removal_targets(
+    containers: &[ManagedContainer],
+    requested_ids: &[String],
+    protected_ids: &[String],
+    policy: ContainerRemovalPolicy,
+) -> Result<Vec<String>> {
+    let mut targets = Vec::new();
+    for requested in requested_ids {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            continue;
+        }
+        // 先要求完整 ID/名字相等，再允许受管容器内的前缀匹配，避免前缀歧义。
+        let container = containers
+            .iter()
+            .find(|container| container.id == requested || container.name == requested)
+            .or_else(|| {
+                containers
+                    .iter()
+                    .find(|container| container.matches_identifier(requested))
+            });
+        let Some(container) = container else {
+            if policy == ContainerRemovalPolicy::TolerateMissing {
+                continue;
+            }
+            return Err(DockerError::UnknownContainer(requested.to_string()));
+        };
+        if protected_ids.iter().any(|protected| {
+            let protected = protected.trim();
+            !protected.is_empty() && container.matches_identifier(protected)
+        }) {
+            return Err(DockerError::ProtectedContainer(container.id.clone()));
+        }
+        if !targets.contains(&container.id) {
+            targets.push(container.id.clone());
+        }
+    }
+    Ok(targets)
+}
 
 pub(crate) fn orphaned_container_ids(
     containers: &[ManagedContainer],
@@ -65,22 +157,6 @@ pub(crate) fn find_reusable_agent_container<'a>(
     containers
         .iter()
         .find(|container| !container.sidecar && container.agent_id.as_deref() == Some(agent_id))
-}
-
-pub(crate) fn agent_mcp_sidecar_container_delete_ids(
-    containers: &[ManagedContainer],
-    agent_id: &str,
-) -> Vec<String> {
-    dedupe_container_ids(
-        containers
-            .iter()
-            .filter(|container| {
-                container.sidecar
-                    && container.sidecar_kind.as_deref() == Some(AGENT_MCP_SIDECAR_KIND)
-                    && container.agent_id.as_deref() == Some(agent_id)
-            })
-            .map(|container| container.id.clone()),
-    )
 }
 
 pub(crate) fn project_sidecar_container_delete_ids(
@@ -301,6 +377,7 @@ mod tests {
             project_id: None,
             sidecar: false,
             sidecar_kind: None,
+            generation: None,
         }
     }
 
@@ -314,6 +391,7 @@ mod tests {
             project_id: Some(project_id.to_string()),
             sidecar: true,
             sidecar_kind: Some(PROJECT_SIDECAR_KIND.to_string()),
+            generation: None,
         }
     }
 
@@ -327,6 +405,76 @@ mod tests {
             project_id: None,
             sidecar: true,
             sidecar_kind: Some(AGENT_MCP_SIDECAR_KIND.to_string()),
+            generation: None,
         }
+    }
+
+    #[test]
+    fn environment_candidate_requires_the_expected_generation() {
+        let generation = Uuid::parse_str("8f058410-c69e-45d6-a10d-d204db72b30a").expect("uuid");
+        let containers = vec![
+            managed_with_generation("old-generation", Some("agent-1"), None),
+            managed_with_generation("new-generation", Some("agent-1"), Some(generation)),
+            managed_with_generation("other-agent", Some("agent-2"), Some(generation)),
+        ];
+
+        assert_eq!(
+            find_environment_candidate(&containers, "agent-1", Some(generation), None)
+                .map(|container| container.id.as_str()),
+            Some("new-generation")
+        );
+        assert_eq!(
+            find_environment_candidate(&containers, "agent-1", None, Some("old-generation"))
+                .map(|container| container.id.as_str()),
+            Some("old-generation")
+        );
+        assert_eq!(
+            find_environment_candidate(&containers, "agent-3", Some(generation), None),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_removal_never_deletes_unknown_or_protected_containers() {
+        let containers = vec![managed("owned-1", Some("agent-1"))];
+
+        assert!(matches!(
+            exact_container_removal_targets(
+                &containers,
+                &["not-managed".to_string()],
+                &[],
+                ContainerRemovalPolicy::RequireManaged
+            ),
+            Err(DockerError::UnknownContainer(id)) if id == "not-managed"
+        ));
+        assert!(matches!(
+            exact_container_removal_targets(
+                &containers,
+                &["owned-1".to_string()],
+                &["owned-1".to_string()],
+                ContainerRemovalPolicy::RequireManaged
+            ),
+            Err(DockerError::ProtectedContainer(id)) if id == "owned-1"
+        ));
+        assert_eq!(
+            exact_container_removal_targets(
+                &containers,
+                &["owned-1".to_string(), "already-gone".to_string()],
+                &[],
+                ContainerRemovalPolicy::TolerateMissing
+            )
+            .expect("tolerate missing"),
+            vec!["owned-1".to_string()]
+        );
+    }
+
+    fn managed_with_generation(
+        id: &str,
+        agent_id: Option<&str>,
+        generation: Option<Uuid>,
+    ) -> ManagedContainer {
+        let mut container = managed(id, agent_id);
+        container.generation = generation;
+        container
     }
 }

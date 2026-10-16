@@ -39,6 +39,10 @@ mod runtime_environment;
 mod runtime_product_api;
 mod runtime_project_traits;
 mod runtime_provisioning;
+mod runtime_reference_context;
+mod runtime_reference_environment;
+mod runtime_reference_host;
+mod runtime_references;
 mod runtime_resources;
 mod runtime_review_context;
 mod runtime_review_traits;
@@ -124,6 +128,8 @@ impl From<ProjectReviewPoolEnqueueSummary> for ProjectReviewQueueSummary {
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("参考环境错误：{0}")]
+    Reference(#[from] mai_references::ReferenceError),
     #[error("agent not found: {0}")]
     AgentNotFound(AgentId),
     #[error("task not found: {0}")]
@@ -195,6 +201,10 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    pub references_policy_path: Option<PathBuf>,
+    /// 隔离验收的持久阶段观察点；正常产品服务始终为 None。
+    pub reference_application_observer:
+        Option<Arc<dyn mai_references::ReferenceApplicationObserver>>,
     pub repo_root: PathBuf,
     pub projects_root: PathBuf,
     pub sessions_root: PathBuf,
@@ -208,6 +218,7 @@ pub struct RuntimeConfig {
 }
 
 pub struct AgentRuntime {
+    references: Arc<mai_references::ReferenceApplications>,
     self_ref: OnceLock<Weak<AgentRuntime>>,
     deps: RuntimeDeps,
     state: RuntimeState,
@@ -368,3 +379,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_references_recovery_acceptance;

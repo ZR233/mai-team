@@ -62,10 +62,13 @@ pub(crate) struct PreparedAgentWorkspace {
 
 /// 恢复既有 Thread 的派生运行资源所需端口。
 ///
-/// 实现必须让关闭容器和删除 workspace 保持幂等；`prepare_agent_workspace` 可以创建
-/// workspace，但不得修改 canonical Thread 或产品 Agent 身份；`mark_recovery_failed`
-/// 只能更新派生资源状态，不得清除消息历史。
+/// 实现必须让关闭执行环境和删除 workspace 保持幂等。`close_agent_resources` 只停止执行
+/// 环境并撤销租约，必须保留已发布容器、binding 与工作区收据，让随后的 `start_agent_container`
+/// 能按同一 binding 重新验证并复用同一环境；恢复不得先删容器再退回基础镜像。
+/// `prepare_agent_workspace` 可以创建 workspace，但不得修改 canonical Thread 或产品 Agent
+/// 身份；`mark_recovery_failed` 只能更新派生资源状态，不得清除消息历史。
 pub(crate) trait AgentResourceRecoveryOps: Send + Sync + 'static {
+    /// 关闭（只停止、保留收据）该 Agent 的派生执行环境。
     fn close_agent_resources(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
 
     fn prepare_agent_workspace(
@@ -233,7 +236,10 @@ async fn rollback_agent_resource_recovery<O: AgentResourceRecoveryOps>(
     failure: String,
 ) -> Result<()> {
     let mut rollback_errors = Vec::new();
-    if let Err(error) = ops.close_agent_resources(request.agent_id).await {
+    // 删除流程已取得所有权并清理资源时，同一 Agent 的缺失代表回滚已完成。
+    if let Err(error) = ops.close_agent_resources(request.agent_id).await
+        && !matches!(&error, RuntimeError::AgentNotFound(id) if *id == request.agent_id)
+    {
         rollback_errors.push(format!("container cleanup: {error}"));
     }
     if workspace_preparation_started
@@ -250,6 +256,7 @@ async fn rollback_agent_resource_recovery<O: AgentResourceRecoveryOps>(
     if let Err(error) = ops
         .mark_recovery_failed(request.agent_id, persisted_failure)
         .await
+        && !matches!(&error, RuntimeError::AgentNotFound(id) if *id == request.agent_id)
     {
         rollback_errors.push(format!("failure persistence: {error}"));
     }
@@ -275,11 +282,15 @@ mod tests {
     struct FakeRecoveryOps {
         calls: Mutex<Vec<&'static str>>,
         fail_start: AtomicBool,
+        deleted: AtomicBool,
     }
 
     impl AgentResourceRecoveryOps for FakeRecoveryOps {
-        async fn close_agent_resources(&self, _agent_id: AgentId) -> Result<()> {
+        async fn close_agent_resources(&self, agent_id: AgentId) -> Result<()> {
             self.calls.lock().await.push("close");
+            if self.deleted.load(Ordering::Acquire) {
+                return Err(RuntimeError::AgentNotFound(agent_id));
+            }
             Ok(())
         }
 
@@ -310,10 +321,31 @@ mod tests {
             Ok(())
         }
 
-        async fn mark_recovery_failed(&self, _agent_id: AgentId, _error: String) -> Result<()> {
+        async fn mark_recovery_failed(&self, agent_id: AgentId, _error: String) -> Result<()> {
             self.calls.lock().await.push("failed");
+            if self.deleted.load(Ordering::Acquire) {
+                return Err(RuntimeError::AgentNotFound(agent_id));
+            }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn deleted_agent_recovery_preserves_typed_absence() {
+        let ops = Arc::new(FakeRecoveryOps::default());
+        ops.deleted.store(true, Ordering::Release);
+        let agent_id = Uuid::new_v4();
+        let error = recover_agent_resources(
+            Arc::clone(&ops),
+            AgentResourceRecoveryRequest::borrowed_workspace(agent_id),
+        )
+        .await
+        .expect_err("删除应阻止恢复");
+        assert_eq!(
+            error.to_string(),
+            RuntimeError::AgentNotFound(agent_id).to_string()
+        );
+        assert_eq!(*ops.calls.lock().await, vec!["close", "close", "failed"]);
     }
 
     #[tokio::test]

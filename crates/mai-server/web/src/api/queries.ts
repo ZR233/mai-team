@@ -1,6 +1,13 @@
 import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
 
 import { api } from "@/api/client"
+import { referenceApi } from "@/api/reference-client"
+import type {
+  ProjectReferenceConfiguration,
+  ProjectReferenceStatus,
+  ReferenceSource,
+  ReferenceSourcePolicy,
+} from "@/api/reference-types"
 import type { ThreadTurnHistory, ThreadTurnPage } from "@/events/thread-events.generated"
 import type {
   AgentDetail,
@@ -49,6 +56,11 @@ export const queryKeys = {
   relay: ["relay"] as const,
   webSearch: ["web-search"] as const,
   mcpServers: ["mcp-servers"] as const,
+  referenceSources: ["reference-sources"] as const,
+  referenceSource: (id: string) => ["reference-sources", id] as const,
+  referenceSourcePolicy: ["reference-source-policy"] as const,
+  projectReferences: (id: string) => ["projects", id, "references"] as const,
+  projectReferencesStatus: (id: string) => ["projects", id, "references", "status"] as const,
 }
 
 function query(params: Record<string, string | null | undefined>) {
@@ -177,4 +189,46 @@ export const providerCatalogQuery = () => queryOptions({
   queryKey: queryKeys.providerCatalog,
   queryFn: () => api<ProviderCatalog>("/provider-catalog"),
   staleTime: Number.POSITIVE_INFINITY,
+})
+
+export const referenceSourcesQuery = () => queryOptions({
+  queryKey: queryKeys.referenceSources,
+  // 管理面契约是裸数组 `Vec<ReferenceSource>`，不做任何包装兼容解析。
+  queryFn: () => referenceApi<ReferenceSource[]>("/reference-sources"),
+  // 验证在受控 worker 中异步进行；只在存在 validating 项时轮询，不整页全量重扫。
+  refetchInterval: (query) => query.state.data?.some((source) => source.state === "validating") ? 3_000 : false,
+})
+
+export const referenceSourceQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.referenceSource(id),
+  queryFn: () => referenceApi<ReferenceSource>(`/reference-sources/${id}`),
+  enabled: Boolean(id),
+  refetchInterval: (query) => query.state.data?.state === "validating" ? 3_000 : false,
+})
+
+export const referenceSourcePolicyQuery = () => queryOptions({
+  queryKey: queryKeys.referenceSourcePolicy,
+  queryFn: () => referenceApi<ReferenceSourcePolicy>("/reference-source-policy"),
+})
+
+export const projectReferencesQuery = (projectId: string) => queryOptions({
+  queryKey: queryKeys.projectReferences(projectId),
+  // 只返回 durable 配置；各 Agent 的应用事实见 `.../references/status`。
+  queryFn: () => referenceApi<ProjectReferenceConfiguration>(`/projects/${projectId}/references`),
+  enabled: Boolean(projectId),
+})
+
+/**
+ * 项目应用状态：包含完整 counts 与分页 agents。
+ *
+ * 只有还有 Agent 未收敛时轮询；查询接口不触发 Docker 创建/重建。
+ */
+export const projectReferencesStatusQuery = (projectId: string, offset = 0, limit = 100) => queryOptions({
+  queryKey: [...queryKeys.projectReferencesStatus(projectId), offset, limit] as const,
+  queryFn: () => referenceApi<ProjectReferenceStatus>(`/projects/${projectId}/references/status${query({ offset: String(offset), limit: String(limit) })}`),
+  enabled: Boolean(projectId),
+  refetchInterval: (query) => {
+    const state = query.state.data?.state
+    return state === "pending" ? 5_000 : false
+  },
 })

@@ -4,91 +4,33 @@ use crate::*;
 use rusqlite::params;
 
 impl MaiStore {
+    /// 创建一条新的产品项目行（含初始引用配置）。
+    ///
+    /// 只负责创建：ID 已存在时显式失败；普通更新必须走 [`MaiStore::save_project`]。
+    pub async fn insert_project(&self, project: &ProjectSummary) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async { self.insert_project_once(project).await })
+            .await
+    }
+
+    async fn insert_project_once(&self, project: &ProjectSummary) -> Result<()> {
+        crate::parent_saves::insert_project_row(self, project).await
+    }
+
+    /// 更新一条已经存在的产品项目行。
+    ///
+    /// 目标行不存在（例如已经被删除）时显式失败；项目已经处于 `Deleting` 时拒绝把状态改回
+    /// 其它值，避免迟到的旧摘要让已开始删除的项目看起来又活了。
     pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
         crate::sqlite_busy::retry_sqlite_busy(|| async { self.save_project_once(project).await })
             .await
     }
 
     async fn save_project_once(&self, project: &ProjectSummary) -> Result<()> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        Query::<List<ProjectRecordRow>>::filter(
-            ProjectRecordRow::fields().id().eq(project.id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        toasty::create!(ProjectRecordRow {
-            id: project.id.to_string(),
-            name: project.name.clone(),
-            status: project.status.to_string(),
-            owner: project.owner.clone(),
-            repo: project.repo.clone(),
-            repository_full_name: project.repository_full_name.clone(),
-            git_account_id: project.git_account_id.clone(),
-            repository_id: u64_to_i64(project.repository_id),
-            installation_id: u64_to_i64(project.installation_id),
-            installation_account: project.installation_account.clone(),
-            branch: project.branch.clone(),
-            docker_image: project.docker_image.clone(),
-            clone_status: project.clone_status.to_string(),
-            maintainer_agent_id: project.maintainer_agent_id.to_string(),
-            created_at: project.created_at.to_rfc3339(),
-            updated_at: project.updated_at.to_rfc3339(),
-            last_error: project.last_error.clone(),
-            auto_review_enabled: project.auto_review_enabled,
-            reviewer_extra_prompt: project.reviewer_extra_prompt.clone(),
-            review_status: project.review_status.to_string(),
-            current_reviewer_agent_id: project.current_reviewer_agent_id.map(|id| id.to_string()),
-            last_review_started_at: project.last_review_started_at.map(|time| time.to_rfc3339()),
-            last_review_finished_at: project
-                .last_review_finished_at
-                .map(|time| time.to_rfc3339()),
-            next_review_at: project.next_review_at.map(|time| time.to_rfc3339()),
-            last_review_outcome: project.last_review_outcome.as_ref().map(|o| o.to_string()),
-            review_last_error: project.review_last_error.clone(),
-        })
-        .exec(&mut tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        crate::parent_saves::save_project_row(self, project).await
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<()> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        Query::<List<ProjectRecordRow>>::filter(
-            ProjectRecordRow::fields().id().eq(project_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        Query::<List<ProjectReviewRunRecord>>::filter(
-            ProjectReviewRunRecord::fields()
-                .project_id()
-                .eq(project_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        Query::<List<ProjectReviewJobRecord>>::filter(
-            ProjectReviewJobRecord::fields()
-                .project_id()
-                .eq(project_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        Query::<List<ProjectReviewCiWatchRecord>>::filter(
-            ProjectReviewCiWatchRecord::fields()
-                .project_id()
-                .eq(project_id.to_string()),
-        )
-        .delete()
-        .exec(&mut tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        crate::resource_deletion::delete_project(self, project_id).await
     }
 
     pub async fn load_projects(&self) -> Result<Vec<ProjectSummary>> {

@@ -66,6 +66,8 @@ pub(crate) struct AgentContainerStatusChange {
 /// Provides Docker, MCP, persistence, and event side effects required while
 /// ensuring an agent container exists.
 pub(crate) trait AgentContainerOps: Send + Sync {
+    /// 首次创建、MCP 装配和状态发布共用同一 Agent 生命周期所有者。
+    fn environment_admission(&self, agent_id: AgentId) -> Arc<mai_references::AgentAdmission>;
     fn start_agent_container(
         &self,
         request: AgentContainerStartRequest,
@@ -105,17 +107,6 @@ pub(crate) async fn ensure_agent_container_with_source(
     agent: &Arc<AgentRecord>,
     container_source: &ContainerSource,
 ) -> Result<String> {
-    if let Some(container_id) = agent
-        .container
-        .read()
-        .await
-        .as_ref()
-        .map(|container| container.id.clone())
-        && agent.mcp.read().await.is_some()
-    {
-        return Ok(container_id);
-    }
-
     let (agent_id, preferred_container_id, docker_image) = {
         let summary = agent.summary.read().await;
         (
@@ -124,47 +115,43 @@ pub(crate) async fn ensure_agent_container_with_source(
             summary.docker_image.clone(),
         )
     };
+    let admission = ops.environment_admission(agent_id);
+    let _lifecycle = admission.lifecycle.lock().await;
     let mut container_guard = agent.container.write().await;
-    if let Some(container_id) = container_guard
+    let container = match Box::pin(ops.start_agent_container(AgentContainerStartRequest {
+        agent_id,
+        preferred_container_id,
+        docker_image,
+        source: container_source.clone(),
+    }))
+    .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            drop(container_guard);
+            set_resource_state(
+                ops,
+                agent,
+                AgentResourceState::Failed,
+                Some(error.to_string()),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    if container_guard
         .as_ref()
-        .map(|container| container.id.clone())
+        .is_some_and(|current| current.id == container.id)
         && agent.mcp.read().await.is_some()
     {
-        return Ok(container_id);
+        drop(container_guard);
+        set_resource_state(ops, agent, AgentResourceState::Ready, None).await?;
+        return Ok(container.id);
     }
-
-    // 容器缺失即代表 transport identity 已变化；必须先关闭旧 MCP handle，
-    // 避免旧 stdio 进程或 HTTP session 在新容器 generation 建立后继续存活。
     if let Some(previous) = agent.mcp.write().await.take() {
         previous.shutdown().await;
     }
-
     set_resource_state(ops, agent, AgentResourceState::Provisioning, None).await?;
-    let container = if let Some(container) = container_guard.as_ref() {
-        container.clone()
-    } else {
-        match ops
-            .start_agent_container(AgentContainerStartRequest {
-                agent_id,
-                preferred_container_id,
-                docker_image,
-                source: container_source.clone(),
-            })
-            .await
-        {
-            Ok(container) => container,
-            Err(err) => {
-                let message = err.to_string();
-                drop(container_guard);
-                if let Err(store_err) =
-                    set_resource_state(ops, agent, AgentResourceState::Failed, Some(message)).await
-                {
-                    tracing::warn!("failed to persist container startup failure: {store_err}");
-                }
-                return Err(err);
-            }
-        }
-    };
 
     let container_id = container.id.clone();
     let setup: Result<ContainerMcpRuntime> = async {
@@ -299,6 +286,9 @@ mod tests {
     }
 
     impl AgentContainerOps for ContainerFailureOps {
+        fn environment_admission(&self, _agent_id: AgentId) -> Arc<mai_references::AgentAdmission> {
+            Arc::new(mai_references::AgentAdmission::default())
+        }
         async fn start_agent_container(
             &self,
             request: AgentContainerStartRequest,

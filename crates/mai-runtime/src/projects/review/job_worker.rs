@@ -412,6 +412,16 @@ pub(super) fn apply_review_failure(
 
 pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
     let (category, code, http_status, retry) = match error {
+        RuntimeError::Reference(error) => (
+            ProjectReviewFailureCategory::Workspace,
+            Some(error.code().to_string()),
+            Some(error.http_status()),
+            if error.retryable() {
+                retryable_disposition(None)
+            } else {
+                pl_protocol::RetryDisposition::Permanent
+            },
+        ),
         RuntimeError::GithubUnavailable {
             status,
             retry_after,
@@ -449,6 +459,13 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
             | mai_docker::DockerError::Json(_)
             | mai_docker::DockerError::InvalidImage(_)
             | mai_docker::DockerError::InvalidMount(_)
+            | mai_docker::DockerError::UnsupportedCapability(_)
+            | mai_docker::DockerError::EnvironmentReconfigurationRequired(_)
+            | mai_docker::DockerError::UnexpectedExistingMount(_)
+            | mai_docker::DockerError::EnvironmentNameConflict(_)
+            | mai_docker::DockerError::EnvironmentStateMismatch(_)
+            | mai_docker::DockerError::UnknownContainer(_)
+            | mai_docker::DockerError::ProtectedContainer(_)
             | mai_docker::DockerError::InvalidWorkspaceExport(_) => (
                 ProjectReviewFailureCategory::Validation,
                 Some("invalid_workspace_configuration".to_string()),
