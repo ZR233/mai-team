@@ -386,7 +386,7 @@ git checkout --detach "$expected_head"
 git reset --hard "$expected_head"
 git clean -fdx
 test "$(git rev-parse HEAD)" = "$expected_head"
-test "$(git remote get-url origin)" = "$expected_origin"
+test "$(git config --get remote.origin.url)" = "$expected_origin"
 test -z "$(git status --porcelain)"
 "#,
             credential = git_shell_credential_prelude(),

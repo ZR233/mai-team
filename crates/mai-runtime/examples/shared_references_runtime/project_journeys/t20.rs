@@ -44,6 +44,21 @@ pub async fn scenario(
     let tag = probe::run_tag();
     let project_id = created.project;
 
+    // 创建与并发生命周期场景先不启动审查；在本场景通过产品入口启用调度。
+    let enabled = host
+        .runtime
+        .update_project(
+            project_id,
+            UpdateProjectRequest {
+                auto_review_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    evidence.fact(
+        "t20.auto_review_enabled",
+        json!(enabled.auto_review_enabled),
+    );
     // 1) 真实自动审查触发。
     let queue = host
         .runtime
@@ -101,8 +116,14 @@ pub async fn scenario(
     }
 
     // 2) 等真实 Reviewer Agent 与它的执行环境。
-    let Some(reviewer) =
-        reviewer::wait_for_reviewer(host, project_id, host.config.operation_timeout).await?
+    let Some(reviewer) = reviewer::wait_for_reviewer(
+        host,
+        project_id,
+        host.config
+            .operation_timeout
+            .min(std::time::Duration::from_secs(90)),
+    )
+    .await?
     else {
         record_runs(host, project_id, evidence, job.as_ref()).await;
         evidence.fail(

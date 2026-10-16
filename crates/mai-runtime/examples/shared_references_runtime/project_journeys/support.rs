@@ -79,7 +79,7 @@ pub async fn create_project(
         repo: fixture.name.clone(),
         branch: Some(fixture.default_branch.clone()),
         docker_image: Some(host.config.agent_image.clone()),
-        auto_review_enabled: true,
+        auto_review_enabled: false,
         reviewer_extra_prompt: Some(format!(
             "隔离验收运行 {tag}：只使用 /project/repo 与 /workspace/repo 的固定视图。"
         )),
