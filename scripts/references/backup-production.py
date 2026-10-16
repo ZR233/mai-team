@@ -72,6 +72,7 @@ if review_settings.exists():
 running = [c['Id'] for c in owned if c['State']['Running']]
 if running:
     run(['docker','--host',SOCKET,'stop','--time','30',*running],stdout=subprocess.DEVNULL)
+resources_quiesced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 run(['cp','-a','--reflink=auto',str(ROOT/'data'),str(backup/'data')])
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -132,7 +133,7 @@ for volume in volume_metadata:
     assert inventory == tree_inventory(destination), '卷备份内容不一致：'+volume['Name']
     volume_integrity[volume['Name']] = inventory
 # 当前资源之外的容器仅记录，部署脚本不主动停止或清理；启动回收由产品的所有权规则决定。
-summary = {'backup':str(backup),'data_time_utc':stamp,'counts':counts,'data_inventory':data_inventory,'old_binary_sha256':sha256_file(backup/'mai-server'),'containers':len(owned),'volumes':len(volumes),'image_ids':sorted(images),'preserved_unmanaged_container_ids':[c['Id'] for c in containers if (c['Config'].get('Labels') or {}).get('mai.team.managed')!='true']}
+summary = {'backup':str(backup),'data_time_utc':stamp,'resources_quiesced_at':resources_quiesced_at,'completed_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'counts':counts,'data_inventory':data_inventory,'old_binary_sha256':sha256_file(backup/'mai-server'),'containers':len(owned),'volumes':len(volumes),'image_ids':sorted(images),'preserved_unmanaged_container_ids':[c['Id'] for c in containers if (c['Config'].get('Labels') or {}).get('mai.team.managed')!='true']}
 assert summary['old_binary_sha256'] == sha256_file(ROOT/'bin/mai-server'), '旧二进制备份不一致'
 integrity = {'volumes':volume_integrity,'images.tar':{'size':(backup/'images.tar').stat().st_size,'sha256':sha256_file(backup/'images.tar')},'configuration':tree_inventory(backup/'etc')}
 (backup/'integrity.json').write_text(json.dumps(integrity,indent=2))
