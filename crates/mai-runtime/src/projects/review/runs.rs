@@ -26,6 +26,7 @@ pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
 pub(crate) struct ReviewRunSnapshot {
     pub(crate) usage: RuntimeUsageSnapshot,
     pub(crate) history: Option<ThreadTurnHistory>,
+    pub(crate) history_status: mai_protocol::ProjectReviewHistoryStatus,
 }
 
 /// 把 PL core 的 canonical 累计用量投影成 review Run 摘要使用的产品用量快照。
@@ -267,43 +268,23 @@ async fn finish_project_review_run_at(
         .or(existing.summary.reviewer_agent_id);
     let turn_id = request.turn_id.or(existing.summary.turn_id);
     let snapshot = if let Some(reviewer_agent_id) = reviewer_agent_id {
-        match snapshot_source
+        snapshot_source
             .snapshot(reviewer_agent_id, turn_id.as_deref())
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) if matches!(mode, ReviewRunFinalizationMode::ExpiredRecovery) => {
-                tracing::warn!(
-                    %reviewer_agent_id,
-                    ?turn_id,
-                    %error,
-                    "expired Review Run recovery is continuing without canonical Thread snapshot"
-                );
-                ReviewRunSnapshot::default()
-            }
-            Err(error) => return Err(error),
-        }
+            .await?
     } else {
         ReviewRunSnapshot::default()
     };
     if reviewer_agent_id.is_some() && turn_id.is_some() && snapshot.history.is_none() {
-        match mode {
-            ReviewRunFinalizationMode::ActiveAttempt => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "review run {} cannot finish without canonical Thread history",
-                    request.run_id
-                )));
-            }
-            ReviewRunFinalizationMode::ExpiredRecovery => {
-                tracing::warn!(
-                    run_id = %request.run_id,
-                    ?reviewer_agent_id,
-                    ?turn_id,
-                    "expired Review Run recovery has no canonical Thread history"
-                );
-            }
+        let never_started =
+            snapshot.history_status == mai_protocol::ProjectReviewHistoryStatus::NotStarted;
+        if !never_started || request.status == ProjectReviewRunStatus::Succeeded {
+            return Err(RuntimeError::InvalidInput(format!(
+                "review run {} cannot finish without canonical Thread history",
+                request.run_id
+            )));
         }
     }
+
     let detail = ProjectReviewRunDetail {
         summary: ProjectReviewRunSummary {
             id: request.run_id,
@@ -322,7 +303,7 @@ async fn finish_project_review_run_at(
             error: request.error,
             failure: request.failure,
             usage: snapshot.usage,
-            history_status: existing.summary.history_status,
+            history_status: snapshot.history_status,
             history_archive_id: existing.summary.history_archive_id,
             history_archived_at: existing.summary.history_archived_at,
         },
@@ -652,6 +633,7 @@ mod tests {
                     ..RuntimeUsageSnapshot::default()
                 },
                 history: Some(history.clone()),
+                ..Default::default()
             },
         };
 
@@ -709,6 +691,7 @@ mod tests {
             snapshot: ReviewRunSnapshot {
                 usage: RuntimeUsageSnapshot::default(),
                 history: Some(history),
+                ..Default::default()
             },
         };
 
@@ -732,6 +715,93 @@ mod tests {
                 .await
                 .expect("load non-active run")
                 .expect("non-active run")
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_accepted_input_without_a_turn_releases_only_its_own_ownership() {
+        let (_directory, store) = test_store().await;
+        let project_id = Uuid::new_v4();
+        let job = new_project_review_job(NewProjectReviewJob {
+            project_id,
+            pr: 2099,
+            head_sha: "old-head".into(),
+            source: ProjectReviewJobSource::Manual,
+            delivery_id: None,
+            reason: "test".into(),
+        });
+        store.enqueue_project_review_job(job.clone()).await.unwrap();
+        let started_at = Utc::now() + TimeDelta::seconds(1);
+        let owner = "old-worker".to_owned();
+        store
+            .claim_due_project_review_job(
+                project_id,
+                owner.clone(),
+                started_at,
+                started_at + TimeDelta::minutes(10),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let mut job = store
+            .begin_claimed_project_review_attempt(job.id, owner, run_id, started_at)
+            .await
+            .unwrap();
+        update_project_review_run_turn(
+            &store,
+            project_id,
+            run_id,
+            Uuid::new_v4(),
+            "accepted-input".into(),
+        )
+        .await
+        .unwrap();
+        job.status = ProjectReviewJobStatus::Superseded;
+        store.save_project_review_job(job.clone()).await.unwrap();
+        let source = FixedSnapshotSource {
+            snapshot: ReviewRunSnapshot {
+                history_status: mai_protocol::ProjectReviewHistoryStatus::NotStarted,
+                ..Default::default()
+            },
+        };
+        let at = job.lease_expires_at.unwrap() + TimeDelta::seconds(1);
+        assert_eq!(
+            recover_expired_terminal_project_review_runs(&store, &source, at)
+                .await
+                .unwrap(),
+            1
+        );
+        let detail = store
+            .load_project_review_run(job.project_id, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                detail.summary.status,
+                detail.summary.history_status,
+                detail.history
+            ),
+            (
+                ProjectReviewRunStatus::Interrupted,
+                mai_protocol::ProjectReviewHistoryStatus::NotStarted,
+                None
+            )
+        );
+        let saved = store
+            .load_project_review_job(job.project_id, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                saved.status,
+                saved.active_run_id,
+                saved.lease_owner,
+                saved.lease_expires_at
+            ),
+            (ProjectReviewJobStatus::Superseded, None, None, None)
         );
     }
 
@@ -845,6 +915,7 @@ mod tests {
             snapshot: ReviewRunSnapshot {
                 usage: RuntimeUsageSnapshot::default(),
                 history: Some(history.clone()),
+                ..Default::default()
             },
         };
 

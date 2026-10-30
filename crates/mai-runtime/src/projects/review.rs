@@ -16,6 +16,7 @@ pub(crate) mod context;
 pub(crate) mod cycle;
 pub(crate) mod discovery;
 pub(crate) mod eligibility;
+pub(crate) mod history;
 pub(crate) mod job;
 pub(crate) mod job_attempt;
 mod job_heartbeat;

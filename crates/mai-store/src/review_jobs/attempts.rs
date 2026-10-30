@@ -395,7 +395,7 @@ impl MaiStore {
                             finished_at = ?3, status = ?4, outcome = ?5, review_event = ?6,
                             pr = ?7, summary = ?8, error = ?9, failure_json = ?10,
                             usage_json = ?11,
-                            history_json = COALESCE(?12, history_json)
+                            history_json = COALESCE(?12, history_json), history_status = ?14
                          WHERE id = ?13 AND finished_at IS NULL",
                         params![
                             run.summary.reviewer_agent_id.map(|id| id.to_string()),
@@ -411,6 +411,7 @@ impl MaiStore {
                             serde_json::to_string(&run.summary.usage)?,
                             run.history.map(|history| serde_json::to_string(&history)).transpose()?,
                             run.summary.id.to_string(),
+                            run.summary.history_status.to_string(),
                         ],
                     )?;
                     if changed != 1 {
