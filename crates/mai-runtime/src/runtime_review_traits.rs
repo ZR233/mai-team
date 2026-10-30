@@ -6,34 +6,17 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
         reviewer_agent_id: AgentId,
         turn_id: Option<&str>,
     ) -> Result<projects::review::runs::ReviewRunSnapshot> {
-        // typed SessionHistory 读取已提交 effect；同时保证 reviewer Thread 已驻留，使下面的
-        // canonical usage_summary 与刚完成的 Turn 属于同一 owner。
-        let page = self
-            .thread_turns(
-                reviewer_agent_id.to_string(),
-                None,
-                REVIEW_SNAPSHOT_TURN_LIMIT,
+        if let Some(resident) = self.resident_thread(reviewer_agent_id) {
+            self.await_agent_durable(
+                reviewer_agent_id,
+                resident.handle.snapshot().commit_sequence,
             )
             .await?;
-        let updated_at = now().timestamp();
-        let usage = self
-            .resident_thread(reviewer_agent_id)
-            .map(|resident| {
-                projects::review::runs::runtime_usage_snapshot(
-                    &resident.handle.snapshot().usage_summary,
-                    updated_at,
-                )
-            })
-            .unwrap_or_default();
-        let history = page.turns.into_iter().find(|history| {
-            turn_id.is_none_or(|input_id| history.turn.input_id.as_deref() == Some(input_id))
-        });
-        Ok(projects::review::runs::ReviewRunSnapshot { usage, history })
+        }
+        let store = self.session_history.open(reviewer_agent_id).await?;
+        projects::review::history::snapshot(&store, reviewer_agent_id, turn_id).await
     }
 }
-
-/// 一次 Run 终态快照最多回看的已提交 Thread effect 数。
-const REVIEW_SNAPSHOT_TURN_LIMIT: usize = 200;
 
 impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
     fn project(

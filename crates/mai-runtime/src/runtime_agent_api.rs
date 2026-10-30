@@ -167,32 +167,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         self.agent(agent_id).await?;
         let resident = self.ensure_thread(agent_id).await?;
-        let state = resident.handle.snapshot();
-        let Some(active) = state
-            .turns
-            .iter()
-            .rev()
-            .find(|turn| turn.state == pl_core::thread::TurnState::Running)
-        else {
-            return Ok(());
-        };
-        // 标识别名：调用方可能持有开跑时受理的输入身份（`send_message` 的返回值），也可能
-        // 持有投影出的活动 Turn 身份。两者指向同一段执行；都不匹配时保持旧的空操作语义。
-        let matches =
-            active.turn_id == turn_id || active.input_id.as_deref() == Some(turn_id.as_str());
-        if !matches {
-            return Ok(());
-        }
-        match resident
-            .handle
-            .interrupt_turn(Some(active.turn_id.clone()))
-            .await
-        {
-            Ok(_) => Ok(()),
-            // 运行中的 Turn 已经在比对后结束或换成了另一个 Turn；取消请求已经失去目标。
-            Err(pl_core::thread::ThreadError::InvalidIdentity) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        crate::runtime_input_cancel::cancel(&resident.handle, &turn_id).await
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {

@@ -683,6 +683,8 @@ pub struct ProjectReviewRunSummary {
 pub enum ProjectReviewHistoryStatus {
     #[default]
     Available,
+    /// 输入已受理，但 canonical effect 证明从未启动对应 Turn。
+    NotStarted,
     PlV2Archived,
 }
 

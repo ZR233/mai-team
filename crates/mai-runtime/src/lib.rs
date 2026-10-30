@@ -36,6 +36,7 @@ mod runtime_bootstrap;
 mod runtime_child_reports;
 mod runtime_config;
 mod runtime_environment;
+mod runtime_input_cancel;
 mod runtime_product_api;
 mod runtime_project_traits;
 mod runtime_provisioning;
