@@ -78,7 +78,7 @@ export interface ProjectSummary {
 
 export type ReviewRunOutcome = "review_submitted" | "no_eligible_pr" | "failed"
 export type ReviewDecision = "approve" | "request_changes" | "comment"
-export type ReviewHistoryStatus = "available" | "pl_v2_archived"
+export type ReviewHistoryStatus = "available" | "not_started" | "pl_v2_archived"
 
 export interface ReviewRunSummary {
   id: Id

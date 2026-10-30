@@ -9,6 +9,9 @@
 //! 存储根由调用方注入：`artifact_files_root.join("thread-resources")`。这里不读取配置、不依赖
 //! Studio 产品 crate，也不把模型、Thread 或调用方提供的字符串直接当作文件路径。
 
+mod durability;
+#[cfg(test)]
+mod permission_tests;
 mod store;
 
 pub(crate) use store::{MaiResourceStore, MaiResourceStoreError, thread_resources_root};

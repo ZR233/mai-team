@@ -1,3 +1,4 @@
+use super::durability::{ensure_directory, sync_directory};
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
@@ -203,7 +204,12 @@ impl MaiResourceStoreError {
     /// 不会让 Thread 误以为整个输出存储都不可用。
     pub(crate) fn tool_error(self) -> ToolError {
         match self {
-            MaiResourceStoreError::Io { source, .. } => blob_storage_fault(source),
+            error @ MaiResourceStoreError::Io { .. } => ToolError::new(OutputStorageFault::new(
+                StorageFaultKind::BlobFailed,
+                Arc::new(ColdStoreError {
+                    source: Box::new(error),
+                }),
+            )),
             MaiResourceStoreError::NotFile(path) => {
                 ToolError::new(MaiResourceStoreError::NotFile(path))
             }
@@ -224,16 +230,6 @@ impl MaiResourceStoreError {
     }
 }
 
-fn blob_storage_fault(error: io::Error) -> ToolError {
-    let source = ColdStoreError {
-        source: Box::new(error),
-    };
-    ToolError::new(OutputStorageFault::new(
-        StorageFaultKind::BlobFailed,
-        Arc::new(source),
-    ))
-}
-
 fn retain_command_capture(
     root: &Path,
     source: &Path,
@@ -249,7 +245,7 @@ fn retain_command_capture(
         return Err(MaiResourceStoreError::TooLarge { limit });
     }
 
-    fs::create_dir_all(root).map_err(|source| io_error(root.to_owned(), source))?;
+    ensure_directory(root)?;
     let root = fs::canonicalize(root).map_err(|source| io_error(root.to_owned(), source))?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(&root).map_err(|source| io_error(root.clone(), source))?;
@@ -290,7 +286,7 @@ fn retain_bytes(
     media_type: &str,
 ) -> Result<ResourceReference, MaiResourceStoreError> {
     let reference = content_reference(media_type, bytes)?;
-    fs::create_dir_all(root).map_err(|source| io_error(root.to_owned(), source))?;
+    ensure_directory(root)?;
     let root = fs::canonicalize(root).map_err(|source| io_error(root.to_owned(), source))?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(&root).map_err(|source| io_error(root.clone(), source))?;
@@ -345,7 +341,7 @@ fn publish_object(
             return Err(io_error(destination, error.error));
         }
     }
-    sync_parent_directories(root)?;
+    sync_directory(root)?;
     Ok(())
 }
 
@@ -439,22 +435,6 @@ fn verify_existing_file(path: &Path, expected: &[u8]) -> Result<(), MaiResourceS
         return Err(MaiResourceStoreError::Integrity(
             ResourceError::ContentMismatch,
         ));
-    }
-    Ok(())
-}
-
-fn sync_parent_directories(root: &Path) -> Result<(), MaiResourceStoreError> {
-    #[cfg(unix)]
-    {
-        for directory in root.ancestors() {
-            File::open(directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| io_error(directory.to_owned(), source))?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = root;
     }
     Ok(())
 }

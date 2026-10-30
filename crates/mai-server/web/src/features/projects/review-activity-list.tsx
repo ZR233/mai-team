@@ -19,7 +19,7 @@ export function ReviewActivityList({ activity }: { activity: ReviewActivity }) {
   const items = activity.items.slice((page - 1) * ACTIVITY_PAGE_SIZE, page * ACTIVITY_PAGE_SIZE)
   return <div className="flex flex-col gap-4">
     {activity.items.length === 0 && !active
-      ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No committed PL turn activity is available for this attempt.</p>
+      ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">{activity.historyStatus === "not_started" ? "该输入已受理，但尚未启动对应 Turn 就已结束；没有生成执行历史。" : "No committed PL turn activity is available for this attempt."}</p>
       : <TimelineEntriesView items={items} activeTurn={active && page === totalPages ? activity.turn : undefined} />}
     {active && activity.items.length === 0 && <p className="text-xs text-muted-foreground">The PL turn is still running. Its chat will appear as effects are committed.</p>}
     {activity.items.length > ACTIVITY_PAGE_SIZE && <PagePagination page={page} totalPages={totalPages} onPageChange={(next) => setSelectedPage(next === totalPages ? null : next)} label="Review activity pages" />}

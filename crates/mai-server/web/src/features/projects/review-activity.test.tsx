@@ -9,6 +9,12 @@ import { ReviewActivityList } from "./review-activity-list"
 import { buildReviewActivity } from "./review-activity"
 
 describe("Review PL Thread activity", () => {
+  it("只受理未启动的尝试显示真实状态，不暗示历史损坏", () => {
+    render(<ReviewActivityList activity={{ items: [], status: "interrupted", historyStatus: "not_started", conclusion: { error: "head changed" } }} />)
+    expect(screen.getByText("该输入已受理，但尚未启动对应 Turn 就已结束；没有生成执行历史。")).toBeVisible()
+    expect(screen.queryByText("No committed PL turn activity is available for this attempt.")).not.toBeInTheDocument()
+  })
+
   it("复用会话 Timeline 展示 Review 历史", () => {
     const detail: ReviewRunDetail = {
       id: "run-1",
@@ -89,7 +95,7 @@ describe("Review PL Thread activity", () => {
       updatedAt: index + 1,
       state: { kind: "text", data: { channel: "user", text: `message ${index + 1}`, lifecycle: { kind: "completed", data: { completedAt: index + 1 } } } },
     }))
-    render(<ReviewActivityList activity={{ items, status: "succeeded", conclusion: { summary: "done" } }} />)
+    render(<ReviewActivityList activity={{ items, status: "succeeded", historyStatus: "available", conclusion: { summary: "done" } }} />)
 
     expect(screen.getByRole("navigation", { name: "Review activity pages" })).toBeVisible()
     expect(screen.getByText("message 41")).toBeVisible()

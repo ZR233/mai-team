@@ -13,6 +13,7 @@ export interface ReviewActivity {
   items: ThreadItem[]
   turn?: Turn
   status: ReviewRunDetail["status"]
+  historyStatus: ReviewRunDetail["history_status"]
   conclusion: ReviewConclusionView
 }
 
@@ -21,6 +22,7 @@ export function buildReviewActivity(detail: ReviewRunDetail): ReviewActivity {
     items: detail.history?.items ?? [],
     turn: detail.history?.turn,
     status: detail.status,
+    historyStatus: detail.history_status,
     conclusion: {
       outcome: detail.outcome ?? undefined,
       reviewEvent: detail.review_event ?? undefined,
